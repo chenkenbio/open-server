@@ -1,0 +1,33 @@
+# compiled binary
+/open-server
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test artifacts
+*.test
+*.out
+coverage.txt
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# stray data files (not project source)
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.parquet
+*.bam
+*.bai
+*.fastq
+*.fq
+*.fastq.gz
+*.fq.gz
