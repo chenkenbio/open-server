@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -70,6 +71,52 @@ func validateToken(s string) error {
 	return nil
 }
 
+func parseDurationSpec(s string) (time.Duration, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return 0, errors.New("empty duration")
+	}
+	unit := s[len(s)-1]
+	value := s[:len(s)-1]
+	if value == "" {
+		return 0, fmt.Errorf("missing duration value in %q", s)
+	}
+	var duration time.Duration
+	var err error
+	switch unit {
+	case 'd':
+		days, parseErr := strconv.ParseFloat(value, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("invalid day value %q: %w", value, parseErr)
+		}
+		duration = time.Duration(days * float64(24*time.Hour))
+	case 'h', 'm':
+		duration, err = time.ParseDuration(s)
+		if err != nil {
+			return 0, err
+		}
+	default:
+		return 0, fmt.Errorf("unsupported duration suffix %q; use d, h, or m", string(unit))
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("duration must be greater than zero")
+	}
+	return duration, nil
+}
+
+func formatDurationSpec(duration time.Duration) string {
+	if duration%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%dd", duration/(24*time.Hour))
+	}
+	if duration%time.Hour == 0 {
+		return fmt.Sprintf("%dh", duration/time.Hour)
+	}
+	if duration%time.Minute == 0 {
+		return fmt.Sprintf("%dm", duration/time.Minute)
+	}
+	return duration.String()
+}
+
 func humanSize(n int64) string {
 	const unit = 1024
 	if n < unit {
@@ -119,7 +166,22 @@ func getGateway() string {
 	return gw.String()
 }
 
+func expandHomePath(path string) string {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
 func parsePath(path string) (string, string, error) {
+	path = expandHomePath(path)
 	fi, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -228,6 +290,33 @@ func openURL(host string, port int, fileBase, token string) string {
 	return fmt.Sprintf("http://%s:%d%s?token=%s", host, port, path, token)
 }
 
+func logicalWorkingDir() string {
+	pwd := os.Getenv("PWD")
+	if filepath.IsAbs(pwd) {
+		cwdInfo, cwdErr := os.Stat(".")
+		pwdInfo, pwdErr := os.Stat(pwd)
+		if cwdErr == nil && pwdErr == nil && os.SameFile(cwdInfo, pwdInfo) {
+			return pwd
+		}
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return wd
+}
+
+func defaultPageTitle(path, fileBase string) string {
+	titlePath := expandHomePath(path)
+	if fileBase != "" {
+		titlePath = filepath.Dir(titlePath)
+	}
+	if !filepath.IsAbs(titlePath) {
+		titlePath = filepath.Join(logicalWorkingDir(), titlePath)
+	}
+	return filepath.Clean(titlePath)
+}
+
 func printOpenLink(url string) {
 	fmt.Println()
 	fmt.Println("File server ready")
@@ -328,7 +417,7 @@ func uploadHandler(fileDir string) http.HandlerFunc {
 	}
 }
 
-func serveFiles(address string, portLo, portHi int, fileDir, fileBase, token string) error {
+func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, token string, duration time.Duration) error {
 	appMux := http.NewServeMux()
 	appMux.HandleFunc("/upload", uploadHandler(fileDir))
 
@@ -398,12 +487,12 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, token str
 			parentDir = filepath.Join(r.URL.Path, "..")
 		}
 		data := struct {
-			Entries     []Entry
-			ParentDir   string
-			Token       string
-			RequestPath string
+			Entries   []Entry
+			PageTitle string
+			ParentDir string
+			Token     string
 		}{
-			Entries: entries, ParentDir: parentDir, Token: token, RequestPath: r.URL.Path,
+			Entries: entries, PageTitle: title, ParentDir: parentDir, Token: token,
 		}
 		tmpl, err := template.New("dir").Parse(htmlTemplate)
 		if err != nil {
@@ -420,6 +509,12 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, token str
 	})
 
 	finalHandler := panicMiddleware(tokenAuthMiddleware(appMux, token))
+	server := &http.Server{
+		Handler:      finalHandler,
+		ReadTimeout:  10 * time.Minute,
+		WriteTimeout: 10 * time.Minute,
+		IdleTimeout:  120 * time.Second,
+	}
 
 	listener, boundPort, err := bindListener(address, portLo, portHi)
 	if err != nil {
@@ -429,14 +524,19 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, token str
 
 	link := openURL(address, boundPort, fileBase, token)
 	printOpenLink(link)
-	fmt.Printf("\nServing: %s\nAddress: http://%s:%d/\nStop:    Ctrl+C\n", fileDir, address, boundPort)
+	fmt.Printf("\nServing:  %s\nAddress:  http://%s:%d/\nDuration: %s\nStop:     Ctrl+C\n", fileDir, address, boundPort, formatDurationSpec(duration))
 
-	server := &http.Server{
-		Handler:      finalHandler,
-		ReadTimeout:  10 * time.Minute,
-		WriteTimeout: 10 * time.Minute,
-		IdleTimeout:  120 * time.Second,
-	}
+	timer := time.AfterFunc(duration, func() {
+		log.Printf("Duration %s reached; shutting down", formatDurationSpec(duration))
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+			_ = server.Close()
+		}
+	})
+	defer timer.Stop()
+
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("file server stopped unexpectedly: %w", err)
 	}

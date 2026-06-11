@@ -4,10 +4,10 @@ const htmlTemplate = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Index of {{.RequestPath}}</title>
+<title>{{.PageTitle}}</title>
 </head>
 <body>
-<h1>Index of {{.RequestPath}}</h1>
+<h1>{{.PageTitle}}</h1>
 <table>
 <tr><th align="left">Name</th><th align="left">Last modified</th><th align="right">Size</th></tr>
 <tr><th colspan="3"><hr></th></tr>

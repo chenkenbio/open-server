@@ -44,15 +44,20 @@ func defaultPortSpec() string {
 func main() {
 	var (
 		address  string
+		duration string
 		portSpec string
+		title    string
 		token    string
 	)
 	defAddr := defaultAddress()
 	defPort := defaultPortSpec()
 	flag.StringVar(&address, "address", defAddr, "IP address to bind")
 	flag.StringVar(&address, "a", defAddr, "IP address to bind (shorthand)")
+	flag.StringVar(&duration, "duration", "7d", "server lifetime before automatic exit (e.g. 7d, 12h, 30m)")
 	flag.StringVar(&portSpec, "port", defPort, "port or port range (e.g. 60000 or 60000-70000)")
 	flag.StringVar(&portSpec, "p", defPort, "port or port range (shorthand)")
+	flag.StringVar(&title, "title", "", "page title; defaults to full served folder path")
+	flag.StringVar(&title, "t", "", "page title (shorthand)")
 	flag.StringVar(&token, "token", "", "access token (>=8 chars); auto-generated if empty")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] [path]\n\nServes a file or directory over HTTP with token auth.\nIf no path is given, the current directory is served.\n\nFlags:\n", os.Args[0])
@@ -69,6 +74,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid --port: %v", err)
 	}
+	lifetime, err := parseDurationSpec(duration)
+	if err != nil {
+		log.Fatalf("invalid --duration: %v", err)
+	}
 
 	if token == "" {
 		t, err := generateRandomToken(16)
@@ -84,8 +93,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
+	if title == "" {
+		title = defaultPageTitle(path, fileBase)
+	}
 
-	if err := serveFiles(address, portLo, portHi, fileDir, fileBase, token); err != nil {
+	if err := serveFiles(address, portLo, portHi, fileDir, fileBase, title, token, lifetime); err != nil {
 		log.Fatalf("%v", err)
 	}
 }
