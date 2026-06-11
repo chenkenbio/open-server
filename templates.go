@@ -9,10 +9,10 @@ const htmlTemplate = `<!DOCTYPE html>
 <body>
 <h1>{{.PageTitle}}</h1>
 <table>
-<tr><th align="left">Name</th><th align="left">Last modified</th><th align="right">Size</th><th align="right">Path</th></tr>
+<tr><th align="left"><a href="{{.Sort.NameHref}}">Name{{.Sort.NameMarker}}</a></th><th align="left"><a href="{{.Sort.ModifiedHref}}">Last modified{{.Sort.ModifiedMarker}}</a></th><th align="right"><a href="{{.Sort.SizeHref}}">Size{{.Sort.SizeMarker}}</a></th><th align="right">Path</th></tr>
 <tr><th colspan="4"><hr></th></tr>
-{{if .ParentDir}}<tr><td><a href="{{.ParentDir}}?token={{.Token}}">Parent Directory</a></td><td>&nbsp;</td><td align="right">  - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.ParentPath}}">Copy path</button></td></tr>
-{{end}}{{range .Entries}}<tr><td><a href="{{.Href}}?token={{$.Token}}">{{.Name}}</a></td><td>&nbsp;&nbsp;{{.ModTime}}&nbsp;&nbsp;</td><td align="right">{{.Size}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.FullPath}}">Copy path</button></td></tr>
+{{if .ParentDir}}<tr><td><a href="{{.ParentDir}}{{.Sort.QuerySuffix}}">Parent Directory</a></td><td>&nbsp;</td><td align="right">  - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.ParentPath}}">Copy path</button></td></tr>
+{{end}}{{range .Entries}}<tr><td><a href="{{.Href}}{{$.Sort.QuerySuffix}}">{{.Name}}</a></td><td>&nbsp;&nbsp;{{.ModTime}}&nbsp;&nbsp;</td><td align="right">{{.Size}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.FullPath}}">Copy path</button></td></tr>
 {{end}}<tr><th colspan="4"><hr></th></tr>
 </table>
 <hr>

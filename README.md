@@ -14,6 +14,7 @@ Standalone HTTP file-sharing server: token-authenticated browse + drag-and-drop 
 - **Automatic timeout exit** after `--duration 7d` by default; accepts `d`, `h`, and `m` suffixes.
 - **Custom page title** via `--title "Shared files"`; by default the listing title is the full served folder path, expanding `~` while preserving logical symlink names.
 - **UCSC-style directory listing** — borderless table with Name / Last modified / Size, Apache-style size suffixes (`12.0K`, `2.0M`).
+- **Sortable listing columns** — click `Name`, `Last modified`, or `Size` to toggle ascending/descending order.
 - **Experimental: copy full server paths** from a right-aligned `Path` column, useful for pasting figure paths into LaTeX on the same server.
 - **Drag-and-drop uploads** with per-file progress indicator; falls back to a plain multipart `<form>` if JavaScript is off.
 - **Path-traversal protection** on both browse and upload.
@@ -66,6 +67,8 @@ Visiting the link drops a `Set-Cookie: open_server_token=…` so subsequent navi
 If `--title` is omitted, the browser title and listing header default to the full served folder path. `~` is expanded to your home directory. For `open-server .`, a valid logical `$PWD` is used so running from a symlinked directory displays that symlink path instead of the resolved target path.
 
 Each listed file and directory has an experimental right-aligned `Path` column with a `Copy path` button that copies the full server filesystem path. This is useful for LaTeX work on the same server: browse to a figure, copy its path, and paste it directly into your `.tex` source.
+
+Directory listings sort by name by default. Click the `Name`, `Last modified`, or `Size` header to change sort order; clicking the active header toggles ascending/descending order. Directory entries stay grouped before files.
 
 ## Flags
 

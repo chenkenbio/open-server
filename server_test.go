@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,6 +56,85 @@ func TestFormatDurationSpec(t *testing.T) {
 		if got := formatDurationSpec(tt.duration); got != tt.want {
 			t.Fatalf("formatDurationSpec(%v) = %q, want %q", tt.duration, got, tt.want)
 		}
+	}
+}
+
+func TestParseSortState(t *testing.T) {
+	tests := []struct {
+		name string
+		in   url.Values
+		want sortState
+	}{
+		{
+			name: "size desc",
+			in:   url.Values{"sort": []string{"size"}, "order": []string{"desc"}},
+			want: sortState{Column: sortBySize, Order: sortOrderDesc},
+		},
+		{
+			name: "modified asc",
+			in:   url.Values{"sort": []string{"modified"}, "order": []string{"asc"}},
+			want: sortState{Column: sortByModified, Order: sortOrderAsc},
+		},
+		{
+			name: "invalid falls back",
+			in:   url.Values{"sort": []string{"unknown"}, "order": []string{"sideways"}},
+			want: sortState{Column: sortByName, Order: sortOrderAsc},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseSortState(tt.in); got != tt.want {
+				t.Fatalf("parseSortState(%v) = %#v, want %#v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSortEntries(t *testing.T) {
+	t1 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	t3 := time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name  string
+		state sortState
+		want  []string
+	}{
+		{
+			name:  "name desc keeps directories first",
+			state: sortState{Column: sortByName, Order: sortOrderDesc},
+			want:  []string{"dir/", "c.txt", "b.txt", "a.txt"},
+		},
+		{
+			name:  "size asc",
+			state: sortState{Column: sortBySize, Order: sortOrderAsc},
+			want:  []string{"dir/", "a.txt", "b.txt", "c.txt"},
+		},
+		{
+			name:  "modified desc",
+			state: sortState{Column: sortByModified, Order: sortOrderDesc},
+			want:  []string{"dir/", "a.txt", "b.txt", "c.txt"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entries := []Entry{
+				{Name: "b.txt", SizeBytes: 20, ModTimeValue: t2},
+				{Name: "dir/", IsDir: true},
+				{Name: "c.txt", SizeBytes: 30, ModTimeValue: t1},
+				{Name: "a.txt", SizeBytes: 10, ModTimeValue: t3},
+			}
+			sortEntries(entries, tt.state)
+			got := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				got = append(got, entry.Name)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("sortEntries names = %v, want %v", got, tt.want)
+				}
+			}
+		})
 	}
 }
 

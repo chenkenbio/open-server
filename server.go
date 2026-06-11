@@ -25,12 +25,14 @@ import (
 )
 
 type Entry struct {
-	Name     string
-	Href     string
-	FullPath string
-	ModTime  string
-	Size     string
-	IsDir    bool
+	Name         string
+	Href         string
+	FullPath     string
+	ModTime      string
+	ModTimeValue time.Time
+	Size         string
+	SizeBytes    int64
+	IsDir        bool
 }
 
 type forbiddenPageData struct {
@@ -38,6 +40,29 @@ type forbiddenPageData struct {
 	Message string
 	Detail  string
 }
+
+type sortState struct {
+	Column string
+	Order  string
+}
+
+type sortLinks struct {
+	QuerySuffix    string
+	NameHref       string
+	NameMarker     string
+	ModifiedHref   string
+	ModifiedMarker string
+	SizeHref       string
+	SizeMarker     string
+}
+
+const (
+	sortByName     = "name"
+	sortByModified = "modified"
+	sortBySize     = "size"
+	sortOrderAsc   = "asc"
+	sortOrderDesc  = "desc"
+)
 
 func parsePortSpec(s string) (int, int, error) {
 	s = strings.TrimSpace(s)
@@ -116,6 +141,111 @@ func formatDurationSpec(duration time.Duration) string {
 		return fmt.Sprintf("%dm", duration/time.Minute)
 	}
 	return duration.String()
+}
+
+func parseSortState(values url.Values) sortState {
+	column := values.Get("sort")
+	switch column {
+	case sortByName, sortByModified, sortBySize:
+	default:
+		column = sortByName
+	}
+	order := values.Get("order")
+	if order != sortOrderDesc {
+		order = sortOrderAsc
+	}
+	return sortState{Column: column, Order: order}
+}
+
+func sortMarker(state sortState, column string) string {
+	if state.Column != column {
+		return ""
+	}
+	if state.Order == sortOrderDesc {
+		return " v"
+	}
+	return " ^"
+}
+
+func nextSortOrder(state sortState, column string) string {
+	if state.Column == column && state.Order == sortOrderAsc {
+		return sortOrderDesc
+	}
+	return sortOrderAsc
+}
+
+func sortHref(token string, state sortState, column string) string {
+	values := url.Values{}
+	values.Set("token", token)
+	values.Set("sort", column)
+	values.Set("order", nextSortOrder(state, column))
+	return "?" + values.Encode()
+}
+
+func querySuffix(token string, state sortState) string {
+	values := url.Values{}
+	values.Set("token", token)
+	values.Set("sort", state.Column)
+	values.Set("order", state.Order)
+	return "?" + values.Encode()
+}
+
+func makeSortLinks(token string, state sortState) sortLinks {
+	return sortLinks{
+		QuerySuffix:    querySuffix(token, state),
+		NameHref:       sortHref(token, state, sortByName),
+		NameMarker:     sortMarker(state, sortByName),
+		ModifiedHref:   sortHref(token, state, sortByModified),
+		ModifiedMarker: sortMarker(state, sortByModified),
+		SizeHref:       sortHref(token, state, sortBySize),
+		SizeMarker:     sortMarker(state, sortBySize),
+	}
+}
+
+func compareEntries(a, b Entry, column string) int {
+	switch column {
+	case sortBySize:
+		if a.SizeBytes < b.SizeBytes {
+			return -1
+		}
+		if a.SizeBytes > b.SizeBytes {
+			return 1
+		}
+	case sortByModified:
+		if a.ModTimeValue.Before(b.ModTimeValue) {
+			return -1
+		}
+		if a.ModTimeValue.After(b.ModTimeValue) {
+			return 1
+		}
+	default:
+		if a.Name < b.Name {
+			return -1
+		}
+		if a.Name > b.Name {
+			return 1
+		}
+	}
+	if a.Name < b.Name {
+		return -1
+	}
+	if a.Name > b.Name {
+		return 1
+	}
+	return 0
+}
+
+func sortEntries(entries []Entry, state sortState) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir
+		}
+		cmp := compareEntries(entries[i], entries[j], state.Column)
+		if state.Order == sortOrderDesc {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
 }
 
 func humanSize(n int64) string {
@@ -461,16 +591,21 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 			http.Error(w, "Failed to read directory", http.StatusInternalServerError)
 			return
 		}
+		sortState := parseSortState(r.URL.Query())
 		currentPath := displayPath(displayRoot, r.URL.Path)
 		entries := make([]Entry, 0, len(dirEntries))
 		for _, de := range dirEntries {
 			fi, infoErr := de.Info()
 			modTime := ""
+			var modTimeValue time.Time
 			size := "-"
+			var sizeBytes int64
 			if infoErr == nil {
-				modTime = fi.ModTime().Format("2006-01-02 15:04")
+				modTimeValue = fi.ModTime()
+				modTime = modTimeValue.Format("2006-01-02 15:04")
 				if !de.IsDir() {
-					size = humanSize(fi.Size())
+					sizeBytes = fi.Size()
+					size = humanSize(sizeBytes)
 				}
 			}
 			name := de.Name()
@@ -480,20 +615,17 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 				name = name + "/"
 			}
 			entries = append(entries, Entry{
-				Name:     name,
-				Href:     href,
-				FullPath: filepath.Join(currentPath, de.Name()),
-				ModTime:  modTime,
-				Size:     size,
-				IsDir:    de.IsDir(),
+				Name:         name,
+				Href:         href,
+				FullPath:     filepath.Join(currentPath, de.Name()),
+				ModTime:      modTime,
+				ModTimeValue: modTimeValue,
+				Size:         size,
+				SizeBytes:    sizeBytes,
+				IsDir:        de.IsDir(),
 			})
 		}
-		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].IsDir != entries[j].IsDir {
-				return entries[i].IsDir
-			}
-			return entries[i].Name < entries[j].Name
-		})
+		sortEntries(entries, sortState)
 		var parentDir string
 		var parentPath string
 		if absFullPath != absFileDir {
@@ -505,9 +637,10 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 			PageTitle  string
 			ParentDir  string
 			ParentPath string
+			Sort       sortLinks
 			Token      string
 		}{
-			Entries: entries, PageTitle: title, ParentDir: parentDir, ParentPath: parentPath, Token: token,
+			Entries: entries, PageTitle: title, ParentDir: parentDir, ParentPath: parentPath, Sort: makeSortLinks(token, sortState), Token: token,
 		}
 		tmpl, err := template.New("dir").Parse(htmlTemplate)
 		if err != nil {
