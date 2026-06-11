@@ -93,11 +93,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
+	displayRoot := defaultPageTitle(path, fileBase)
 	if title == "" {
-		title = defaultPageTitle(path, fileBase)
+		title = displayRoot
 	}
 
-	if err := serveFiles(address, portLo, portHi, fileDir, fileBase, title, token, lifetime); err != nil {
+	if err := serveFiles(address, portLo, portHi, fileDir, fileBase, title, displayRoot, token, lifetime); err != nil {
 		log.Fatalf("%v", err)
 	}
 }

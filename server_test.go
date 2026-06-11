@@ -62,7 +62,7 @@ func TestServeFilesExitsAfterDuration(t *testing.T) {
 	dir := t.TempDir()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveFiles("127.0.0.1", 0, 0, dir, "", "test", "12345678", 20*time.Millisecond)
+		done <- serveFiles("127.0.0.1", 0, 0, dir, "", "test", dir, "12345678", 20*time.Millisecond)
 	}()
 
 	select {
@@ -72,6 +72,27 @@ func TestServeFilesExitsAfterDuration(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("serveFiles did not exit after duration")
+	}
+}
+
+func TestDisplayPath(t *testing.T) {
+	root := filepath.Join(string(os.PathSeparator), "home", "kenchen", "Documents", "xxx")
+	tests := []struct {
+		name        string
+		requestPath string
+		want        string
+	}{
+		{name: "root", requestPath: "/", want: root},
+		{name: "subdir", requestPath: "/figures/", want: filepath.Join(root, "figures")},
+		{name: "nested file", requestPath: "/figures/panel.pdf", want: filepath.Join(root, "figures", "panel.pdf")},
+		{name: "parent", requestPath: "/figures/..", want: root},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := displayPath(root, tt.requestPath); got != tt.want {
+				t.Fatalf("displayPath(%q, %q) = %q, want %q", root, tt.requestPath, got, tt.want)
+			}
+		})
 	}
 }
 

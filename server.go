@@ -25,11 +25,12 @@ import (
 )
 
 type Entry struct {
-	Name    string
-	Href    string
-	ModTime string
-	Size    string
-	IsDir   bool
+	Name     string
+	Href     string
+	FullPath string
+	ModTime  string
+	Size     string
+	IsDir    bool
 }
 
 type forbiddenPageData struct {
@@ -317,6 +318,15 @@ func defaultPageTitle(path, fileBase string) string {
 	return filepath.Clean(titlePath)
 }
 
+func displayPath(root, requestPath string) string {
+	cleanRequest := filepath.Clean(requestPath)
+	if cleanRequest == "." || cleanRequest == string(os.PathSeparator) {
+		return filepath.Clean(root)
+	}
+	rel := strings.TrimPrefix(cleanRequest, string(os.PathSeparator))
+	return filepath.Clean(filepath.Join(root, rel))
+}
+
 func printOpenLink(url string) {
 	fmt.Println()
 	fmt.Println("File server ready")
@@ -417,7 +427,7 @@ func uploadHandler(fileDir string) http.HandlerFunc {
 	}
 }
 
-func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, token string, duration time.Duration) error {
+func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, displayRoot, token string, duration time.Duration) error {
 	appMux := http.NewServeMux()
 	appMux.HandleFunc("/upload", uploadHandler(fileDir))
 
@@ -451,6 +461,7 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, to
 			http.Error(w, "Failed to read directory", http.StatusInternalServerError)
 			return
 		}
+		currentPath := displayPath(displayRoot, r.URL.Path)
 		entries := make([]Entry, 0, len(dirEntries))
 		for _, de := range dirEntries {
 			fi, infoErr := de.Info()
@@ -469,11 +480,12 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, to
 				name = name + "/"
 			}
 			entries = append(entries, Entry{
-				Name:    name,
-				Href:    href,
-				ModTime: modTime,
-				Size:    size,
-				IsDir:   de.IsDir(),
+				Name:     name,
+				Href:     href,
+				FullPath: filepath.Join(currentPath, de.Name()),
+				ModTime:  modTime,
+				Size:     size,
+				IsDir:    de.IsDir(),
 			})
 		}
 		sort.SliceStable(entries, func(i, j int) bool {
@@ -483,16 +495,19 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, to
 			return entries[i].Name < entries[j].Name
 		})
 		var parentDir string
+		var parentPath string
 		if absFullPath != absFileDir {
 			parentDir = filepath.Join(r.URL.Path, "..")
+			parentPath = displayPath(displayRoot, parentDir)
 		}
 		data := struct {
-			Entries   []Entry
-			PageTitle string
-			ParentDir string
-			Token     string
+			Entries    []Entry
+			PageTitle  string
+			ParentDir  string
+			ParentPath string
+			Token      string
 		}{
-			Entries: entries, PageTitle: title, ParentDir: parentDir, Token: token,
+			Entries: entries, PageTitle: title, ParentDir: parentDir, ParentPath: parentPath, Token: token,
 		}
 		tmpl, err := template.New("dir").Parse(htmlTemplate)
 		if err != nil {

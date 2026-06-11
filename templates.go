@@ -9,11 +9,11 @@ const htmlTemplate = `<!DOCTYPE html>
 <body>
 <h1>{{.PageTitle}}</h1>
 <table>
-<tr><th align="left">Name</th><th align="left">Last modified</th><th align="right">Size</th></tr>
-<tr><th colspan="3"><hr></th></tr>
-{{if .ParentDir}}<tr><td><a href="{{.ParentDir}}?token={{.Token}}">Parent Directory</a></td><td>&nbsp;</td><td align="right">  - </td></tr>
-{{end}}{{range .Entries}}<tr><td><a href="{{.Href}}?token={{$.Token}}">{{.Name}}</a></td><td>&nbsp;&nbsp;{{.ModTime}}&nbsp;&nbsp;</td><td align="right">{{.Size}}</td></tr>
-{{end}}<tr><th colspan="3"><hr></th></tr>
+<tr><th align="left">Name</th><th align="left">Last modified</th><th align="right">Size</th><th align="right">Path</th></tr>
+<tr><th colspan="4"><hr></th></tr>
+{{if .ParentDir}}<tr><td><a href="{{.ParentDir}}?token={{.Token}}">Parent Directory</a></td><td>&nbsp;</td><td align="right">  - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.ParentPath}}">Copy path</button></td></tr>
+{{end}}{{range .Entries}}<tr><td><a href="{{.Href}}?token={{$.Token}}">{{.Name}}</a></td><td>&nbsp;&nbsp;{{.ModTime}}&nbsp;&nbsp;</td><td align="right">{{.Size}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.FullPath}}">Copy path</button></td></tr>
+{{end}}<tr><th colspan="4"><hr></th></tr>
 </table>
 <hr>
 <div id="drop-zone" style="padding: 1.2em; border: 2px dashed #999; text-align: center; margin: 1em 0; font-family: sans-serif;">
@@ -29,6 +29,38 @@ const htmlTemplate = `<!DOCTYPE html>
   var dz = document.getElementById('drop-zone');
   var status = document.getElementById('upload-status');
   var token = "{{.Token}}";
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    var ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  }
+  function showCopyResult(button, label) {
+    var old = button.textContent;
+    button.textContent = label;
+    setTimeout(function() { button.textContent = old; }, 900);
+  }
+  function copyPath(button) {
+    var text = button.getAttribute('data-path');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function() {
+        showCopyResult(button, 'Copied');
+      }).catch(function() {
+        showCopyResult(button, fallbackCopy(text) ? 'Copied' : 'Copy failed');
+      });
+      return;
+    }
+    showCopyResult(button, fallbackCopy(text) ? 'Copied' : 'Copy failed');
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('.copy-path'), function(button) {
+    button.addEventListener('click', function() { copyPath(button); });
+  });
   function stop(e) { e.preventDefault(); e.stopPropagation(); }
   ['dragenter','dragover'].forEach(function(ev) {
     dz.addEventListener(ev, function(e) { stop(e); dz.style.background = '#eef'; });
