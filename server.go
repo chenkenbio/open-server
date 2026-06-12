@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -54,6 +55,11 @@ type sortLinks struct {
 	ModifiedMarker string
 	SizeHref       string
 	SizeMarker     string
+}
+
+type breadcrumb struct {
+	Label string
+	Href  string
 }
 
 const (
@@ -457,6 +463,27 @@ func displayPath(root, requestPath string) string {
 	return filepath.Clean(filepath.Join(root, rel))
 }
 
+func makeBreadcrumbs(requestPath, querySuffix string) []breadcrumb {
+	cleanPath := path.Clean("/" + strings.TrimPrefix(requestPath, "/"))
+	crumbs := []breadcrumb{{Label: ".", Href: "/" + querySuffix}}
+	if cleanPath == "/" {
+		return crumbs
+	}
+
+	currentPath := ""
+	for _, segment := range strings.Split(strings.Trim(cleanPath, "/"), "/") {
+		if segment == "" {
+			continue
+		}
+		currentPath += "/" + url.PathEscape(segment)
+		crumbs = append(crumbs, breadcrumb{
+			Label: segment,
+			Href:  currentPath + "/" + querySuffix,
+		})
+	}
+	return crumbs
+}
+
 func printOpenLink(url string) {
 	fmt.Println()
 	fmt.Println("File server ready")
@@ -633,14 +660,21 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 			parentPath = displayPath(displayRoot, parentDir)
 		}
 		data := struct {
-			Entries    []Entry
-			PageTitle  string
-			ParentDir  string
-			ParentPath string
-			Sort       sortLinks
-			Token      string
+			Entries     []Entry
+			PageTitle   string
+			Breadcrumbs []breadcrumb
+			ParentDir   string
+			ParentPath  string
+			Sort        sortLinks
+			Token       string
 		}{
-			Entries: entries, PageTitle: title, ParentDir: parentDir, ParentPath: parentPath, Sort: makeSortLinks(token, sortState), Token: token,
+			Entries:     entries,
+			PageTitle:   title,
+			Breadcrumbs: makeBreadcrumbs(r.URL.Path, querySuffix(token, sortState)),
+			ParentDir:   parentDir,
+			ParentPath:  parentPath,
+			Sort:        makeSortLinks(token, sortState),
+			Token:       token,
 		}
 		tmpl, err := template.New("dir").Parse(htmlTemplate)
 		if err != nil {

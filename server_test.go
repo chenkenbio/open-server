@@ -4,6 +4,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -173,6 +175,60 @@ func TestDisplayPath(t *testing.T) {
 				t.Fatalf("displayPath(%q, %q) = %q, want %q", root, tt.requestPath, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMakeBreadcrumbs(t *testing.T) {
+	querySuffix := "?order=asc&sort=name&token=12345678"
+	tests := []struct {
+		name        string
+		requestPath string
+		want        []breadcrumb
+	}{
+		{
+			name:        "root",
+			requestPath: "/",
+			want: []breadcrumb{
+				{Label: ".", Href: "/" + querySuffix},
+			},
+		},
+		{
+			name:        "nested path",
+			requestPath: "/figures/panels/",
+			want: []breadcrumb{
+				{Label: ".", Href: "/" + querySuffix},
+				{Label: "figures", Href: "/figures/" + querySuffix},
+				{Label: "panels", Href: "/figures/panels/" + querySuffix},
+			},
+		},
+		{
+			name:        "escaped segment",
+			requestPath: "/figure sets/panel a/",
+			want: []breadcrumb{
+				{Label: ".", Href: "/" + querySuffix},
+				{Label: "figure sets", Href: "/figure%20sets/" + querySuffix},
+				{Label: "panel a", Href: "/figure%20sets/panel%20a/" + querySuffix},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := makeBreadcrumbs(tt.requestPath, querySuffix); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("makeBreadcrumbs(%q, %q) = %#v, want %#v", tt.requestPath, querySuffix, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTemplatePlacesUploadBetweenPathAndColumnHeaders(t *testing.T) {
+	pathIndex := strings.Index(htmlTemplate, `Path: {{range`)
+	uploadIndex := strings.Index(htmlTemplate, `id="drop-zone"`)
+	headerIndex := strings.Index(htmlTemplate, `<tr><th align="left"`)
+	if pathIndex == -1 || uploadIndex == -1 || headerIndex == -1 {
+		t.Fatalf("template is missing path line, upload frame, or column header")
+	}
+	if !(pathIndex < uploadIndex && uploadIndex < headerIndex) {
+		t.Fatalf("upload frame should be between path line and column headers")
 	}
 }
 

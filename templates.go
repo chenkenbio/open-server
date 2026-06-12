@@ -8,15 +8,8 @@ const htmlTemplate = `<!DOCTYPE html>
 </head>
 <body>
 <h1>{{.PageTitle}}</h1>
-<table>
-<tr><th align="left"><a href="{{.Sort.NameHref}}">Name{{.Sort.NameMarker}}</a></th><th align="left"><a href="{{.Sort.ModifiedHref}}">Last modified{{.Sort.ModifiedMarker}}</a></th><th align="right"><a href="{{.Sort.SizeHref}}">Size{{.Sort.SizeMarker}}</a></th><th align="right">Path</th></tr>
-<tr><th colspan="4"><hr></th></tr>
-{{if .ParentDir}}<tr><td><a href="{{.ParentDir}}{{.Sort.QuerySuffix}}">Parent Directory</a></td><td>&nbsp;</td><td align="right">  - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.ParentPath}}">Copy path</button></td></tr>
-{{end}}{{range .Entries}}<tr><td><a href="{{.Href}}{{$.Sort.QuerySuffix}}">{{.Name}}</a></td><td>&nbsp;&nbsp;{{.ModTime}}&nbsp;&nbsp;</td><td align="right">{{.Size}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.FullPath}}">Copy path</button></td></tr>
-{{end}}<tr><th colspan="4"><hr></th></tr>
-</table>
-<hr>
-<div id="drop-zone" style="padding: 1.2em; border: 2px dashed #999; text-align: center; margin: 1em 0; font-family: sans-serif;">
+<p style="margin: 0 0 0.6em 0; font-family: monospace;">Path: {{range $i, $crumb := .Breadcrumbs}}{{if $i}} / {{end}}<a href="{{$crumb.Href}}">{{$crumb.Label}}</a>{{end}}</p>
+<div id="drop-zone" style="padding: 1.2em; border: 2px dashed #999; text-align: center; margin: 0 0 1em 0; font-family: sans-serif;">
 <p style="margin: 0 0 0.6em 0;">Drop files here, or use the form to upload.</p>
 <form id="upload-form" action="/upload?token={{.Token}}" method="POST" enctype="multipart/form-data" style="margin: 0;">
 <input type="file" name="file" multiple>
@@ -24,6 +17,13 @@ const htmlTemplate = `<!DOCTYPE html>
 </form>
 <p id="upload-status" style="margin: 0.6em 0 0 0; font-family: monospace; min-height: 1.2em;"></p>
 </div>
+<table>
+<tr><th align="left"><a href="{{.Sort.NameHref}}">Name{{.Sort.NameMarker}}</a></th><th align="left"><a href="{{.Sort.ModifiedHref}}">Last modified{{.Sort.ModifiedMarker}}</a></th><th align="right"><a href="{{.Sort.SizeHref}}">Size{{.Sort.SizeMarker}}</a></th><th align="right">Path</th></tr>
+<tr><th colspan="4"><hr></th></tr>
+{{if .ParentDir}}<tr><td><a href="{{.ParentDir}}{{.Sort.QuerySuffix}}">Parent Directory</a></td><td>&nbsp;</td><td align="right">  - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.ParentPath}}">Copy path</button></td></tr>
+{{end}}{{range .Entries}}<tr><td><a href="{{.Href}}{{$.Sort.QuerySuffix}}">{{.Name}}</a></td><td>&nbsp;&nbsp;{{.ModTime}}&nbsp;&nbsp;</td><td align="right">{{.Size}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.FullPath}}">Copy path</button></td></tr>
+{{end}}<tr><th colspan="4"><hr></th></tr>
+</table>
 <script>
 (function() {
   var dz = document.getElementById('drop-zone');

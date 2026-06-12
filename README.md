@@ -5,6 +5,10 @@
 
 Standalone HTTP file-sharing server: token-authenticated browse + drag-and-drop upload, in a single Go binary. Listings render in the classic Apache `IndexOptions FancyIndexing` style (modeled on [UCSC's hgdownload](https://hgdownload.cse.ucsc.edu/goldenpath/hg38/)).
 
+## Security warning
+
+`open-server` is intended for temporary file sharing on trusted lab, campus, or home networks. It serves files over plain HTTP, not HTTPS. The access token limits who can browse the server, but HTTP does not encrypt URLs, headers, cookies, file names, uploads, or downloads in transit. Anyone who can observe the network path may be able to read or modify traffic, so do not expose it as a public website or use it to transfer sensitive data.
+
 ## Features
 
 - **Zero dependencies on the host** — one statically-linked binary.
@@ -14,9 +18,10 @@ Standalone HTTP file-sharing server: token-authenticated browse + drag-and-drop 
 - **Automatic timeout exit** after `--duration 7d` by default; accepts `d`, `h`, and `m` suffixes.
 - **Custom page title** via `--title "Shared files"`; by default the listing title is the full served folder path, expanding `~` while preserving logical symlink names.
 - **UCSC-style directory listing** — borderless table with Name / Last modified / Size, Apache-style size suffixes (`12.0K`, `2.0M`).
+- **Clickable relative path breadcrumbs** — jump directly to any parent level without scrolling through the listing.
 - **Sortable listing columns** — click `Name`, `Last modified`, or `Size` to toggle ascending/descending order.
 - **Experimental: copy full server paths** from a right-aligned `Path` column, useful for pasting figure paths into LaTeX on the same server.
-- **Drag-and-drop uploads** with per-file progress indicator; falls back to a plain multipart `<form>` if JavaScript is off.
+- **Drag-and-drop uploads near the top of the listing** with per-file progress indicator; falls back to a plain multipart `<form>` if JavaScript is off.
 - **Path-traversal protection** on both browse and upload.
 
 ## Install
@@ -65,6 +70,8 @@ Open this secure link in your browser:
 Visiting the link drops a `Set-Cookie: open_server_token=…` so subsequent navigation within the directory tree no longer needs the `?token=` parameter in the URL bar. Stop with `Ctrl+C`.
 
 If `--title` is omitted, the browser title and listing header default to the full served folder path. `~` is expanded to your home directory. For `open-server .`, a valid logical `$PWD` is used so running from a symlinked directory displays that symlink path instead of the resolved target path.
+
+Directory pages show a relative breadcrumb path below the title. Each path level is clickable and preserves the active token and sort settings, so you can jump back to any parent directory directly. The drag-and-drop upload frame is placed below this path and above the listing headers for easier access in large directories.
 
 Each listed file and directory has an experimental right-aligned `Path` column with a `Copy path` button that copies the full server filesystem path. This is useful for LaTeX work on the same server: browse to a figure, copy its path, and paste it directly into your `.tex` source.
 
