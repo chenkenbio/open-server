@@ -144,7 +144,7 @@ func TestServeFilesExitsAfterDuration(t *testing.T) {
 	dir := t.TempDir()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveFiles("127.0.0.1", 0, 0, dir, "", "test", dir, "12345678", 20*time.Millisecond)
+		done <- serveFiles("127.0.0.1", 0, 0, dir, "", "test", dir, "12345678", "", "", 20*time.Millisecond)
 	}()
 
 	select {

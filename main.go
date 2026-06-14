@@ -48,6 +48,8 @@ func main() {
 		portSpec string
 		title    string
 		token    string
+		tbBin    string
+		tbDir    string
 	)
 	defAddr := defaultAddress()
 	defPort := defaultPortSpec()
@@ -59,6 +61,8 @@ func main() {
 	flag.StringVar(&title, "title", "", "page title; defaults to full served folder path")
 	flag.StringVar(&title, "t", "", "page title (shorthand)")
 	flag.StringVar(&token, "token", "", "access token (>=8 chars); auto-generated if empty")
+	flag.StringVar(&tbDir, "tb-dir", "", "TensorBoard logdir; launches & reverse-proxies an external tensorboard under /tensorboard/")
+	flag.StringVar(&tbBin, "tb-bin", "", "path to the tensorboard binary (default: 'tensorboard' on PATH)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] [path]\n\nServes a file or directory over HTTP with token auth.\nIf no path is given, the current directory is served.\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
@@ -98,7 +102,7 @@ func main() {
 		title = displayRoot
 	}
 
-	if err := serveFiles(address, portLo, portHi, fileDir, fileBase, title, displayRoot, token, lifetime); err != nil {
+	if err := serveFiles(address, portLo, portHi, fileDir, fileBase, title, displayRoot, token, tbBin, tbDir, lifetime); err != nil {
 		log.Fatalf("%v", err)
 	}
 }

@@ -14,12 +14,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackpal/gateway"
@@ -584,9 +586,28 @@ func uploadHandler(fileDir string) http.HandlerFunc {
 	}
 }
 
-func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, displayRoot, token string, duration time.Duration) error {
+func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, displayRoot, token, tbBin, tbDir string, duration time.Duration) error {
 	appMux := http.NewServeMux()
 	appMux.HandleFunc("/upload", uploadHandler(fileDir))
+
+	var tb *tbProcess
+	if tbDir != "" {
+		var err error
+		tb, err = startTensorboard(tbBin, tbDir)
+		if err != nil {
+			return err
+		}
+		// Register before finalHandler is built so the proxy inherits the token
+		// auth and panic middleware below.
+		appMux.Handle(tbPathPrefix+"/", tb.proxy)
+		appMux.HandleFunc(tbPathPrefix, func(w http.ResponseWriter, r *http.Request) {
+			target := tbPathPrefix + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		})
+	}
 
 	appMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fullPath := filepath.Join(fileDir, r.URL.Path)
@@ -708,8 +729,23 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 	printOpenLink(link)
 	fmt.Printf("\nServing:  %s\nAddress:  http://%s:%d/\nDuration: %s\nStop:     Ctrl+C\n", fileDir, address, boundPort, formatDurationSpec(duration))
 
+	if tb != nil {
+		// Backstop in case neither the timer nor the signal path runs (e.g. an
+		// unexpected Serve error). stop() is guarded by sync.Once.
+		defer tb.stop()
+		if tb.waitReady(15 * time.Second) {
+			tbLink := fmt.Sprintf("http://%s:%d%s/?token=%s", address, boundPort, tbPathPrefix, token)
+			fmt.Printf("\nTensorBoard ready (logdir: %s)\nOpen: %s\n", tbDir, tbLink)
+		} else {
+			fmt.Printf("\nTensorBoard did not become ready within 15s; it may still be starting.\nTry: http://%s:%d%s/?token=%s\n", address, boundPort, tbPathPrefix, token)
+		}
+	}
+
 	timer := time.AfterFunc(duration, func() {
 		log.Printf("Duration %s reached; shutting down", formatDurationSpec(duration))
+		if tb != nil {
+			tb.stop()
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
@@ -718,6 +754,26 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 		}
 	})
 	defer timer.Stop()
+
+	// Handle Ctrl+C / SIGTERM so the TensorBoard subprocess is reaped instead of
+	// orphaned. Without TensorBoard there is no prior signal handler either, but
+	// it is only required when a child process is running.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		log.Printf("Signal received; shutting down")
+		if tb != nil {
+			tb.stop()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Graceful shutdown failed: %v", err)
+			_ = server.Close()
+		}
+	}()
 
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("file server stopped unexpectedly: %w", err)
