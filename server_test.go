@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -140,6 +144,133 @@ func TestSortEntries(t *testing.T) {
 	}
 }
 
+func newMultipartUploadRequest(t *testing.T, targetURL, fileName, content string) *http.Request {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		t.Fatalf("create multipart file: %v", err)
+	}
+	if _, err := part.Write([]byte(content)); err != nil {
+		t.Fatalf("write multipart content: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, targetURL, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
+}
+
+func TestUploadHandlerUsesRequestedDirectory(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "nested")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+
+	req := newMultipartUploadRequest(t, "/upload?dir=/nested/&token=12345678", "note.txt", "hello")
+	rec := httptest.NewRecorder()
+	uploadHandler(root).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(nested, "note.txt"))
+	if err != nil {
+		t.Fatalf("read uploaded file: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("uploaded content = %q, want %q", got, "hello")
+	}
+	if _, err := os.Stat(filepath.Join(root, "note.txt")); !os.IsNotExist(err) {
+		t.Fatalf("upload should not write to served root; stat err = %v", err)
+	}
+}
+
+func TestUploadHandlerRejectsParentDirectoryTarget(t *testing.T) {
+	root := t.TempDir()
+	req := newMultipartUploadRequest(t, "/upload?dir=/../&token=12345678", "note.txt", "hello")
+	rec := httptest.NewRecorder()
+	uploadHandler(root).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("upload status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+}
+
+func TestUploadHandlerRejectsExistingFileWithoutOverwrite(t *testing.T) {
+	root := t.TempDir()
+	dstPath := filepath.Join(root, "note.txt")
+	if err := os.WriteFile(dstPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write existing file: %v", err)
+	}
+
+	req := newMultipartUploadRequest(t, "/upload?dir=/&token=12345678", "note.txt", "new")
+	rec := httptest.NewRecorder()
+	uploadHandler(root).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("upload status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("read existing file: %v", err)
+	}
+	if string(got) != "old" {
+		t.Fatalf("existing content = %q, want %q", got, "old")
+	}
+}
+
+func TestUploadHandlerOverwritesExistingFileWhenRequested(t *testing.T) {
+	root := t.TempDir()
+	dstPath := filepath.Join(root, "note.txt")
+	if err := os.WriteFile(dstPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("write existing file: %v", err)
+	}
+
+	req := newMultipartUploadRequest(t, "/upload?dir=/&overwrite=1&token=12345678", "note.txt", "new")
+	rec := httptest.NewRecorder()
+	uploadHandler(root).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatalf("read overwritten file: %v", err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("overwritten content = %q, want %q", got, "new")
+	}
+}
+
+func TestUploadHandlerDoesNotOverwriteExistingDirectory(t *testing.T) {
+	root := t.TempDir()
+	dstPath := filepath.Join(root, "note.txt")
+	if err := os.Mkdir(dstPath, 0o755); err != nil {
+		t.Fatalf("mkdir conflict directory: %v", err)
+	}
+
+	req := newMultipartUploadRequest(t, "/upload?dir=/&overwrite=1&token=12345678", "note.txt", "new")
+	rec := httptest.NewRecorder()
+	uploadHandler(root).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("upload status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	info, err := os.Stat(dstPath)
+	if err != nil {
+		t.Fatalf("stat conflict path: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("conflict path should remain a directory")
+	}
+}
+
 func TestServeFilesExitsAfterDuration(t *testing.T) {
 	dir := t.TempDir()
 	done := make(chan error, 1)
@@ -229,6 +360,19 @@ func TestTemplatePlacesUploadBetweenPathAndColumnHeaders(t *testing.T) {
 	}
 	if !(pathIndex < uploadIndex && uploadIndex < headerIndex) {
 		t.Fatalf("upload frame should be between path line and column headers")
+	}
+}
+
+func TestTemplateIncludesUploadConflictDialog(t *testing.T) {
+	for _, want := range []string{
+		`id="conflict-modal"`,
+		`id="conflict-overwrite"`,
+		`id="conflict-skip"`,
+		`Apply this choice to all remaining conflicts`,
+	} {
+		if !strings.Contains(htmlTemplate, want) {
+			t.Fatalf("template missing %q", want)
+		}
 	}
 }
 

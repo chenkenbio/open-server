@@ -198,6 +198,17 @@ func querySuffix(token string, state sortState) string {
 	return "?" + values.Encode()
 }
 
+func cleanURLPath(requestPath string) string {
+	return path.Clean("/" + strings.TrimPrefix(requestPath, "/"))
+}
+
+func uploadURL(token, requestPath string) string {
+	values := url.Values{}
+	values.Set("dir", cleanURLPath(requestPath))
+	values.Set("token", token)
+	return "/upload?" + values.Encode()
+}
+
 func makeSortLinks(token string, state sortState) sortLinks {
 	return sortLinks{
 		QuerySuffix:    querySuffix(token, state),
@@ -530,10 +541,76 @@ func bindListener(address string, lo, hi int) (net.Listener, int, error) {
 	return nil, 0, fmt.Errorf("could not bind any port in [%d,%d] after 5 attempts: %w", lo, hi, lastErr)
 }
 
+func hasParentDirSegment(requestPath string) bool {
+	for _, segment := range strings.Split(requestPath, "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func uploadTargetDir(fileDir, requestPath string) (string, error) {
+	if hasParentDirSegment(requestPath) {
+		return "", fmt.Errorf("parent directory segments are not allowed in upload target")
+	}
+	cleanRequest := cleanURLPath(requestPath)
+	rel := strings.TrimPrefix(cleanRequest, "/")
+	targetDir := filepath.Join(fileDir, filepath.FromSlash(rel))
+	absRoot, rootErr := filepath.Abs(fileDir)
+	absTarget, targetErr := filepath.Abs(targetDir)
+	if rootErr != nil || targetErr != nil {
+		return "", fmt.Errorf("cannot resolve upload target")
+	}
+	if !isPathWithin(absTarget, absRoot) {
+		return "", fmt.Errorf("upload target escapes served root")
+	}
+	info, err := os.Stat(absTarget)
+	if err != nil {
+		return "", fmt.Errorf("cannot access upload target: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("upload target is not a directory")
+	}
+	return absTarget, nil
+}
+
+var errUploadConflict = errors.New("upload destination already exists")
+
+func openUploadDestination(dstPath string, overwrite bool) (*os.File, error) {
+	info, err := os.Stat(dstPath)
+	if err == nil && info.IsDir() {
+		return nil, errUploadConflict
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	flags := os.O_WRONLY | os.O_CREATE
+	if overwrite {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_EXCL
+	}
+	dst, err := os.OpenFile(dstPath, flags, 0o666)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, errUploadConflict
+		}
+		return nil, err
+	}
+	return dst, nil
+}
+
 func uploadHandler(fileDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		targetDir, targetErr := uploadTargetDir(fileDir, r.URL.Query().Get("dir"))
+		if targetErr != nil {
+			http.Error(w, "Forbidden: invalid upload target", http.StatusForbidden)
 			return
 		}
 		reader, err := r.MultipartReader()
@@ -541,7 +618,8 @@ func uploadHandler(fileDir string) http.HandlerFunc {
 			http.Error(w, "Bad request: expected multipart/form-data", http.StatusBadRequest)
 			return
 		}
-		absDir, absErr := filepath.Abs(fileDir)
+		overwrite := r.URL.Query().Get("overwrite") == "1"
+		absDir, absErr := filepath.Abs(targetDir)
 		if absErr != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
@@ -559,14 +637,18 @@ func uploadHandler(fileDir string) http.HandlerFunc {
 			if part.FileName() == "" {
 				continue
 			}
-			dstPath := filepath.Join(fileDir, part.FileName())
+			dstPath := filepath.Join(targetDir, part.FileName())
 			absDst, absErr2 := filepath.Abs(dstPath)
 			if absErr2 != nil || !isPathWithin(absDst, absDir) {
 				http.Error(w, "Forbidden: path traversal not allowed", http.StatusForbidden)
 				return
 			}
-			dst, err := os.Create(dstPath)
+			dst, err := openUploadDestination(dstPath, overwrite)
 			if err != nil {
+				if errors.Is(err, errUploadConflict) {
+					http.Error(w, "Conflict: file already exists", http.StatusConflict)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -580,7 +662,7 @@ func uploadHandler(fileDir string) http.HandlerFunc {
 				http.Error(w, closeErr.Error(), http.StatusInternalServerError)
 				return
 			}
-			log.Printf("Uploaded file: %q", part.FileName())
+			log.Printf("Uploaded file: %q to %q", part.FileName(), targetDir)
 		}
 		w.WriteHeader(http.StatusOK)
 	}
@@ -687,7 +769,7 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 			ParentDir   string
 			ParentPath  string
 			Sort        sortLinks
-			Token       string
+			UploadURL   string
 		}{
 			Entries:     entries,
 			PageTitle:   title,
@@ -695,7 +777,7 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 			ParentDir:   parentDir,
 			ParentPath:  parentPath,
 			Sort:        makeSortLinks(token, sortState),
-			Token:       token,
+			UploadURL:   uploadURL(token, r.URL.Path),
 		}
 		tmpl, err := template.New("dir").Parse(htmlTemplate)
 		if err != nil {

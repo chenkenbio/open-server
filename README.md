@@ -21,7 +21,7 @@ Standalone HTTP file-sharing server: token-authenticated browse + drag-and-drop 
 - **Clickable relative path breadcrumbs** — jump directly to any parent level without scrolling through the listing.
 - **Sortable listing columns** — click `Name`, `Last modified`, or `Size` to toggle ascending/descending order.
 - **Experimental: copy full server paths** from a right-aligned `Path` column, useful for pasting figure paths into LaTeX on the same server.
-- **Drag-and-drop uploads near the top of the listing** with per-file progress indicator; falls back to a plain multipart `<form>` if JavaScript is off.
+- **Current-folder uploads near the top of the listing** with per-file progress indicator and overwrite/skip prompts for filename conflicts; falls back to a plain multipart `<form>` if JavaScript is off.
 - **Path-traversal protection** on both browse and upload.
 
 ## Install
@@ -71,7 +71,9 @@ Visiting the link drops a `Set-Cookie: open_server_token=…` so subsequent navi
 
 If `--title` is omitted, the browser title and listing header default to the full served folder path. `~` is expanded to your home directory. For `open-server .`, a valid logical `$PWD` is used so running from a symlinked directory displays that symlink path instead of the resolved target path.
 
-Directory pages show a relative breadcrumb path below the title. Each path level is clickable and preserves the active token and sort settings, so you can jump back to any parent directory directly. The drag-and-drop upload frame is placed below this path and above the listing headers for easier access in large directories.
+Directory pages show a relative breadcrumb path below the title. Each path level is clickable and preserves the active token and sort settings, so you can jump back to any parent directory directly. The drag-and-drop upload frame is placed below this path and above the listing headers for easier access in large directories. Uploads are saved into the directory currently being viewed.
+
+If a JavaScript upload would replace an existing filename, `open-server` asks whether to overwrite or skip that file. The dialog includes an **Apply this choice to all remaining conflicts** checkbox for multi-file uploads. Plain multipart form uploads do not overwrite existing files automatically; conflicting filenames return `409 Conflict`.
 
 Each listed file and directory has an experimental right-aligned `Path` column with a `Copy path` button that copies the full server filesystem path. This is useful for LaTeX work on the same server: browse to a figure, copy its path, and paste it directly into your `.tex` source.
 
