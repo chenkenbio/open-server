@@ -7,7 +7,7 @@ const htmlTemplate = `<!DOCTYPE html>
 <title>{{.PageTitle}}</title>
 </head>
 <body>
-<h1>{{.PageTitle}}</h1>
+<h1 style="font-family: monospace;">{{.PageTitle}}</h1>
 <p style="margin: 0 0 0.6em 0; font-family: monospace;">Path: {{range $i, $crumb := .Breadcrumbs}}{{if $i}} / {{end}}<a href="{{$crumb.Href}}">{{$crumb.Label}}</a>{{end}}</p>
 <div id="drop-zone" style="padding: 1.2em; border: 2px dashed #999; text-align: center; margin: 0 0 1em 0; font-family: sans-serif;">
 <p style="margin: 0 0 0.6em 0;">Drop files here, or use the form to upload.</p>

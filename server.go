@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -64,12 +66,43 @@ type breadcrumb struct {
 	Href  string
 }
 
+type serveMode string
+
+const (
+	serveModeTCP serveMode = "tcp-http"
+	serveModeSSH serveMode = "ssh-unix"
+)
+
+type serveOptions struct {
+	Mode         serveMode
+	Address      string
+	PortLo       int
+	PortHi       int
+	FileDir      string
+	FileBase     string
+	Title        string
+	DisplayRoot  string
+	Token        string
+	TBBin        string
+	TBDir        string
+	Duration     time.Duration
+	LocalPort    int
+	SocketPath   string
+	SSHHost      string
+	SecureCookie bool
+	StartWatcher bool
+}
+
 const (
 	sortByName     = "name"
 	sortByModified = "modified"
 	sortBySize     = "size"
 	sortOrderAsc   = "asc"
 	sortOrderDesc  = "desc"
+
+	legacyAuthCookieName = "open_server_token"
+	authCookieNamePrefix = "open_server_token_"
+	authCookieMaxAge     = 12 * 60 * 60
 )
 
 func parsePortSpec(s string) (int, int, error) {
@@ -182,17 +215,15 @@ func nextSortOrder(state sortState, column string) string {
 	return sortOrderAsc
 }
 
-func sortHref(token string, state sortState, column string) string {
+func sortHref(state sortState, column string) string {
 	values := url.Values{}
-	values.Set("token", token)
 	values.Set("sort", column)
 	values.Set("order", nextSortOrder(state, column))
 	return "?" + values.Encode()
 }
 
-func querySuffix(token string, state sortState) string {
+func querySuffix(state sortState) string {
 	values := url.Values{}
-	values.Set("token", token)
 	values.Set("sort", state.Column)
 	values.Set("order", state.Order)
 	return "?" + values.Encode()
@@ -202,21 +233,20 @@ func cleanURLPath(requestPath string) string {
 	return path.Clean("/" + strings.TrimPrefix(requestPath, "/"))
 }
 
-func uploadURL(token, requestPath string) string {
+func uploadURL(requestPath string) string {
 	values := url.Values{}
 	values.Set("dir", cleanURLPath(requestPath))
-	values.Set("token", token)
 	return "/upload?" + values.Encode()
 }
 
-func makeSortLinks(token string, state sortState) sortLinks {
+func makeSortLinks(state sortState) sortLinks {
 	return sortLinks{
-		QuerySuffix:    querySuffix(token, state),
-		NameHref:       sortHref(token, state, sortByName),
+		QuerySuffix:    querySuffix(state),
+		NameHref:       sortHref(state, sortByName),
 		NameMarker:     sortMarker(state, sortByName),
-		ModifiedHref:   sortHref(token, state, sortByModified),
+		ModifiedHref:   sortHref(state, sortByModified),
 		ModifiedMarker: sortMarker(state, sortByModified),
-		SizeHref:       sortHref(token, state, sortBySize),
+		SizeHref:       sortHref(state, sortBySize),
 		SizeMarker:     sortMarker(state, sortBySize),
 	}
 }
@@ -369,7 +399,38 @@ func panicMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func tokenAuthMiddleware(next http.Handler, token string) http.Handler {
+func tokenMatches(got, want string) bool {
+	gotHash := sha256.Sum256([]byte(got))
+	wantHash := sha256.Sum256([]byte(want))
+	return len(got) == len(want) && subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
+}
+
+func tokenStrippedURI(r *http.Request) string {
+	nextURL := *r.URL
+	values := nextURL.Query()
+	values.Del("token")
+	nextURL.RawQuery = values.Encode()
+	return nextURL.RequestURI()
+}
+
+func authCookieName(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return authCookieNamePrefix + hex.EncodeToString(sum[:])[:16]
+}
+
+func setAuthCookie(w http.ResponseWriter, token string, secureCookie bool) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     authCookieName(token),
+		Value:    token,
+		Path:     "/",
+		MaxAge:   authCookieMaxAge,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   secureCookie,
+	})
+}
+
+func tokenAuthMiddleware(next http.Handler, token string, secureCookie bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/favicon.ico" {
 			http.NotFound(w, r)
@@ -377,24 +438,30 @@ func tokenAuthMiddleware(next http.Handler, token string) http.Handler {
 		}
 		queryToken := r.URL.Query().Get("token")
 		cookieToken := ""
-		if cookie, err := r.Cookie("open_server_token"); err == nil {
+		legacyCookieToken := ""
+		if cookie, err := r.Cookie(authCookieName(token)); err == nil {
 			cookieToken = cookie.Value
 		}
+		if cookie, err := r.Cookie(legacyAuthCookieName); err == nil {
+			legacyCookieToken = cookie.Value
+		}
 
-		if queryToken == token || cookieToken == token {
-			if queryToken == token {
-				http.SetCookie(w, &http.Cookie{
-					Name:     "open_server_token",
-					Value:    token,
-					Path:     "/",
-					MaxAge:   12 * 60 * 60,
-					HttpOnly: true,
-					SameSite: http.SameSiteLaxMode,
-				})
+		queryValid := tokenMatches(queryToken, token)
+		cookieValid := tokenMatches(cookieToken, token)
+		legacyCookieValid := tokenMatches(legacyCookieToken, token)
+		if queryValid || cookieValid || legacyCookieValid {
+			if queryValid || legacyCookieValid {
+				setAuthCookie(w, token, secureCookie)
+			}
+			if queryValid {
+				if r.Method == http.MethodGet || r.Method == http.MethodHead {
+					http.Redirect(w, r, tokenStrippedURI(r), http.StatusSeeOther)
+					return
+				}
 			}
 			next.ServeHTTP(w, r)
 		} else {
-			writeForbiddenPage(w, queryToken != "", cookieToken != "")
+			writeForbiddenPage(w, queryToken != "", cookieToken != "" || legacyCookieToken != "")
 		}
 	})
 }
@@ -438,6 +505,13 @@ func openURL(host string, port int, fileBase, token string) string {
 		path = "/" + url.PathEscape(fileBase)
 	}
 	return fmt.Sprintf("http://%s:%d%s?token=%s", host, port, path, token)
+}
+
+func openURLWithPath(host string, port int, requestPath, token string) string {
+	if requestPath == "" {
+		requestPath = "/"
+	}
+	return fmt.Sprintf("http://%s:%d%s?token=%s", host, port, requestPath, token)
 }
 
 func logicalWorkingDir() string {
@@ -501,6 +575,18 @@ func printOpenLink(url string) {
 	fmt.Println()
 	fmt.Println("File server ready")
 	fmt.Println("Open this secure link in your browser:")
+	sepLine := strings.Repeat("━", len(url)+2)
+	fmt.Printf("\n┏%s┓\n┃ %s ┃\n┗%s┛\n", sepLine, url, sepLine)
+}
+
+func printSSHOpenLink(command, url string) {
+	fmt.Println()
+	fmt.Println("File server ready")
+	fmt.Println("Server is listening on a private Unix socket.")
+	fmt.Println("Run this SSH tunnel from your local device:")
+	fmt.Printf("\n  %s\n", command)
+	fmt.Println()
+	fmt.Println("Then open this local link in your browser:")
 	sepLine := strings.Repeat("━", len(url)+2)
 	fmt.Printf("\n┏%s┓\n┃ %s ┃\n┗%s┛\n", sepLine, url, sepLine)
 }
@@ -669,13 +755,33 @@ func uploadHandler(fileDir string) http.HandlerFunc {
 }
 
 func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, displayRoot, token, tbBin, tbDir string, duration time.Duration) error {
+	return serveFilesWithOptions(serveOptions{
+		Mode:        serveModeTCP,
+		Address:     address,
+		PortLo:      portLo,
+		PortHi:      portHi,
+		FileDir:     fileDir,
+		FileBase:    fileBase,
+		Title:       title,
+		DisplayRoot: displayRoot,
+		Token:       token,
+		TBBin:       tbBin,
+		TBDir:       tbDir,
+		Duration:    duration,
+	})
+}
+
+func serveFilesWithOptions(opt serveOptions) error {
+	if opt.Mode == "" {
+		opt.Mode = serveModeTCP
+	}
 	appMux := http.NewServeMux()
-	appMux.HandleFunc("/upload", uploadHandler(fileDir))
+	appMux.HandleFunc("/upload", uploadHandler(opt.FileDir))
 
 	var tb *tbProcess
-	if tbDir != "" {
+	if opt.TBDir != "" {
 		var err error
-		tb, err = startTensorboard(tbBin, tbDir)
+		tb, err = startTensorboard(opt.TBBin, opt.TBDir)
 		if err != nil {
 			return err
 		}
@@ -692,8 +798,8 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 	}
 
 	appMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fullPath := filepath.Join(fileDir, r.URL.Path)
-		absFileDir, absErr := filepath.Abs(fileDir)
+		fullPath := filepath.Join(opt.FileDir, r.URL.Path)
+		absFileDir, absErr := filepath.Abs(opt.FileDir)
 		absFullPath, absPathErr := filepath.Abs(fullPath)
 		if absErr != nil || absPathErr != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -722,7 +828,7 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 			return
 		}
 		sortState := parseSortState(r.URL.Query())
-		currentPath := displayPath(displayRoot, r.URL.Path)
+		currentPath := displayPath(opt.DisplayRoot, r.URL.Path)
 		entries := make([]Entry, 0, len(dirEntries))
 		for _, de := range dirEntries {
 			fi, infoErr := de.Info()
@@ -760,7 +866,7 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 		var parentPath string
 		if absFullPath != absFileDir {
 			parentDir = filepath.Join(r.URL.Path, "..")
-			parentPath = displayPath(displayRoot, parentDir)
+			parentPath = displayPath(opt.DisplayRoot, parentDir)
 		}
 		data := struct {
 			Entries     []Entry
@@ -772,12 +878,12 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 			UploadURL   string
 		}{
 			Entries:     entries,
-			PageTitle:   title,
-			Breadcrumbs: makeBreadcrumbs(r.URL.Path, querySuffix(token, sortState)),
+			PageTitle:   opt.Title,
+			Breadcrumbs: makeBreadcrumbs(r.URL.Path, querySuffix(sortState)),
 			ParentDir:   parentDir,
 			ParentPath:  parentPath,
-			Sort:        makeSortLinks(token, sortState),
-			UploadURL:   uploadURL(token, r.URL.Path),
+			Sort:        makeSortLinks(sortState),
+			UploadURL:   uploadURL(r.URL.Path),
 		}
 		tmpl, err := template.New("dir").Parse(htmlTemplate)
 		if err != nil {
@@ -793,7 +899,7 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 		}
 	})
 
-	finalHandler := panicMiddleware(tokenAuthMiddleware(appMux, token))
+	finalHandler := panicMiddleware(tokenAuthMiddleware(appMux, opt.Token, opt.SecureCookie))
 	server := &http.Server{
 		Handler:      finalHandler,
 		ReadTimeout:  10 * time.Minute,
@@ -801,30 +907,79 @@ func serveFiles(address string, portLo, portHi int, fileDir, fileBase, title, di
 		IdleTimeout:  120 * time.Second,
 	}
 
-	listener, boundPort, err := bindListener(address, portLo, portHi)
-	if err != nil {
-		return err
+	var (
+		boundPort int
+		listener  net.Listener
+		err       error
+	)
+	switch opt.Mode {
+	case serveModeTCP:
+		listener, boundPort, err = bindListener(opt.Address, opt.PortLo, opt.PortHi)
+		if err != nil {
+			return err
+		}
+		link := openURL(opt.Address, boundPort, opt.FileBase, opt.Token)
+		printOpenLink(link)
+		fmt.Printf(
+			"\nServing:  %s\nAddress:  http://%s:%d/\nDuration: %s\nStop:     Ctrl+C\n",
+			opt.FileDir,
+			opt.Address,
+			boundPort,
+			formatDurationSpec(opt.Duration),
+		)
+	case serveModeSSH:
+		target, err := prepareSSHSocketTarget(opt.SocketPath)
+		if err != nil {
+			return err
+		}
+		defer target.cleanup()
+		if opt.StartWatcher {
+			if _, err := startCleanupWatcher(target); err != nil {
+				return fmt.Errorf("could not start cleanup watcher: %w", err)
+			}
+		}
+		listener, err = net.Listen("unix", target.SocketPath)
+		if err != nil {
+			return fmt.Errorf("cannot listen on Unix socket %q: %w", target.SocketPath, err)
+		}
+		link := openURL("127.0.0.1", opt.LocalPort, opt.FileBase, opt.Token)
+		printSSHOpenLink(sshTunnelCommand(opt.SSHHost, opt.LocalPort, target.SocketPath), link)
+		fmt.Printf(
+			"\nServing:  %s\nSocket:   %s\nDuration: %s\nStop:     Ctrl+C\n",
+			opt.FileDir,
+			target.SocketPath,
+			formatDurationSpec(opt.Duration),
+		)
+	default:
+		return fmt.Errorf("unsupported serve mode %q", opt.Mode)
 	}
 	defer listener.Close()
-
-	link := openURL(address, boundPort, fileBase, token)
-	printOpenLink(link)
-	fmt.Printf("\nServing:  %s\nAddress:  http://%s:%d/\nDuration: %s\nStop:     Ctrl+C\n", fileDir, address, boundPort, formatDurationSpec(duration))
 
 	if tb != nil {
 		// Backstop in case neither the timer nor the signal path runs (e.g. an
 		// unexpected Serve error). stop() is guarded by sync.Once.
 		defer tb.stop()
 		if tb.waitReady(15 * time.Second) {
-			tbLink := fmt.Sprintf("http://%s:%d%s/?token=%s", address, boundPort, tbPathPrefix, token)
-			fmt.Printf("\nTensorBoard ready (logdir: %s)\nOpen: %s\n", tbDir, tbLink)
+			tbLink := ""
+			if opt.Mode == serveModeSSH {
+				tbLink = openURLWithPath("127.0.0.1", opt.LocalPort, tbPathPrefix+"/", opt.Token)
+			} else {
+				tbLink = openURLWithPath(opt.Address, boundPort, tbPathPrefix+"/", opt.Token)
+			}
+			fmt.Printf("\nTensorBoard ready (logdir: %s)\nOpen: %s\n", opt.TBDir, tbLink)
 		} else {
-			fmt.Printf("\nTensorBoard did not become ready within 15s; it may still be starting.\nTry: http://%s:%d%s/?token=%s\n", address, boundPort, tbPathPrefix, token)
+			tbLink := ""
+			if opt.Mode == serveModeSSH {
+				tbLink = openURLWithPath("127.0.0.1", opt.LocalPort, tbPathPrefix+"/", opt.Token)
+			} else {
+				tbLink = openURLWithPath(opt.Address, boundPort, tbPathPrefix+"/", opt.Token)
+			}
+			fmt.Printf("\nTensorBoard did not become ready within 15s; it may still be starting.\nTry: %s\n", tbLink)
 		}
 	}
 
-	timer := time.AfterFunc(duration, func() {
-		log.Printf("Duration %s reached; shutting down", formatDurationSpec(duration))
+	timer := time.AfterFunc(opt.Duration, func() {
+		log.Printf("Duration %s reached; shutting down", formatDurationSpec(opt.Duration))
 		if tb != nil {
 			tb.stop()
 		}

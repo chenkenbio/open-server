@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -288,6 +292,286 @@ func TestServeFilesExitsAfterDuration(t *testing.T) {
 	}
 }
 
+func TestServeFilesSSHServesOverUnixSocket(t *testing.T) {
+	dir := t.TempDir()
+	socketDir := t.TempDir()
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		t.Fatalf("chmod socket dir: %v", err)
+	}
+	socketPath := filepath.Join(socketDir, "server.sock")
+	done := make(chan error, 1)
+	go func() {
+		done <- serveFilesWithOptions(serveOptions{
+			Mode:        serveModeSSH,
+			FileDir:     dir,
+			Title:       "test",
+			DisplayRoot: dir,
+			Token:       "12345678",
+			Duration:    300 * time.Millisecond,
+			LocalPort:   60123,
+			SocketPath:  socketPath,
+			SSHHost:     "user@example",
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, err := net.DialTimeout("unix", socketPath, 20*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		select {
+		case serveErr := <-done:
+			t.Fatalf("server exited before creating Unix socket: %v", serveErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server did not create Unix socket %q", socketPath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://open-server/", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: "open_server_token", Value: "12345678"})
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Unix socket HTTP request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveFilesWithOptions returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SSH-mode server did not exit after duration")
+	}
+	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+		t.Fatalf("socket should be removed after shutdown; stat err = %v", err)
+	}
+}
+
+func TestTokenAuthRedirectStripsQueryToken(t *testing.T) {
+	nextCalled := false
+	handler := tokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+	}), "12345678", false)
+	req := httptest.NewRequest(http.MethodGet, "/figures/?token=12345678&sort=name", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if nextCalled {
+		t.Fatal("next handler should not run during token-stripping redirect")
+	}
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusSeeOther)
+	}
+	if got, want := rec.Header().Get("Location"), "/figures/?sort=name"; got != want {
+		t.Fatalf("Location = %q, want %q", got, want)
+	}
+	if len(rec.Result().Cookies()) != 1 {
+		t.Fatalf("expected one auth cookie, got %d", len(rec.Result().Cookies()))
+	}
+	if got, want := rec.Result().Cookies()[0].Name, authCookieName("12345678"); got != want {
+		t.Fatalf("auth cookie name = %q, want %q", got, want)
+	}
+}
+
+func TestTokenAuthCookieAllowsRequest(t *testing.T) {
+	handler := tokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), "12345678", false)
+	req := httptest.NewRequest(http.MethodGet, "/?sort=name", nil)
+	req.AddCookie(&http.Cookie{Name: authCookieName("12345678"), Value: "12345678"})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+}
+
+func TestTokenAuthLegacyCookieAllowsRequestAndUpgrades(t *testing.T) {
+	handler := tokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), "12345678", false)
+	req := httptest.NewRequest(http.MethodGet, "/?sort=name", nil)
+	req.AddCookie(&http.Cookie{Name: legacyAuthCookieName, Value: "12345678"})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("expected upgraded auth cookie, got %d cookies", len(cookies))
+	}
+	if got, want := cookies[0].Name, authCookieName("12345678"); got != want {
+		t.Fatalf("upgraded auth cookie name = %q, want %q", got, want)
+	}
+}
+
+func TestTokenAuthCookiesDoNotConflictAcrossPorts(t *testing.T) {
+	newServer := func(token string) *httptest.Server {
+		return httptest.NewServer(tokenAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}), token, false))
+	}
+	serverA := newServer("12345678")
+	defer serverA.Close()
+	serverB := newServer("abcdefgh")
+	defer serverB.Close()
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("create cookie jar: %v", err)
+	}
+	client := &http.Client{Jar: jar}
+	for _, rawURL := range []string{
+		serverA.URL + "/?token=12345678",
+		serverB.URL + "/?token=abcdefgh",
+		serverA.URL,
+	} {
+		resp, err := client.Get(rawURL)
+		if err != nil {
+			t.Fatalf("GET %s: %v", rawURL, err)
+		}
+		if resp.StatusCode != http.StatusNoContent {
+			resp.Body.Close()
+			t.Fatalf("GET %s status = %d, want %d", rawURL, resp.StatusCode, http.StatusNoContent)
+		}
+		resp.Body.Close()
+	}
+}
+
+func TestDefaultSocketBaseDirUsesTMPDIR(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	want := filepath.Join(tmp, "open-server-"+strconv.Itoa(os.Getuid()))
+	if got := defaultSocketBaseDir(); got != want {
+		t.Fatalf("defaultSocketBaseDir() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultSocketBaseDirFallsBackToTmp(t *testing.T) {
+	t.Setenv("TMPDIR", "")
+
+	want := filepath.Join("/tmp", "open-server-"+strconv.Itoa(os.Getuid()))
+	if got := defaultSocketBaseDir(); got != want {
+		t.Fatalf("defaultSocketBaseDir() = %q, want %q", got, want)
+	}
+}
+
+func TestPrepareSSHSocketTargetCreatesPrivateRunDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+
+	target, err := prepareSSHSocketTarget("")
+	if err != nil {
+		t.Fatalf("prepareSSHSocketTarget returned error: %v", err)
+	}
+	t.Cleanup(target.cleanup)
+
+	if target.SocketPath != filepath.Join(target.RunDir, "server.sock") {
+		t.Fatalf("socket path = %q, run dir = %q", target.SocketPath, target.RunDir)
+	}
+	for _, dir := range []string{defaultSocketBaseDir(), target.RunDir} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("stat %q: %v", dir, err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("%q mode = %04o, want 0700", dir, perm)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(target.RunDir, socketPIDFile)); err != nil {
+		t.Fatalf("pid file missing: %v", err)
+	}
+	target.cleanup()
+	if _, err := os.Stat(target.RunDir); !os.IsNotExist(err) {
+		t.Fatalf("run dir should be removed; stat err = %v", err)
+	}
+}
+
+func TestPrepareSSHSocketTargetRejectsUnsafeOverrideParent(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "public")
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		t.Fatalf("mkdir public: %v", err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatalf("chmod public: %v", err)
+	}
+
+	_, err := prepareSSHSocketTarget(filepath.Join(parent, "server.sock"))
+	if err == nil {
+		t.Fatal("expected unsafe socket parent to be rejected")
+	}
+}
+
+func TestCleanupStaleSocketDirsKeepsLivePID(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "open-server-"+strconv.Itoa(os.Getuid()))
+	if err := ensurePrivateDir(base); err != nil {
+		t.Fatalf("ensurePrivateDir: %v", err)
+	}
+	stale := filepath.Join(base, socketRunDirPrefix+"stale")
+	live := filepath.Join(base, socketRunDirPrefix+"live")
+	for _, dir := range []string{stale, live} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %q: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stale, socketPIDFile), []byte("0\n"), 0o600); err != nil {
+		t.Fatalf("write stale pid: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(live, socketPIDFile), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatalf("write live pid: %v", err)
+	}
+
+	if err := cleanupStaleSocketDirs(base); err != nil {
+		t.Fatalf("cleanupStaleSocketDirs: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale dir should be removed; stat err = %v", err)
+	}
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("live dir should remain: %v", err)
+	}
+}
+
+func TestValidateTransportFlagsRejectsTCPFlagsWithSSH(t *testing.T) {
+	for _, flags := range []map[string]bool{
+		{"address": true},
+		{"a": true},
+		{"port": true},
+		{"p": true},
+	} {
+		if err := validateTransportFlags(true, flags); err == nil {
+			t.Fatalf("validateTransportFlags(true, %#v) returned nil error", flags)
+		}
+	}
+	if err := validateTransportFlags(false, map[string]bool{"address": true, "port": true}); err != nil {
+		t.Fatalf("default TCP mode should allow TCP flags: %v", err)
+	}
+}
+
 func TestDisplayPath(t *testing.T) {
 	root := filepath.Join(string(os.PathSeparator), "home", "kenchen", "Documents", "xxx")
 	tests := []struct {
@@ -310,7 +594,7 @@ func TestDisplayPath(t *testing.T) {
 }
 
 func TestMakeBreadcrumbs(t *testing.T) {
-	querySuffix := "?order=asc&sort=name&token=12345678"
+	querySuffix := "?order=asc&sort=name"
 	tests := []struct {
 		name        string
 		requestPath string

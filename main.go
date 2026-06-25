@@ -42,22 +42,34 @@ func defaultPortSpec() string {
 }
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == cleanupWatcherCommand {
+		os.Exit(runCleanupWatcher(os.Args[2:]))
+	}
+
 	var (
-		address  string
-		duration string
-		portSpec string
-		title    string
-		token    string
-		tbBin    string
-		tbDir    string
+		address       string
+		duration      string
+		localPortSpec string
+		portSpec      string
+		socketPath    string
+		sshHost       string
+		title         string
+		token         string
+		tbBin         string
+		tbDir         string
+		useSSH        bool
 	)
 	defAddr := defaultAddress()
 	defPort := defaultPortSpec()
 	flag.StringVar(&address, "address", defAddr, "IP address to bind")
 	flag.StringVar(&address, "a", defAddr, "IP address to bind (shorthand)")
 	flag.StringVar(&duration, "duration", "7d", "server lifetime before automatic exit (e.g. 7d, 12h, 30m)")
+	flag.StringVar(&localPortSpec, "local-port", defPort, "local browser port or port range for --ssh (e.g. 60123 or 60000-60100)")
 	flag.StringVar(&portSpec, "port", defPort, "port or port range (e.g. 60000 or 60000-70000)")
 	flag.StringVar(&portSpec, "p", defPort, "port or port range (shorthand)")
+	flag.BoolVar(&useSSH, "ssh", false, "listen on a private Unix socket and print an SSH tunnel command")
+	flag.StringVar(&sshHost, "ssh-host", "", "SSH target printed by --ssh (default: USER@hostname)")
+	flag.StringVar(&socketPath, "socket", "", "Unix socket path for --ssh; parent directory must be private")
 	flag.StringVar(&title, "title", "", "page title; defaults to full served folder path")
 	flag.StringVar(&title, "t", "", "page title (shorthand)")
 	flag.StringVar(&token, "token", "", "access token (>=8 chars); auto-generated if empty")
@@ -68,15 +80,18 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	explicitFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) {
+		explicitFlags[f.Name] = true
+	})
 
 	path := "."
 	if flag.NArg() >= 1 {
 		path = flag.Arg(0)
 	}
 
-	portLo, portHi, err := parsePortSpec(portSpec)
-	if err != nil {
-		log.Fatalf("invalid --port: %v", err)
+	if err := validateTransportFlags(useSSH, explicitFlags); err != nil {
+		log.Fatalf("%v", err)
 	}
 	lifetime, err := parseDurationSpec(duration)
 	if err != nil {
@@ -102,6 +117,43 @@ func main() {
 		title = displayRoot
 	}
 
+	if useSSH {
+		localPortLo, localPortHi, err := parsePortSpec(localPortSpec)
+		if err != nil {
+			log.Fatalf("invalid --local-port: %v", err)
+		}
+		localPort, err := pickPort(localPortLo, localPortHi)
+		if err != nil {
+			log.Fatalf("could not choose --local-port: %v", err)
+		}
+		if sshHost == "" {
+			sshHost = defaultSSHHost()
+		}
+		err = serveFilesWithOptions(serveOptions{
+			Mode:         serveModeSSH,
+			FileDir:      fileDir,
+			FileBase:     fileBase,
+			Title:        title,
+			DisplayRoot:  displayRoot,
+			Token:        token,
+			TBBin:        tbBin,
+			TBDir:        tbDir,
+			Duration:     lifetime,
+			LocalPort:    localPort,
+			SocketPath:   socketPath,
+			SSHHost:      sshHost,
+			StartWatcher: true,
+		})
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		return
+	}
+
+	portLo, portHi, err := parsePortSpec(portSpec)
+	if err != nil {
+		log.Fatalf("invalid --port: %v", err)
+	}
 	if err := serveFiles(address, portLo, portHi, fileDir, fileBase, title, displayRoot, token, tbBin, tbDir, lifetime); err != nil {
 		log.Fatalf("%v", err)
 	}
