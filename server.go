@@ -822,6 +822,13 @@ func serveFilesWithOptions(opt serveOptions) error {
 			http.ServeFile(w, r, fullPath)
 			return
 		}
+		if !strings.HasSuffix(r.URL.Path, "/") {
+			nextURL := *r.URL
+			nextURL.Path = cleanURLPath(r.URL.Path) + "/"
+			nextURL.RawPath = ""
+			http.Redirect(w, r, nextURL.RequestURI(), http.StatusMovedPermanently)
+			return
+		}
 		dirEntries, err := os.ReadDir(fullPath)
 		if err != nil {
 			http.Error(w, "Failed to read directory", http.StatusInternalServerError)
@@ -831,22 +838,24 @@ func serveFilesWithOptions(opt serveOptions) error {
 		currentPath := displayPath(opt.DisplayRoot, r.URL.Path)
 		entries := make([]Entry, 0, len(dirEntries))
 		for _, de := range dirEntries {
-			fi, infoErr := de.Info()
+			fi, infoErr := os.Stat(filepath.Join(fullPath, de.Name()))
 			modTime := ""
 			var modTimeValue time.Time
 			size := "-"
 			var sizeBytes int64
+			isDir := false
 			if infoErr == nil {
 				modTimeValue = fi.ModTime()
 				modTime = modTimeValue.Format("2006-01-02 15:04")
-				if !de.IsDir() {
+				isDir = fi.IsDir()
+				if !isDir {
 					sizeBytes = fi.Size()
 					size = humanSize(sizeBytes)
 				}
 			}
 			name := de.Name()
 			href := name
-			if de.IsDir() {
+			if isDir {
 				href = name + "/"
 				name = name + "/"
 			}
@@ -858,7 +867,7 @@ func serveFilesWithOptions(opt serveOptions) error {
 				ModTimeValue: modTimeValue,
 				Size:         size,
 				SizeBytes:    sizeBytes,
-				IsDir:        de.IsDir(),
+				IsDir:        isDir,
 			})
 		}
 		sortEntries(entries, sortState)

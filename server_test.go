@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -364,6 +365,140 @@ func TestServeFilesSSHServesOverUnixSocket(t *testing.T) {
 	}
 	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
 		t.Fatalf("socket should be removed after shutdown; stat err = %v", err)
+	}
+}
+
+func TestServeFilesOpensFilesUnderSymlinkDirectory(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real-dir")
+	linkDir := filepath.Join(root, "link-dir")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatalf("mkdir real dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "note.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	socketDir := t.TempDir()
+	if err := os.Chmod(socketDir, 0o700); err != nil {
+		t.Fatalf("chmod socket dir: %v", err)
+	}
+	socketPath := filepath.Join(socketDir, "server.sock")
+	done := make(chan error, 1)
+	go func() {
+		done <- serveFilesWithOptions(serveOptions{
+			Mode:        serveModeSSH,
+			FileDir:     root,
+			Title:       "test",
+			DisplayRoot: root,
+			Token:       "12345678",
+			Duration:    500 * time.Millisecond,
+			LocalPort:   60124,
+			SocketPath:  socketPath,
+			SSHHost:     "user@example",
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, err := net.DialTimeout("unix", socketPath, 20*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		select {
+		case serveErr := <-done:
+			t.Fatalf("server exited before creating Unix socket: %v", serveErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server did not create Unix socket %q", socketPath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var dialer net.Dialer
+				return dialer.DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
+	noRedirectClient := *client
+	noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "http://open-server/", nil)
+	if err != nil {
+		t.Fatalf("new root request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: "open_server_token", Value: "12345678"})
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("root request failed: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read root response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("root status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if !strings.Contains(string(body), `href="link-dir/?order=asc&amp;sort=name"`) {
+		t.Fatalf("root listing should link symlinked directory with trailing slash; body: %s", body)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, "http://open-server/link-dir?sort=size&order=desc", nil)
+	if err != nil {
+		t.Fatalf("new symlink dir request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: "open_server_token", Value: "12345678"})
+	resp, err = noRedirectClient.Do(req)
+	if err != nil {
+		t.Fatalf("symlink dir request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("symlink dir status = %d, want %d", resp.StatusCode, http.StatusMovedPermanently)
+	}
+	if got, want := resp.Header.Get("Location"), "/link-dir/?sort=size&order=desc"; got != want {
+		t.Fatalf("symlink dir redirect Location = %q, want %q", got, want)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, "http://open-server/link-dir/note.txt", nil)
+	if err != nil {
+		t.Fatalf("new note request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: "open_server_token", Value: "12345678"})
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("note request failed: %v", err)
+	}
+	body, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read note response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("note status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if string(body) != "hello" {
+		t.Fatalf("note body = %q, want %q", body, "hello")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveFilesWithOptions returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SSH-mode server did not exit after duration")
 	}
 }
 
