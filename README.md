@@ -2,6 +2,8 @@
 
 `remote-browser` provides a local, loopback-only web interface for browsing and transferring files on a server over standard SSH/SFTP.
 
+It is an open-source, lightweight SFTP browser and file-transfer tool that works through a local web interface without installing a separate client or service on the server.
+
 It launches your system `ssh` client, so your existing SSH aliases, keys, agent, host-key checks, `ProxyJump`, and other `ssh_config` settings continue to work. Nothing is installed, started, or left behind on the remote server.
 
 ## Requirements
@@ -37,11 +39,11 @@ The local server binds only to IPv4 loopback, prints its URL, and normally opens
 ```text
 Usage: remote-browser [options] host:/path
   -duration duration
-        optional session duration (for example 2h)
+        session duration (default 7d; for example 2h)
   -no-open
         print the URL without opening a browser
   -port int
-        local loopback port (0 chooses one automatically)
+        local loopback port (0 scans from 60000)
   -rsh string
         OpenSSH executable or compatible wrapper (default "ssh")
   -title string
@@ -52,7 +54,7 @@ Usage: remote-browser [options] host:/path
         print the version and exit
 ```
 
-Press Ctrl-C to end a session. `-duration` can be used to end it automatically.
+Press Ctrl-C to end a session. Sessions end automatically after 7 days by default; use `-duration` to change this.
 
 If `-rsh` points to a wrapper, it must accept normal OpenSSH arguments and replace itself with the SSH process—for example, with `exec ssh "$@"`—so `remote-browser` can monitor and stop the connection reliably.
 

@@ -27,6 +27,10 @@ import (
 
 const version = "0.1.0"
 
+const automaticPortStart = 60000
+
+const defaultSessionDuration = 7 * 24 * time.Hour
+
 type config struct {
 	port     int
 	rsh      string
@@ -191,9 +195,9 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	var configuration config
 	flags := flag.NewFlagSet("remote-browser", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	flags.IntVar(&configuration.port, "port", 0, "local loopback port (0 chooses one automatically)")
+	flags.IntVar(&configuration.port, "port", 0, "local loopback port (0 scans from 60000)")
 	flags.StringVar(&configuration.rsh, "rsh", "ssh", "OpenSSH executable or compatible wrapper")
-	flags.DurationVar(&configuration.duration, "duration", 0, "optional session duration (for example 2h)")
+	flags.DurationVar(&configuration.duration, "duration", defaultSessionDuration, "session duration (default 7d; for example 2h)")
 	flags.StringVar(&configuration.title, "title", "", "browser page title")
 	flags.BoolVar(&configuration.noOpen, "no-open", false, "print the URL instead of opening a browser")
 	flags.BoolVar(&configuration.version, "version", false, "print the version and exit")
@@ -241,6 +245,25 @@ func openBrowser(parent context.Context, address string) error {
 }
 
 func listenLoopback(port int) (net.Listener, error) {
+	if port != 0 {
+		return listenLoopbackPort(port)
+	}
+
+	var lastErr error
+	for candidate := automaticPortStart; candidate <= 65535; candidate++ {
+		listener, err := listenLoopbackPort(candidate)
+		if err == nil {
+			return listener, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("no available loopback port from %d through 65535: %w", automaticPortStart, lastErr)
+}
+
+func listenLoopbackPort(port int) (net.Listener, error) {
 	return net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 }
 

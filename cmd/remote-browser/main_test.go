@@ -21,6 +21,14 @@ import (
 
 func TestParseFlags(t *testing.T) {
 	t.Parallel()
+	defaults, err := parseFlags([]string{"lab:/tmp"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.duration != defaultSessionDuration {
+		t.Fatalf("default duration = %s, want %s", defaults.duration, defaultSessionDuration)
+	}
+
 	configuration, err := parseFlags([]string{"--port", "8123", "--duration", "90m", "--title", "Files", "lab:/tmp"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
