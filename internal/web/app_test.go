@@ -178,7 +178,7 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 					t.Fatal("listing does not show the confined root")
 				}
 				if !strings.Contains(body, "addEventListener(&#39;paste&#39;") && !strings.Contains(body, "addEventListener('paste'") {
-					t.Fatal("clipboard image upload handler was not rendered")
+					t.Fatal("clipboard file upload handler was not rendered")
 				}
 				if strings.Contains(body, `Remote <files>`) || strings.Contains(body, `weird <&".txt`) {
 					t.Fatal("unescaped remote metadata appeared in HTML")
@@ -400,19 +400,25 @@ func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 	for _, want := range []string{
 		`action="{{.UploadURL}}" method="POST" enctype="multipart/form-data"`,
 		`id="btn-upload-files"`,
-		`id="btn-paste-image"`,
+		`id="btn-paste-file"`,
 		`id="btn-from-url"`,
 		`id="conflict-modal"`,
 		`Apply this choice to all remaining conflicts`,
 		`id="paste-modal"`,
 		`function armPasteCapture()`,
 		`document.addEventListener('paste', onPaste)`,
+		`e.clipboardData && e.clipboardData.files`,
+		`items[index].kind === 'file'`,
+		`pasteName.value = file.name || defaultPasteName(file.type)`,
 		`xhr.upload.addEventListener('progress'`,
 		`dz.addEventListener('drop'`,
 	} {
 		if !strings.Contains(directoryTemplate, want) {
 			t.Errorf("directory template is missing %q", want)
 		}
+	}
+	if strings.Contains(directoryTemplate, `items[index].type.indexOf('image/')`) {
+		t.Error("paste upload must not reject non-image clipboard files")
 	}
 }
 

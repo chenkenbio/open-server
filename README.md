@@ -94,7 +94,7 @@ If `-rsh` points to a wrapper, it must accept normal OpenSSH arguments and repla
 - Symlink navigation, including links whose targets are outside the starting directory
 - Safe inline previews and ranged downloads
 - Drag-and-drop and streaming multi-file uploads
-- Batch overwrite confirmation and one-shot clipboard-image uploads
+- Batch overwrite confirmation and one-shot clipboard uploads for files of any type
 - URL fetching on the local device, streamed to the server through SFTP
 - Copyable full remote paths
 

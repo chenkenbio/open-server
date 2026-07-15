@@ -20,7 +20,7 @@ const directoryTemplate = `<!DOCTYPE html>
 </form>
 <div id="upload-buttons" style="display: none;">
 <button id="btn-upload-files" type="button">Upload files</button>
-<button id="btn-paste-image" type="button">Paste image</button>
+<button id="btn-paste-file" type="button">Paste file</button>
 <button id="btn-from-url" type="button">From URL</button>
 </div>
 <div id="url-row" style="display: none; margin: 0.6em 0 0 0;">
@@ -41,7 +41,7 @@ const directoryTemplate = `<!DOCTYPE html>
 </div>
 <div id="paste-modal" role="dialog" aria-modal="true" aria-labelledby="paste-prompt" style="display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.25); z-index: 1000; font-family: sans-serif;">
 <div style="background: #fff; color: #000; border: 1px solid #777; border-radius: 6px; max-width: 28em; margin: 15vh auto 0 auto; padding: 1em;">
-<p id="paste-prompt" style="margin: 0 0 0.8em 0;">Save pasted image as:</p>
+<p id="paste-prompt" style="margin: 0 0 0.8em 0;">Save pasted file as:</p>
 <input id="paste-name" type="text" style="width: 100%; box-sizing: border-box; margin: 0 0 1em 0;">
 <div style="text-align: right;">
 <button id="paste-cancel" type="button">Cancel</button>
@@ -240,9 +240,14 @@ const directoryTemplate = `<!DOCTYPE html>
       'image/gif': '.gif',
       'image/webp': '.webp',
       'image/bmp': '.bmp',
-      'image/svg+xml': '.svg'
+      'image/svg+xml': '.svg',
+      'text/plain': '.txt',
+      'text/csv': '.csv',
+      'application/json': '.json',
+      'application/pdf': '.pdf',
+      'application/zip': '.zip'
     };
-    return extensions[type] || '.png';
+    return extensions[type] || '';
   }
   function defaultPasteName(type) {
     var date = new Date();
@@ -250,8 +255,8 @@ const directoryTemplate = `<!DOCTYPE html>
     return 'paste-' + date.getFullYear() + pad(date.getMonth() + 1) + pad(date.getDate()) +
       '-' + pad(date.getHours()) + pad(date.getMinutes()) + pad(date.getSeconds()) + extensionFromType(type);
   }
-  function promptPasteName(blob) {
-    pasteName.value = defaultPasteName(blob.type);
+  function promptPasteName(file) {
+    pasteName.value = file.name || defaultPasteName(file.type);
     pasteModal.style.display = 'block';
     pasteName.focus();
     pasteName.select();
@@ -264,9 +269,9 @@ const directoryTemplate = `<!DOCTYPE html>
     pasteOK.onclick = function() {
       var name = pasteName.value.trim();
       if (!name) return;
-      if (name.indexOf('.') === -1) name += extensionFromType(blob.type);
+      if (name.indexOf('.') === -1) name += extensionFromType(file.type);
       close();
-      uploadFiles([new File([blob], name, {type: blob.type})]);
+      uploadFiles([new File([file], name, {type: file.type, lastModified: file.lastModified})]);
     };
     pasteCancel.onclick = function() {
       close();
@@ -278,37 +283,39 @@ const directoryTemplate = `<!DOCTYPE html>
     };
   }
 
-  // The button arms a one-shot paste listener. The browser shortcut supplies the image.
-  var pasteButton = document.getElementById('btn-paste-image');
+  // The button arms a one-shot paste listener. The browser shortcut supplies the file.
+  var pasteButton = document.getElementById('btn-paste-file');
   var disarmPaste = null;
   var pasteKeyLabel = /Mac|iP(hone|ad|od)/.test(navigator.platform || '') ? 'Cmd+V' : 'Ctrl+V';
   function armPasteCapture() {
-    status.textContent = 'Press ' + pasteKeyLabel + ' to paste an image (Esc or click again to cancel).';
+    status.textContent = 'Press ' + pasteKeyLabel + ' to paste a file (Esc or click again to cancel).';
     pasteButton.textContent = 'Waiting for ' + pasteKeyLabel + '… (click to cancel)';
     function cleanup() {
       document.removeEventListener('paste', onPaste);
       document.removeEventListener('keydown', onKey);
-      pasteButton.textContent = 'Paste image';
+      pasteButton.textContent = 'Paste file';
       disarmPaste = null;
     }
     function onPaste(e) {
       cleanup();
-      var blob = null;
+      var file = null;
+      var files = e.clipboardData && e.clipboardData.files;
+      if (files && files.length) file = files[0];
       var items = e.clipboardData && e.clipboardData.items;
-      if (items) {
+      if (!file && items) {
         for (var index = 0; index < items.length; index++) {
-          if (items[index].kind === 'file' && items[index].type.indexOf('image/') === 0) {
-            blob = items[index].getAsFile();
-            break;
+          if (items[index].kind === 'file') {
+            file = items[index].getAsFile();
+            if (file) break;
           }
         }
       }
-      if (!blob) {
-        status.textContent = 'No image in clipboard.';
+      if (!file) {
+        status.textContent = 'No file in clipboard.';
         return;
       }
       e.preventDefault();
-      promptPasteName(blob);
+      promptPasteName(file);
     }
     function onKey(e) {
       if (e.key === 'Escape') {
