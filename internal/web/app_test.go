@@ -24,7 +24,8 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"remote-browser/internal/filesystem"
+	"open-server/internal/filesystem"
+	"open-server/internal/tensorboard"
 )
 
 const (
@@ -348,7 +349,7 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				deadline := time.Now().Add(2 * time.Second)
 				for {
 					_, destinationErr := os.Stat(filepath.FromSlash(destination))
-					temporary, globErr := filepath.Glob(filepath.Join(filepath.FromSlash(fixture.root), ".remote-browser-upload-*"))
+					temporary, globErr := filepath.Glob(filepath.Join(filepath.FromSlash(fixture.root), ".open-server-upload-*"))
 					if os.IsNotExist(destinationErr) && globErr == nil && len(temporary) == 0 {
 						break
 					}
@@ -427,6 +428,284 @@ func TestLocalURLHasNoPathToken(t *testing.T) {
 	app := newTestApp(t, fixture, nil)
 	if got, want := app.URL(), "http://"+testHost+"/"; got != want {
 		t.Fatalf("URL = %q, want %q", got, want)
+	}
+}
+
+func TestAccessTokenBecomesScopedCookie(t *testing.T) {
+	root := createFixture(t)
+	app, err := New(Options{
+		Backend: filesystem.Local{}, Root: root, SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost, AccessToken: "secret-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := app.URL(); got != "http://"+testHost+"/?token=secret-token" {
+		t.Fatalf("token URL = %q", got)
+	}
+	missing := request(app, http.MethodGet, "/", nil)
+	if missing.Code != http.StatusForbidden {
+		t.Fatalf("missing token status = %d", missing.Code)
+	}
+	initial := request(app, http.MethodGet, "/?token=secret-token", nil)
+	if initial.Code != http.StatusSeeOther || initial.Header().Get("Location") != "/" {
+		t.Fatalf("initial token response = %d Location %q", initial.Code, initial.Header().Get("Location"))
+	}
+	cookies := initial.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].Value != "secret-token" {
+		t.Fatalf("auth cookies = %#v", cookies)
+	}
+	follow := httptest.NewRequest(http.MethodGet, "/", nil)
+	follow.Host = testHost
+	follow.AddCookie(cookies[0])
+	followResponse := httptest.NewRecorder()
+	app.ServeHTTP(followResponse, follow)
+	if followResponse.Code != http.StatusOK {
+		t.Fatalf("cookie-authenticated response = %d", followResponse.Code)
+	}
+	for _, warning := range []string{"Security warning:", "token-protected plain HTTP", "traffic is not encrypted"} {
+		if !strings.Contains(followResponse.Body.String(), warning) {
+			t.Errorf("serve-mode listing is missing %q", warning)
+		}
+	}
+}
+
+func TestOptionalUIActions(t *testing.T) {
+	root := createFixture(t)
+	for name, contents := range map[string]string{
+		".hidden.txt": "hidden", "results.csv": "a,b\n1,2\n", "results.tsv": "a\tb\n1\t2\n",
+		"figure.png": "png", "report.pdf": "%PDF-1.4\n%%EOF\n",
+	} {
+		if err := os.WriteFile(filepath.Join(filepath.FromSlash(root), name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(filepath.FromSlash(root), "missing.pdf"), filepath.Join(filepath.FromSlash(root), "broken.pdf")); err != nil {
+		t.Fatal(err)
+	}
+	backendHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, r.URL.Path)
+	})
+	launcher := &recordingTensorBoardLauncher{handler: backendHandler}
+	app, err := New(Options{
+		Backend: filesystem.Local{}, Root: root, SSHHost: "lab", Title: "Files",
+		AllowedHost: testHost, TensorBoard: launcher, LaTeX: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listing := request(app, http.MethodGet, "/", nil)
+	body := listing.Body.String()
+	for _, want := range []string{"Create folder", "Show hidden items", "Copy current path", "TensorBoard", "LaTeX tools", ">Table<", ">Figure<", ">Preview<", `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("enhanced listing is missing %q", want)
+		}
+	}
+	if strings.Contains(body, ".hidden.txt") {
+		t.Fatal("hidden item is visible by default")
+	}
+	if got := strings.Count(body, `class="copy-snippet"`); got != 4 {
+		t.Fatalf("copy snippet button count = %d, want 4", got)
+	}
+	if got := strings.Count(body, `class="open-live"`); got != 1 {
+		t.Fatalf("live button count = %d, want 1", got)
+	}
+	for _, button := range []string{">Table</button>", ">Figure</button>", ">Preview</button>"} {
+		if !strings.Contains(body, button) {
+			t.Errorf("enhanced listing is missing button %q", button)
+		}
+	}
+	shown := request(app, http.MethodGet, "/?hidden=1", nil)
+	if !strings.Contains(shown.Body.String(), ".hidden.txt") || !strings.Contains(shown.Body.String(), "Hide hidden items") {
+		t.Fatalf("show-hidden listing = %s", shown.Body.String())
+	}
+
+	mkdirRequest := httptest.NewRequest(http.MethodPost, "/mkdir?path="+url.QueryEscape(root), strings.NewReader("name=new-folder"))
+	mkdirRequest.Host = testHost
+	mkdirRequest.Header.Set("Origin", "http://"+testHost)
+	mkdirRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mkdirResponse := httptest.NewRecorder()
+	app.ServeHTTP(mkdirResponse, mkdirRequest)
+	if mkdirResponse.Code != http.StatusCreated {
+		t.Fatalf("mkdir response = %d %s", mkdirResponse.Code, mkdirResponse.Body.String())
+	}
+	if info, err := os.Stat(filepath.Join(filepath.FromSlash(root), "new-folder")); err != nil || !info.IsDir() {
+		t.Fatalf("new folder = %#v, %v", info, err)
+	}
+
+	tensorRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "folder"))), nil)
+	tensorRequest.Host = testHost
+	tensorRequest.Header.Set("Origin", "http://"+testHost)
+	tensorResponse := httptest.NewRecorder()
+	app.ServeHTTP(tensorResponse, tensorRequest)
+	if tensorResponse.Code != http.StatusSeeOther || !strings.HasPrefix(tensorResponse.Header().Get("Location"), "/tensorboard/") {
+		t.Fatalf("TensorBoard start = %d Location %q body %s", tensorResponse.Code, tensorResponse.Header().Get("Location"), tensorResponse.Body.String())
+	}
+	proxied := request(app, http.MethodGet, tensorResponse.Header().Get("Location"), nil)
+	if proxied.Code != http.StatusOK || proxied.Body.String() != tensorResponse.Header().Get("Location") {
+		t.Fatalf("TensorBoard proxy = %d %q", proxied.Code, proxied.Body.String())
+	}
+	if len(launcher.starts) != 1 || launcher.starts[0].directory != filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "folder")) {
+		t.Fatalf("TensorBoard launches = %#v", launcher.starts)
+	}
+
+	live := request(app, http.MethodGet, "/live?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
+	if live.Code != http.StatusOK || !strings.Contains(live.Body.String(), "watching every 2 seconds") {
+		t.Fatalf("live PDF response = %d %s", live.Code, live.Body.String())
+	}
+	preview := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
+	if preview.Code != http.StatusOK || preview.Header().Get("X-Frame-Options") != "SAMEORIGIN" || !strings.Contains(preview.Header().Get("Content-Security-Policy"), "frame-ancestors 'self'") {
+		t.Fatalf("live PDF preview framing policy = %d X-Frame-Options %q CSP %q", preview.Code, preview.Header().Get("X-Frame-Options"), preview.Header().Get("Content-Security-Policy"))
+	}
+	status := request(app, http.MethodGet, "/live/status?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"version"`) || !strings.Contains(status.Body.String(), `"ready":true`) {
+		t.Fatalf("live status = %d %s", status.Code, status.Body.String())
+	}
+	incompleteName := filepath.Join(filepath.FromSlash(root), "compiling.pdf")
+	if err := os.WriteFile(incompleteName, []byte("%PDF-1.4\n1 0 obj\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	incompleteURL := "/live?path=" + url.QueryEscape(filepath.ToSlash(incompleteName))
+	incompleteLive := request(app, http.MethodGet, incompleteURL, nil)
+	if incompleteLive.Code != http.StatusOK || !strings.Contains(incompleteLive.Body.String(), "waiting for PDF compilation") || strings.Contains(incompleteLive.Body.String(), `src="/preview`) {
+		t.Fatalf("incomplete live PDF response = %d %s", incompleteLive.Code, incompleteLive.Body.String())
+	}
+	incompleteStatus := request(app, http.MethodGet, "/live/status?path="+url.QueryEscape(filepath.ToSlash(incompleteName)), nil)
+	if incompleteStatus.Code != http.StatusOK || !strings.Contains(incompleteStatus.Body.String(), `"ready":false`) || !strings.Contains(incompleteStatus.Body.String(), `"version":""`) {
+		t.Fatalf("incomplete PDF status = %d %s", incompleteStatus.Code, incompleteStatus.Body.String())
+	}
+	if err := os.WriteFile(incompleteName, []byte("%PDF-1.4\n1 0 obj\nendobj\n%%EOF\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	completeStatus := request(app, http.MethodGet, "/live/status?path="+url.QueryEscape(filepath.ToSlash(incompleteName)), nil)
+	if completeStatus.Code != http.StatusOK || !strings.Contains(completeStatus.Body.String(), `"ready":true`) {
+		t.Fatalf("completed PDF status = %d %s", completeStatus.Code, completeStatus.Body.String())
+	}
+	nonPDFLive := request(app, http.MethodGet, "/live?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "figure.png"))), nil)
+	if nonPDFLive.Code != http.StatusBadRequest {
+		t.Fatalf("non-PDF live status = %d, want %d", nonPDFLive.Code, http.StatusBadRequest)
+	}
+
+	plain, err := New(Options{Backend: filesystem.Local{}, Root: root, SSHHost: "lab", Title: "Files", AllowedHost: testHost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainBody := request(plain, http.MethodGet, "/", nil).Body.String()
+	if strings.Contains(plainBody, "LaTeX tools") || strings.Contains(plainBody, "Open live PDF preview") || strings.Contains(plainBody, "TensorBoard") {
+		t.Fatal("optional actions are visible without their flags")
+	}
+	if strings.Contains(plainBody, "token-protected plain HTTP") {
+		t.Fatal("plain-HTTP warning is visible in default loopback mode")
+	}
+	plainLive := request(plain, http.MethodGet, "/live?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
+	if plainLive.Code != http.StatusNotFound {
+		t.Fatalf("plain live status = %d, want %d", plainLive.Code, http.StatusNotFound)
+	}
+	plainPreview := request(plain, http.MethodGet, "/preview?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
+	if plainPreview.Header().Get("X-Frame-Options") != "DENY" || !strings.Contains(plainPreview.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Fatalf("plain preview framing policy = X-Frame-Options %q CSP %q", plainPreview.Header().Get("X-Frame-Options"), plainPreview.Header().Get("Content-Security-Policy"))
+	}
+
+	latexOnly, err := New(Options{Backend: filesystem.Local{}, Root: root, SSHHost: "lab", Title: "Files", AllowedHost: testHost, LaTeX: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	latexOnlyBody := request(latexOnly, http.MethodGet, "/", nil).Body.String()
+	if !strings.Contains(latexOnlyBody, `colspan="8"`) || strings.Contains(latexOnlyBody, `<th align="right">TensorBoard</th>`) {
+		t.Fatal("LaTeX-only mode does not add exactly three columns")
+	}
+}
+
+func TestLaTeXSnippets(t *testing.T) {
+	figure := "\\begin{figure}[htbp]\n" +
+		"  \\centering\n" +
+		"  \\includegraphics[width=1.00\\textwidth]{\\detokenize{/paper/Figure One.PNG}}\n" +
+		"  \\caption{}\n" +
+		"  % \\label{fig:figure-one}\n" +
+		"\\end{figure}"
+	table := "\\begin{table}[htbp]\n" +
+		"  \\centering\n" +
+		"  \\csvautotabular[separator=tab]{\\detokenize{/paper/Data Set.TSV}}\n" +
+		"  \\caption{}\n" +
+		"  % \\label{tab:data-set}\n" +
+		"\\end{table}"
+
+	gotFigure, gotTable := makeLaTeXSnippets("/paper/Figure One.PNG")
+	if gotFigure != figure || gotTable != "" {
+		t.Fatalf("PNG snippets = figure %q, table %q", gotFigure, gotTable)
+	}
+	gotFigure, gotTable = makeLaTeXSnippets("/paper/Data Set.TSV")
+	if gotFigure != "" || gotTable != table {
+		t.Fatalf("TSV snippets = figure %q, table %q", gotFigure, gotTable)
+	}
+	for _, name := range []string{"plot.jpg", "plot.jpeg", "plot.pdf"} {
+		gotFigure, gotTable = makeLaTeXSnippets(name)
+		if gotFigure == "" || gotTable != "" {
+			t.Errorf("%s snippets = figure %q, table %q", name, gotFigure, gotTable)
+		}
+	}
+	gotFigure, gotTable = makeLaTeXSnippets("data.csv")
+	if gotFigure != "" || !strings.Contains(gotTable, `\csvautotabular{\detokenize{data.csv}}`) || strings.Contains(gotTable, "separator=tab") {
+		t.Fatalf("CSV snippets = figure %q, table %q", gotFigure, gotTable)
+	}
+	for _, name := range []string{"plot.svg", "plot.eps", "plot.gif", "notes.txt", "folder"} {
+		gotFigure, gotTable = makeLaTeXSnippets(name)
+		if gotFigure != "" || gotTable != "" {
+			t.Errorf("unsupported %s snippets = figure %q, table %q", name, gotFigure, gotTable)
+		}
+	}
+}
+
+func TestLivePDFVersionChangesWithFile(t *testing.T) {
+	root := t.TempDir()
+	name := filepath.Join(root, "paper.pdf")
+	if err := os.WriteFile(name, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstVersion := fileVersion(first)
+	if err := os.WriteFile(name, []byte("second-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.Stat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondVersion := fileVersion(second); secondVersion == firstVersion {
+		t.Fatalf("file version did not change: %q", secondVersion)
+	}
+}
+
+func TestLivePDFCompletionAgainstLocalAndSFTP(t *testing.T) {
+	for _, fixture := range fixtures(t) {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) {
+			defer fixture.close()
+			name := filepath.Join(filepath.FromSlash(fixture.root), "paper.pdf")
+			if err := os.WriteFile(name, []byte("%PDF-1.7\n1 0 obj\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			app, err := New(Options{Backend: fixture.backend, Root: fixture.root, SSHHost: "lab", Title: "Files", AllowedHost: testHost, LaTeX: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			statusURL := "/live/status?path=" + url.QueryEscape(filepath.ToSlash(name))
+			incomplete := request(app, http.MethodGet, statusURL, nil)
+			if incomplete.Code != http.StatusOK || !strings.Contains(incomplete.Body.String(), `"ready":false`) {
+				t.Fatalf("incomplete PDF status = %d %s", incomplete.Code, incomplete.Body.String())
+			}
+			if err := os.WriteFile(name, []byte("%PDF-1.7\n1 0 obj\nendobj\n%%EOF\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			complete := request(app, http.MethodGet, statusURL, nil)
+			if complete.Code != http.StatusOK || !strings.Contains(complete.Body.String(), `"ready":true`) {
+				t.Fatalf("complete PDF status = %d %s", complete.Code, complete.Body.String())
+			}
+		})
 	}
 }
 
@@ -706,6 +985,21 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+type tensorBoardStart struct {
+	directory string
+	prefix    string
+}
+
+type recordingTensorBoardLauncher struct {
+	handler http.Handler
+	starts  []tensorBoardStart
+}
+
+func (l *recordingTensorBoardLauncher) Start(directory, prefix string) (*tensorboard.Instance, error) {
+	l.starts = append(l.starts, tensorBoardStart{directory: directory, prefix: prefix})
+	return &tensorboard.Instance{Handler: l.handler}, nil
 }
 
 type statErrorBackend struct {

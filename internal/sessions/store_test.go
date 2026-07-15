@@ -12,19 +12,23 @@ func TestStoreAddResolveListAndDelete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config", "sessions", "saved-sessions.yaml")
 	store := Store{Path: path}
 
-	if err := store.Add("production", "prod:/srv/app"); err != nil {
+	if err := store.Add("production", "prod:/srv/app", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Add("development", "dev:~/project"); err != nil {
+	if err := store.Add("development", "dev:~/project", Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Add("production", "prod:/srv/new-app"); err != nil {
+	tensorBoard := true
+	latex := true
+	python := "/env/bin/python"
+	title := "Project dashboard"
+	if err := store.Add("production", "prod:/srv/new-app", Options{TensorBoard: &tensorBoard, Python: &python, LaTeX: &latex, Title: &title}); err != nil {
 		t.Fatal(err)
 	}
 
 	resolved, err := store.Resolve("production")
-	if err != nil || resolved != "prod:/srv/new-app" {
-		t.Fatalf("Resolve(production) = %q, %v", resolved, err)
+	if err != nil || resolved.Target != "prod:/srv/new-app" || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title {
+		t.Fatalf("Resolve(production) = %#v, %v", resolved, err)
 	}
 	entries, err := store.List()
 	if err != nil {
@@ -46,7 +50,7 @@ func TestStoreAddResolveListAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(contents)
-	if !strings.Contains(text, "version: 1") || !strings.Contains(text, "production:") || !strings.Contains(text, "target: prod:/srv/new-app") || strings.Contains(text, "development:") {
+	if !strings.Contains(text, "version: 1") || !strings.Contains(text, "production:") || !strings.Contains(text, "target: prod:/srv/new-app") || !strings.Contains(text, "tensorboard: true") || !strings.Contains(text, "python-interpreter: /env/bin/python") || !strings.Contains(text, "latex: true") || !strings.Contains(text, "title: Project dashboard") || strings.Contains(text, "development:") {
 		t.Fatalf("saved YAML = %q", text)
 	}
 	info, err := os.Stat(path)
@@ -71,11 +75,11 @@ func TestStoreMissingAndInvalidData(t *testing.T) {
 		t.Fatalf("Delete(missing) error = %v, want ErrNotFound", err)
 	}
 	for _, name := range []string{"", "two words", "bad:name", "-option"} {
-		if err := store.Add(name, "lab:/tmp"); err == nil {
+		if err := store.Add(name, "lab:/tmp", Options{}); err == nil {
 			t.Errorf("Add(%q) succeeded, want error", name)
 		}
 	}
-	if err := store.Add("valid", "not-a-target"); err == nil {
+	if err := store.Add("valid", "not-a-target", Options{}); err == nil {
 		t.Fatal("Add with invalid target succeeded")
 	}
 }

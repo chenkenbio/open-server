@@ -52,6 +52,10 @@ func (Local) Open(_ context.Context, name string) (ReadSeekCloser, error) {
 	return os.Open(filepath.FromSlash(name))
 }
 
+func (Local) Mkdir(_ context.Context, name string) error {
+	return os.Mkdir(filepath.FromSlash(name), 0o755)
+}
+
 func (Local) Readlink(_ context.Context, name string) (string, error) {
 	return os.Readlink(filepath.FromSlash(name))
 }
@@ -132,5 +136,5 @@ func localTemporaryName(dir string) (string, error) {
 	if _, err := rand.Read(random[:]); err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, ".remote-browser-upload-"+hex.EncodeToString(random[:])), nil
+	return filepath.Join(dir, ".open-server-upload-"+hex.EncodeToString(random[:])), nil
 }

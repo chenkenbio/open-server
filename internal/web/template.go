@@ -6,12 +6,23 @@ const directoryTemplate = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}}</title>
+<style>
+.latex-logo { font-family: "Times New Roman", Times, serif; font-weight: normal; white-space: nowrap; }
+.latex-logo-a { font-size: 0.72em; vertical-align: 0.32em; margin-left: -0.28em; margin-right: -0.12em; }
+.latex-logo-e { display: inline-block; font-size: 0.85em; vertical-align: -0.18em; margin-left: -0.08em; margin-right: -0.05em; }
+</style>
 </head>
 <body>
 <h1 style="font-family: monospace;">{{.Title}}</h1>
+{{if .PlainHTTPWarning}}<div role="alert" style="margin: 0 0 0.8em 0; padding: 0.7em; border: 1px solid #a66; background: #fff3cd; color: #4d3800; font-family: sans-serif;"><strong>Security warning:</strong> This server uses token-protected plain HTTP. The token controls access, but traffic is not encrypted. Use only on a trusted network.</div>{{end}}
 <p style="margin: 0 0 0.3em 0; font-family: monospace;">Host: <strong>{{.SSHHost}}</strong></p>
 <p style="margin: 0 0 0.3em 0; font-family: monospace;">Root: <strong>{{.RootPath}}</strong></p>
 <p style="margin: 0 0 0.6em 0; font-family: monospace;">Path: {{range $i, $crumb := .Breadcrumbs}}{{if $i}} / {{end}}<a href="{{$crumb.URL}}">{{$crumb.Name}}</a>{{end}}</p>
+<div id="path-actions" style="margin: 0 0 0.8em 0; font-family: sans-serif;">
+<button id="btn-create-folder" type="button">Create folder</button>
+<button id="btn-toggle-hidden" type="button" data-href="{{.HiddenToggleURL}}">{{.HiddenToggleLabel}}</button>
+<button type="button" class="copy-path" data-path="{{.CurrentPath}}">Copy current path</button>
+</div>
 <div id="drop-zone" style="padding: 1.2em; border: 2px dashed #999; text-align: center; margin: 0 0 1em 0; font-family: sans-serif;">
 <p style="margin: 0 0 0.6em 0;">Drop files here, or use the buttons to upload.</p>
 <form id="upload-form" action="{{.UploadURL}}" method="POST" enctype="multipart/form-data" style="margin: 0;">
@@ -49,13 +60,24 @@ const directoryTemplate = `<!DOCTYPE html>
 </div>
 </div>
 </div>
+<div id="folder-modal" role="dialog" aria-modal="true" aria-labelledby="folder-prompt" style="display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.25); z-index: 1000; font-family: sans-serif;">
+<div style="background: #fff; color: #000; border: 1px solid #777; border-radius: 6px; max-width: 28em; margin: 15vh auto 0 auto; padding: 1em;">
+<p id="folder-prompt" style="margin: 0 0 0.8em 0;">Create a folder in the current path:</p>
+<input id="folder-name" type="text" placeholder="Folder name" style="width: 100%; box-sizing: border-box; margin: 0 0 1em 0;">
+<div style="text-align: right;">
+<button id="folder-cancel" type="button">Cancel</button>
+<button id="folder-create" type="button">Create folder</button>
+</div>
+</div>
+</div>
 <table>
-<tr><th align="left"><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a></th><th align="left"><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a></th><th align="right"><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a></th><th align="right">Path</th><th align="right">Download</th></tr>
-<tr><th colspan="5"><hr></th></tr>
-{{if .HasParent}}<tr><td><a href="{{.ParentURL}}">Parent Directory</a></td><td>&nbsp;</td><td align="right"> - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.ParentPath}}">Copy path</button></td><td align="right">&nbsp;</td></tr>
-{{end}}{{range .Entries}}<tr><td><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</td><td>&nbsp;&nbsp;{{time .ModTime}}&nbsp;&nbsp;</td><td align="right">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.FullPath}}">Copy path</button></td><td align="right">{{if .IsDir}}&nbsp;{{else}}&nbsp;&nbsp;<button type="button" class="download-file" data-href="{{.Download}}">Download</button>{{end}}</td></tr>
-{{else}}<tr><td colspan="5">This directory is empty.</td></tr>
-{{end}}<tr><th colspan="5"><hr></th></tr>
+{{$view := .}}<tr><th align="left"{{if .LaTeXEnabled}} rowspan="2"{{end}}><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a></th><th align="left"{{if .LaTeXEnabled}} rowspan="2"{{end}}><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a></th><th align="right"{{if .LaTeXEnabled}} rowspan="2"{{end}}><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a></th><th align="right"{{if .LaTeXEnabled}} rowspan="2"{{end}}>Path</th><th align="right"{{if .LaTeXEnabled}} rowspan="2"{{end}}>Download</th>{{if .TensorBoardEnabled}}<th align="right"{{if .LaTeXEnabled}} rowspan="2"{{end}}>TensorBoard</th>{{end}}{{if .LaTeXEnabled}}<th align="center" colspan="3" aria-label="LaTeX tools"><span class="latex-logo" aria-hidden="true">L<span class="latex-logo-a">A</span>T<span class="latex-logo-e">E</span>X</span> tools</th>{{end}}</tr>
+{{if .LaTeXEnabled}}<tr><th align="right">Table</th><th align="right">Figure</th><th align="right">Preview</th></tr>{{end}}
+<tr><th colspan="{{.ColumnCount}}"><hr></th></tr>
+{{if .HasParent}}<tr><td><a href="{{.ParentURL}}">Parent Directory</a></td><td>&nbsp;</td><td align="right"> - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.ParentPath}}">Copy path</button></td><td align="right">&nbsp;</td>{{if .TensorBoardEnabled}}<td align="right"><form action="{{.ParentTensorBoard}}" method="post" target="_blank" style="margin: 0;"><button type="submit">TensorBoard</button></form></td>{{end}}{{if .LaTeXEnabled}}<td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td>{{end}}</tr>
+{{end}}{{range .Entries}}<tr><td><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</td><td>&nbsp;&nbsp;{{time .ModTime}}&nbsp;&nbsp;</td><td align="right">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path" data-path="{{.FullPath}}">Copy path</button></td><td align="right">{{if .IsDir}}&nbsp;{{else}}&nbsp;&nbsp;<button type="button" class="download-file" data-href="{{.Download}}">Download</button>{{end}}</td>{{if $view.TensorBoardEnabled}}<td align="right">{{if .TensorBoard}}<form action="{{.TensorBoard}}" method="post" target="_blank" style="margin: 0;"><button type="submit">TensorBoard</button></form>{{else}}&nbsp;{{end}}</td>{{end}}{{if $view.LaTeXEnabled}}<td align="right">{{if .TableSnippet}}<button type="button" class="copy-snippet" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet="{{.TableSnippet}}">Table</button>{{else}}&nbsp;{{end}}</td><td align="right">{{if .FigureSnippet}}<button type="button" class="copy-snippet" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet="{{.FigureSnippet}}">Figure</button>{{else}}&nbsp;{{end}}</td><td align="right">{{if .LiveURL}}<button type="button" class="open-live" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}">Preview</button>{{else}}&nbsp;{{end}}</td>{{end}}</tr>
+{{else}}<tr><td colspan="{{.ColumnCount}}">This directory is empty.</td></tr>
+{{end}}<tr><th colspan="{{.ColumnCount}}"><hr></th></tr>
 </table>
 <script>
 (function() {
@@ -63,6 +85,7 @@ const directoryTemplate = `<!DOCTYPE html>
   var status = document.getElementById('upload-status');
   var uploadURL = {{.UploadURL}};
   var importURL = {{.ImportURL}};
+  var mkdirURL = {{.MkdirURL}};
   var conflictModal = document.getElementById('conflict-modal');
   var conflictMessage = document.getElementById('conflict-message');
   var conflictApplyAll = document.getElementById('conflict-apply-all');
@@ -86,8 +109,8 @@ const directoryTemplate = `<!DOCTYPE html>
     button.textContent = label;
     setTimeout(function() { button.textContent = old; }, 900);
   }
-  function copyPath(button) {
-    var text = button.getAttribute('data-path');
+  function copyText(button, attribute) {
+	var text = button.getAttribute(attribute);
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(function() {
         showCopyResult(button, 'Copied');
@@ -99,13 +122,65 @@ const directoryTemplate = `<!DOCTYPE html>
     showCopyResult(button, fallbackCopy(text) ? 'Copied' : 'Copy failed');
   }
   Array.prototype.forEach.call(document.querySelectorAll('.copy-path'), function(button) {
-    button.addEventListener('click', function() { copyPath(button); });
+    button.addEventListener('click', function() { copyText(button, 'data-path'); });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.copy-snippet'), function(button) {
+    button.addEventListener('click', function() { copyText(button, 'data-snippet'); });
   });
   Array.prototype.forEach.call(document.querySelectorAll('.download-file'), function(button) {
     button.addEventListener('click', function() {
       window.location.href = button.getAttribute('data-href');
     });
   });
+  Array.prototype.forEach.call(document.querySelectorAll('.open-live'), function(button) {
+    button.addEventListener('click', function() {
+      window.open(button.getAttribute('data-href'), '_blank', 'noopener');
+    });
+  });
+  document.getElementById('btn-toggle-hidden').addEventListener('click', function() {
+    window.location.href = this.getAttribute('data-href');
+  });
+
+  var folderModal = document.getElementById('folder-modal');
+  var folderName = document.getElementById('folder-name');
+  var folderCreate = document.getElementById('folder-create');
+  var folderCancel = document.getElementById('folder-cancel');
+  function closeFolderModal() {
+    folderModal.style.display = 'none';
+    folderName.onkeydown = null;
+  }
+  function createFolder() {
+    var name = folderName.value.trim();
+    if (!name) return;
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', mkdirURL, true);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    status.textContent = 'Creating folder ' + name + '...';
+    xhr.addEventListener('load', function() {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        closeFolderModal();
+        status.textContent = 'Folder created. Reloading...';
+        setTimeout(function() { window.location.reload(); }, 250);
+      } else {
+        status.textContent = 'Create folder failed: ' + errorMessage(xhr, 'request failed');
+      }
+    });
+    xhr.addEventListener('error', function() {
+      status.textContent = 'Create folder failed: network error';
+    });
+    xhr.send('name=' + encodeURIComponent(name));
+  }
+  document.getElementById('btn-create-folder').addEventListener('click', function() {
+    folderName.value = '';
+    folderModal.style.display = 'block';
+    folderName.focus();
+    folderName.onkeydown = function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); createFolder(); }
+      if (e.key === 'Escape') closeFolderModal();
+    };
+  });
+  folderCreate.addEventListener('click', createFolder);
+  folderCancel.addEventListener('click', closeFolderModal);
 
   function stop(e) { e.preventDefault(); e.stopPropagation(); }
   ['dragenter', 'dragover'].forEach(function(eventName) {

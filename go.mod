@@ -1,4 +1,4 @@
-module remote-browser
+module open-server
 
 go 1.25.0
 

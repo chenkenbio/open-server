@@ -1,7 +1,12 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,14 +15,17 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"remote-browser/internal/filesystem"
+	"open-server/internal/filesystem"
+	"open-server/internal/tensorboard"
 )
 
 type Options struct {
@@ -26,7 +34,10 @@ type Options struct {
 	SSHHost     string
 	Title       string
 	AllowedHost string
+	AccessToken string
 	HTTPClient  *http.Client
+	TensorBoard tensorboard.Launcher
+	LaTeX       bool
 }
 
 var errOutsideRoot = errors.New("path is outside the configured root")
@@ -37,13 +48,21 @@ type App struct {
 	sshHost     string
 	title       string
 	allowedHost string
+	accessToken string
 	httpClient  *http.Client
+	tensorBoard tensorboard.Launcher
+	latex       bool
+	tensorMu    sync.RWMutex
+	tensorProxy map[string]http.Handler
 	template    *template.Template
 }
 
 func New(options Options) (*App, error) {
 	if options.Backend == nil || options.AllowedHost == "" {
 		return nil, errors.New("backend and allowed host are required")
+	}
+	if options.AccessToken != "" && len(options.AccessToken) < 8 {
+		return nil, errors.New("access token must be at least 8 characters")
 	}
 	root, err := filesystem.CleanRemotePath(options.Root)
 	if err != nil {
@@ -77,24 +96,42 @@ func New(options Options) (*App, error) {
 		sshHost:     options.SSHHost,
 		title:       options.Title,
 		allowedHost: options.AllowedHost,
+		accessToken: options.AccessToken,
 		httpClient:  options.HTTPClient,
+		tensorBoard: options.TensorBoard,
+		latex:       options.LaTeX,
+		tensorProxy: make(map[string]http.Handler),
 		template:    tmpl,
 	}, nil
 }
 
 func (a *App) URL() string {
-	return "http://" + a.allowedHost + "/"
+	address := "http://" + a.allowedHost + "/"
+	if a.accessToken == "" {
+		return address
+	}
+	return address + "?token=" + url.QueryEscape(a.accessToken)
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	a.securityHeaders(w)
+	route := r.URL.Path
+	proxyRoute := strings.HasPrefix(r.URL.Path, "/tensorboard/")
+	if !proxyRoute {
+		a.securityHeaders(w, a.latex && route == "/preview")
+	}
 	if r.Host != a.allowedHost {
 		http.Error(w, "invalid Host header", http.StatusMisdirectedRequest)
 		return
 	}
-	route := r.URL.Path
+	if !a.authorize(w, r) {
+		return
+	}
 	if isStateChanging(r.Method) && !a.validOrigin(r) {
 		http.Error(w, "invalid Origin header", http.StatusForbidden)
+		return
+	}
+	if proxyRoute {
+		a.serveTensorBoard(w, r)
 		return
 	}
 
@@ -129,17 +166,91 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.importURL(w, r)
+	case "/mkdir":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		a.mkdir(w, r)
+	case "/tensorboard":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		a.startTensorBoard(w, r)
+	case "/live":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			methodNotAllowed(w, http.MethodGet, http.MethodHead)
+			return
+		}
+		a.livePDF(w, r)
+	case "/live/status":
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			methodNotAllowed(w, http.MethodGet, http.MethodHead)
+			return
+		}
+		a.livePDFStatus(w, r)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func (a *App) securityHeaders(w http.ResponseWriter) {
+const authCookieMaxAge = 12 * 60 * 60
+
+func (a *App) authorize(w http.ResponseWriter, r *http.Request) bool {
+	if a.accessToken == "" {
+		return true
+	}
+	queryToken := r.URL.Query().Get("token")
+	cookieToken := ""
+	if cookie, err := r.Cookie(authCookieName(a.accessToken)); err == nil {
+		cookieToken = cookie.Value
+	}
+	queryValid := tokenMatches(queryToken, a.accessToken)
+	if !queryValid && !tokenMatches(cookieToken, a.accessToken) {
+		http.Error(w, "a valid access token is required", http.StatusForbidden)
+		return false
+	}
+	if queryValid {
+		http.SetCookie(w, &http.Cookie{
+			Name: authCookieName(a.accessToken), Value: a.accessToken, Path: "/",
+			MaxAge: authCookieMaxAge, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		})
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			nextURL := *r.URL
+			values := nextURL.Query()
+			values.Del("token")
+			nextURL.RawQuery = values.Encode()
+			http.Redirect(w, r, nextURL.RequestURI(), http.StatusSeeOther)
+			return false
+		}
+	}
+	return true
+}
+
+func tokenMatches(got, want string) bool {
+	gotHash := sha256.Sum256([]byte(got))
+	wantHash := sha256.Sum256([]byte(want))
+	return len(got) == len(want) && subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
+}
+
+func authCookieName(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return "open_server_token_" + hex.EncodeToString(sum[:])[:16]
+}
+
+func (a *App) securityHeaders(w http.ResponseWriter, allowSameOriginFrame bool) {
+	frameAncestors := "'none'"
+	frameOptions := "DENY"
+	if allowSameOriginFrame {
+		frameAncestors = "'self'"
+		frameOptions = "SAMEORIGIN"
+	}
 	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors "+frameAncestors)
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Frame-Options", frameOptions)
 }
 
 func isStateChanging(method string) bool {
@@ -155,10 +266,18 @@ func (a *App) validOrigin(r *http.Request) bool {
 type directoryView struct {
 	Title              string
 	SSHHost            string
+	PlainHTTPWarning   bool
 	RootPath           string
 	CurrentPath        string
 	UploadURL          string
 	ImportURL          string
+	MkdirURL           string
+	HiddenToggleURL    string
+	HiddenToggleLabel  string
+	ShowHidden         bool
+	TensorBoardEnabled bool
+	LaTeXEnabled       bool
+	ColumnCount        int
 	NameSortURL        string
 	ModifiedSortURL    string
 	SizeSortURL        string
@@ -168,6 +287,7 @@ type directoryView struct {
 	HasParent          bool
 	ParentPath         string
 	ParentURL          string
+	ParentTensorBoard  string
 	Breadcrumbs        []breadcrumbView
 	Entries            []entryView
 }
@@ -178,17 +298,21 @@ type breadcrumbView struct {
 }
 
 type entryView struct {
-	Name       string
-	FullPath   string
-	URL        string
-	Download   string
-	Size       int64
-	ModTime    time.Time
-	IsDir      bool
-	IsLink     bool
-	Broken     bool
-	LinkTarget string
-	Preview    bool
+	Name          string
+	FullPath      string
+	URL           string
+	Download      string
+	TensorBoard   string
+	TableSnippet  string
+	FigureSnippet string
+	LiveURL       string
+	Size          int64
+	ModTime       time.Time
+	IsDir         bool
+	IsLink        bool
+	Broken        bool
+	LinkTarget    string
+	Preview       bool
 }
 
 func (a *App) browse(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +335,16 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		a.pathError(w, err)
 		return
 	}
+	showHidden := r.URL.Query().Get("hidden") == "1"
+	if !showHidden {
+		visible := entries[:0]
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name, ".") {
+				visible = append(visible, entry)
+			}
+		}
+		entries = visible
+	}
 	sortKey := r.URL.Query().Get("sort")
 	if sortKey != "size" && sortKey != "modified" {
 		sortKey = "name"
@@ -222,17 +356,34 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	sortEntries(entries, sortKey, order == "desc")
 
 	view := directoryView{
-		Title:           a.title,
-		SSHHost:         a.sshHost,
-		RootPath:        a.root,
-		CurrentPath:     current,
-		UploadURL:       a.appURL("/upload", current, "", ""),
-		ImportURL:       a.appURL("/import", current, "", ""),
-		NameSortURL:     a.sortURL(current, sortKey, order, "name"),
-		ModifiedSortURL: a.sortURL(current, sortKey, order, "modified"),
-		SizeSortURL:     a.sortURL(current, sortKey, order, "size"),
-		Breadcrumbs:     a.breadcrumbs(current, sortKey, order),
-		Entries:         make([]entryView, 0, len(entries)),
+		Title:              a.title,
+		SSHHost:            a.sshHost,
+		PlainHTTPWarning:   a.accessToken != "",
+		RootPath:           a.root,
+		CurrentPath:        current,
+		UploadURL:          a.appURL("/upload", current, "", "", showHidden),
+		ImportURL:          a.appURL("/import", current, "", "", showHidden),
+		MkdirURL:           a.appURL("/mkdir", current, "", "", showHidden),
+		HiddenToggleURL:    a.appURL("/", current, sortKey, order, !showHidden),
+		ShowHidden:         showHidden,
+		TensorBoardEnabled: a.tensorBoard != nil,
+		LaTeXEnabled:       a.latex,
+		NameSortURL:        a.sortURL(current, sortKey, order, "name", showHidden),
+		ModifiedSortURL:    a.sortURL(current, sortKey, order, "modified", showHidden),
+		SizeSortURL:        a.sortURL(current, sortKey, order, "size", showHidden),
+		Breadcrumbs:        a.breadcrumbs(current, sortKey, order, showHidden),
+		Entries:            make([]entryView, 0, len(entries)),
+	}
+	view.HiddenToggleLabel = "Show hidden items"
+	if showHidden {
+		view.HiddenToggleLabel = "Hide hidden items"
+	}
+	view.ColumnCount = 5
+	if view.TensorBoardEnabled {
+		view.ColumnCount++
+	}
+	if view.LaTeXEnabled {
+		view.ColumnCount += 3
 	}
 	view.NameSortMarker = sortMarker(sortKey, order, "name")
 	view.ModifiedSortMarker = sortMarker(sortKey, order, "modified")
@@ -240,31 +391,50 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	if current != a.root {
 		view.HasParent = true
 		view.ParentPath = path.Dir(current)
-		view.ParentURL = a.appURL("/", view.ParentPath, sortKey, order)
+		view.ParentURL = a.appURL("/", view.ParentPath, sortKey, order, showHidden)
+		if a.tensorBoard != nil {
+			view.ParentTensorBoard = a.appURL("/tensorboard", view.ParentPath, "", "", showHidden)
+		}
 	}
 	for _, entry := range entries {
 		fullName, childErr := filesystem.Child(current, entry.Name)
 		if childErr != nil {
 			continue
 		}
-		entryURL := a.appURL("/download", fullName, "", "")
+		entryURL := a.appURL("/download", fullName, "", "", showHidden)
 		if entry.IsDir() {
-			entryURL = a.appURL("/", fullName, sortKey, order)
+			entryURL = a.appURL("/", fullName, sortKey, order, showHidden)
 		} else if previewable(fullName) {
-			entryURL = a.appURL("/preview", fullName, "", "")
+			entryURL = a.appURL("/preview", fullName, "", "", showHidden)
+		}
+		tensorBoardURL := ""
+		if entry.IsDir() && a.tensorBoard != nil {
+			tensorBoardURL = a.appURL("/tensorboard", fullName, "", "", showHidden)
+		}
+		figureSnippet, tableSnippet := "", ""
+		liveURL := ""
+		if a.latex && entry.Info != nil && entry.Info.Mode().IsRegular() {
+			figureSnippet, tableSnippet = makeLaTeXSnippets(fullName)
+			if strings.EqualFold(path.Ext(fullName), ".pdf") {
+				liveURL = a.appURL("/live", fullName, "", "", showHidden)
+			}
 		}
 		view.Entries = append(view.Entries, entryView{
-			Name:       entry.Name,
-			FullPath:   fullName,
-			URL:        entryURL,
-			Download:   a.appURL("/download", fullName, "", ""),
-			Size:       entry.Size(),
-			ModTime:    entry.ModTime(),
-			IsDir:      entry.IsDir(),
-			IsLink:     entry.IsLink(),
-			Broken:     entry.IsLink() && entry.Info == nil,
-			LinkTarget: entry.LinkTarget,
-			Preview:    !entry.IsDir() && previewable(fullName),
+			Name:          entry.Name,
+			FullPath:      fullName,
+			URL:           entryURL,
+			Download:      a.appURL("/download", fullName, "", "", showHidden),
+			TensorBoard:   tensorBoardURL,
+			TableSnippet:  tableSnippet,
+			FigureSnippet: figureSnippet,
+			LiveURL:       liveURL,
+			Size:          entry.Size(),
+			ModTime:       entry.ModTime(),
+			IsDir:         entry.IsDir(),
+			IsLink:        entry.IsLink(),
+			Broken:        entry.IsLink() && entry.Info == nil,
+			LinkTarget:    entry.LinkTarget,
+			Preview:       !entry.IsDir() && previewable(fullName),
 		})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -288,8 +458,8 @@ func (a *App) requestPath(r *http.Request) (string, error) {
 	return cleaned, nil
 }
 
-func (a *App) breadcrumbs(name, sortKey, order string) []breadcrumbView {
-	crumbs := []breadcrumbView{{Name: ".", URL: a.appURL("/", a.root, sortKey, order)}}
+func (a *App) breadcrumbs(name, sortKey, order string, showHidden bool) []breadcrumbView {
+	crumbs := []breadcrumbView{{Name: ".", URL: a.appURL("/", a.root, sortKey, order, showHidden)}}
 	if name == a.root {
 		return crumbs
 	}
@@ -301,7 +471,7 @@ func (a *App) breadcrumbs(name, sortKey, order string) []breadcrumbView {
 			continue
 		}
 		current = path.Join(current, part)
-		crumbs = append(crumbs, breadcrumbView{Name: part, URL: a.appURL("/", current, sortKey, order)})
+		crumbs = append(crumbs, breadcrumbView{Name: part, URL: a.appURL("/", current, sortKey, order, showHidden)})
 	}
 	return crumbs
 }
@@ -315,22 +485,25 @@ func withinRoot(root, name string) bool {
 	return name == root || strings.HasPrefix(name, root+"/")
 }
 
-func (a *App) appURL(route, name, sortKey, order string) string {
+func (a *App) appURL(route, name, sortKey, order string, showHidden bool) string {
 	values := make(url.Values)
 	values.Set("path", name)
 	if sortKey != "" {
 		values.Set("sort", sortKey)
 		values.Set("order", order)
 	}
+	if showHidden {
+		values.Set("hidden", "1")
+	}
 	return route + "?" + values.Encode()
 }
 
-func (a *App) sortURL(name, currentKey, currentOrder, requestedKey string) string {
+func (a *App) sortURL(name, currentKey, currentOrder, requestedKey string, showHidden bool) string {
 	order := "asc"
 	if requestedKey == currentKey && currentOrder == "asc" {
 		order = "desc"
 	}
-	return a.appURL("/", name, requestedKey, order)
+	return a.appURL("/", name, requestedKey, order, showHidden)
 }
 
 func sortMarker(currentKey, currentOrder, requestedKey string) string {
@@ -373,6 +546,266 @@ func sortEntries(entries []filesystem.Entry, key string, descending bool) {
 	})
 }
 
+func makeLaTeXSnippets(name string) (figure, table string) {
+	extension := strings.ToLower(path.Ext(name))
+	fileArgument := `\detokenize{` + name + `}`
+	label := latexLabel(strings.TrimSuffix(path.Base(name), path.Ext(name)))
+	switch extension {
+	case ".png", ".jpg", ".jpeg", ".pdf":
+		return "\\begin{figure}[htbp]\n" +
+			"  \\centering\n" +
+			"  \\includegraphics[width=1.00\\textwidth]{" + fileArgument + "}\n" +
+			"  \\caption{}\n" +
+			"  % \\label{fig:" + label + "}\n" +
+			"\\end{figure}", ""
+	case ".csv", ".tsv":
+		options := ""
+		if extension == ".tsv" {
+			options = "[separator=tab]"
+		}
+		return "", "\\begin{table}[htbp]\n" +
+			"  \\centering\n" +
+			"  \\csvautotabular" + options + "{" + fileArgument + "}\n" +
+			"  \\caption{}\n" +
+			"  % \\label{tab:" + label + "}\n" +
+			"\\end{table}"
+	default:
+		return "", ""
+	}
+}
+
+func latexLabel(name string) string {
+	name = strings.ToLower(name)
+	var label strings.Builder
+	lastDash := false
+	for _, character := range name {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') {
+			label.WriteRune(character)
+			lastDash = false
+		} else if !lastDash && label.Len() > 0 {
+			label.WriteByte('-')
+			lastDash = true
+		}
+	}
+	result := strings.Trim(label.String(), "-")
+	if result == "" {
+		return "file"
+	}
+	return result
+}
+
+func (a *App) mkdir(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := r.ParseForm(); err != nil {
+		jsonMessage(w, http.StatusBadRequest, "invalid create-folder request")
+		return
+	}
+	directory, err := a.requestPath(r)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	name := strings.TrimSpace(r.Form.Get("name"))
+	destination, err := filesystem.Child(directory, name)
+	if err != nil {
+		jsonMessage(w, http.StatusBadRequest, "folder name must be a single valid path component")
+		return
+	}
+	if err := a.backend.Mkdir(r.Context(), destination); err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"path": destination})
+}
+
+func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
+	if a.tensorBoard == nil {
+		http.NotFound(w, r)
+		return
+	}
+	directory, err := a.requestPath(r)
+	if err != nil {
+		a.pathError(w, err)
+		return
+	}
+	info, err := a.backend.Stat(r.Context(), directory)
+	if err != nil {
+		a.pathError(w, err)
+		return
+	}
+	if !info.IsDir() {
+		http.Error(w, "TensorBoard path must be a directory", http.StatusBadRequest)
+		return
+	}
+	var randomID [8]byte
+	if _, err := rand.Read(randomID[:]); err != nil {
+		http.Error(w, "could not create TensorBoard session", http.StatusInternalServerError)
+		return
+	}
+	id := hex.EncodeToString(randomID[:])
+	prefix := "/tensorboard/" + id
+	instance, err := a.tensorBoard.Start(directory, prefix)
+	if err != nil {
+		http.Error(w, "could not start TensorBoard: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if instance == nil || (instance.Target == nil && instance.Handler == nil) {
+		http.Error(w, "could not start TensorBoard", http.StatusBadGateway)
+		return
+	}
+	var handler http.Handler = instance.Handler
+	if handler == nil {
+		proxy := httputil.NewSingleHostReverseProxy(instance.Target)
+		director := proxy.Director
+		proxy.Director = func(request *http.Request) {
+			director(request)
+			request.Host = instance.Target.Host
+		}
+		proxy.ErrorHandler = func(response http.ResponseWriter, _ *http.Request, _ error) {
+			http.Error(response, "TensorBoard is starting or unavailable; retry shortly", http.StatusBadGateway)
+		}
+		handler = proxy
+	}
+	a.tensorMu.Lock()
+	a.tensorProxy[id] = handler
+	a.tensorMu.Unlock()
+	http.Redirect(w, r, prefix+"/", http.StatusSeeOther)
+}
+
+func (a *App) serveTensorBoard(w http.ResponseWriter, r *http.Request) {
+	remainder := strings.TrimPrefix(r.URL.Path, "/tensorboard/")
+	id := strings.SplitN(remainder, "/", 2)[0]
+	a.tensorMu.RLock()
+	proxy := a.tensorProxy[id]
+	a.tensorMu.RUnlock()
+	if proxy == nil {
+		http.NotFound(w, r)
+		return
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func (a *App) livePDF(w http.ResponseWriter, r *http.Request) {
+	name, info, err := a.livePDFInfo(r)
+	if err != nil {
+		a.pathError(w, err)
+		return
+	}
+	ready, err := a.pdfComplete(r.Context(), name, info)
+	if err != nil {
+		a.pathError(w, err)
+		return
+	}
+	initialVersion := ""
+	if ready {
+		initialVersion = fileVersion(info)
+	}
+	data := struct {
+		Title          string
+		PreviewURL     string
+		StatusURL      string
+		InitialVersion string
+		InitialReady   bool
+		PlainHTTP      bool
+	}{
+		Title:          path.Base(name),
+		PreviewURL:     a.appURL("/preview", name, "", "", false),
+		StatusURL:      a.appURL("/live/status", name, "", "", false),
+		InitialVersion: initialVersion,
+		InitialReady:   ready,
+		PlainHTTP:      a.accessToken != "",
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = livePDFPage.Execute(w, data)
+}
+
+func (a *App) livePDFStatus(w http.ResponseWriter, r *http.Request) {
+	name, info, err := a.livePDFInfo(r)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	ready, err := a.pdfComplete(r.Context(), name, info)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	version := ""
+	if ready {
+		version = fileVersion(info)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"version": version, "ready": ready})
+}
+
+func (a *App) pdfComplete(ctx context.Context, name string, info fs.FileInfo) (bool, error) {
+	const marker = "%%EOF"
+	if info.Size() < int64(len(marker)) {
+		return false, nil
+	}
+	file, err := a.backend.Open(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	tailSize := info.Size()
+	if tailSize > 4096 {
+		tailSize = 4096
+	}
+	if _, err := file.Seek(-tailSize, io.SeekEnd); err != nil {
+		return false, nil
+	}
+	tail, err := io.ReadAll(io.LimitReader(file, tailSize))
+	if err != nil || int64(len(tail)) != tailSize {
+		return false, nil
+	}
+	markerIndex := bytes.LastIndex(tail, []byte(marker))
+	if markerIndex < 0 || !onlyPDFWhitespace(tail[markerIndex+len(marker):]) {
+		return false, nil
+	}
+	latest, err := a.backend.Stat(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	return latest.Mode().IsRegular() && fileVersion(latest) == fileVersion(info), nil
+}
+
+func onlyPDFWhitespace(value []byte) bool {
+	for _, character := range value {
+		switch character {
+		case 0, '\t', '\n', '\f', '\r', ' ':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) livePDFInfo(r *http.Request) (string, fs.FileInfo, error) {
+	if !a.latex {
+		return "", nil, fs.ErrNotExist
+	}
+	name, err := a.requestPath(r)
+	if err != nil {
+		return "", nil, err
+	}
+	if !strings.EqualFold(path.Ext(name), ".pdf") {
+		return "", nil, fs.ErrInvalid
+	}
+	info, err := a.backend.Stat(r.Context(), name)
+	if err != nil {
+		return "", nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil, fs.ErrInvalid
+	}
+	return name, info, nil
+}
+
+func fileVersion(info fs.FileInfo) string {
+	return strconv.FormatInt(info.Size(), 10) + "-" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+}
+
 func (a *App) serveFile(w http.ResponseWriter, r *http.Request, inline bool) {
 	name, err := a.requestPath(r)
 	if err != nil {
@@ -413,7 +846,7 @@ func (a *App) serveNamedFile(w http.ResponseWriter, r *http.Request, name string
 func previewable(name string) bool {
 	switch strings.ToLower(path.Ext(name)) {
 	case ".txt", ".log", ".md", ".csv", ".json", ".yaml", ".yml",
-		".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico",
+		".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico", ".pdf",
 		".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".webm", ".mov":
 		return true
 	default:
@@ -593,6 +1026,8 @@ func publicError(err error) string {
 		return "request was canceled"
 	case errors.Is(err, filesystem.ErrExists):
 		return "destination already exists"
+	case errors.Is(err, fs.ErrExist):
+		return "destination already exists"
 	case errors.Is(err, filesystem.ErrAtomicCreateUnsupported):
 		return "the remote server cannot safely create a new file without overwrite"
 	case errors.Is(err, filesystem.ErrAtomicReplaceUnsupported):
@@ -617,6 +1052,8 @@ func statusForError(err error) int {
 	case errors.Is(err, fs.ErrPermission):
 		return http.StatusForbidden
 	case errors.Is(err, filesystem.ErrExists):
+		return http.StatusConflict
+	case errors.Is(err, fs.ErrExist):
 		return http.StatusConflict
 	case errors.Is(err, filesystem.ErrAtomicCreateUnsupported), errors.Is(err, filesystem.ErrAtomicReplaceUnsupported):
 		return http.StatusNotImplemented

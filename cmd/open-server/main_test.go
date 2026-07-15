@@ -16,7 +16,7 @@ import (
 
 	"github.com/pkg/sftp"
 
-	"remote-browser/internal/filesystem"
+	"open-server/internal/filesystem"
 )
 
 func TestParseFlags(t *testing.T) {
@@ -29,11 +29,11 @@ func TestParseFlags(t *testing.T) {
 		t.Fatalf("default duration = %s, want %s", defaults.duration, defaultSessionDuration)
 	}
 
-	configuration, err := parseFlags([]string{"--port", "8123", "--duration", "90m", "--title", "Files", "lab:/tmp"}, io.Discard)
+	configuration, err := parseFlags([]string{"--port", "8123", "--duration", "90m", "--title", "Files", "lab:/tmp", "--tensorboard", "--python-interpreter", "/env/bin/python", "--latex"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.target != "lab:/tmp" {
+	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.target != "lab:/tmp" || !configuration.tensorBoard || configuration.python != "/env/bin/python" || !configuration.latex {
 		t.Fatalf("configuration = %#v", configuration)
 	}
 	add, err := parseFlags([]string{"--add", "work", "lab:/srv/work"}, io.Discard)
@@ -47,6 +47,10 @@ func TestParseFlags(t *testing.T) {
 	remove, err := parseFlags([]string{"-delete", "work"}, io.Discard)
 	if err != nil || remove.delete != "work" {
 		t.Fatalf("delete configuration = %#v, %v", remove, err)
+	}
+	serve, err := parseFlags([]string{"-serve"}, io.Discard)
+	if err != nil || !serve.serve || serve.target != "." {
+		t.Fatalf("serve configuration = %#v, %v", serve, err)
 	}
 	for _, arguments := range [][]string{
 		{}, {"--port", "70000", "lab:/tmp"}, {"--duration", "-1s", "lab:/tmp"},
@@ -65,11 +69,14 @@ func TestSavedSessionCommands(t *testing.T) {
 	t.Setenv("HOME", configHome)
 
 	var addOutput bytes.Buffer
-	if err := run([]string{"--add", "work", "lab:/srv/work"}, &addOutput); err != nil {
+	if err := run([]string{"--add", "work", "lab:/srv/work", "--tensorboard", "-py", "/env/bin/python", "--latex", "--title", "Dashboards"}, &addOutput); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(addOutput.String(), `Saved session "work" -> lab:/srv/work`) {
 		t.Fatalf("add output = %q", addOutput.String())
+	}
+	if !strings.Contains(addOutput.String(), "-tensorboard=true") || !strings.Contains(addOutput.String(), `-python-interpreter="/env/bin/python"`) || !strings.Contains(addOutput.String(), "-latex=true") {
+		t.Fatalf("add output does not show saved options: %q", addOutput.String())
 	}
 
 	var listOutput bytes.Buffer
@@ -80,11 +87,24 @@ func TestSavedSessionCommands(t *testing.T) {
 		t.Fatalf("list output = %q", listOutput.String())
 	}
 
-	resolved, err := resolveRemoteTarget("work")
+	resolved, options, err := resolveRemoteTarget("work")
 	if err != nil || resolved.Host != "lab" || resolved.Path != "/srv/work" {
 		t.Fatalf("resolveRemoteTarget(work) = %#v, %v", resolved, err)
 	}
-	if _, err := resolveRemoteTarget("missing"); err == nil || !strings.Contains(err.Error(), "use --list") {
+	if options.TensorBoard == nil || !*options.TensorBoard || options.Python == nil || *options.Python != "/env/bin/python" || options.LaTeX == nil || !*options.LaTeX || options.Title == nil || *options.Title != "Dashboards" {
+		t.Fatalf("saved options = %#v", options)
+	}
+	invocation, err := parseFlags([]string{"work", "--tensorboard=false", "--latex=false"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applySavedSessionOptions(&invocation, options); err != nil {
+		t.Fatal(err)
+	}
+	if invocation.tensorBoard || invocation.python != "/env/bin/python" || invocation.latex || invocation.title != "Dashboards" {
+		t.Fatalf("merged saved options = %#v", invocation)
+	}
+	if _, _, err := resolveRemoteTarget("missing"); err == nil || !strings.Contains(err.Error(), "use --list") {
 		t.Fatalf("resolveRemoteTarget(missing) error = %v", err)
 	}
 
@@ -100,6 +120,63 @@ func TestSavedSessionCommands(t *testing.T) {
 	}
 }
 
+func TestTensorBoardLauncherIsNilWhenDisabled(t *testing.T) {
+	configuration := config{rsh: "ssh"}
+	remoteLauncher, closeRemote := remoteTensorBoardLauncher(configuration, "lab", io.Discard)
+	defer closeRemote()
+	if remoteLauncher != nil {
+		t.Fatalf("disabled remote TensorBoard launcher = %#v, want nil", remoteLauncher)
+	}
+	localLauncher, closeLocal := localTensorBoardLauncher(configuration, io.Discard)
+	defer closeLocal()
+	if localLauncher != nil {
+		t.Fatalf("disabled local TensorBoard launcher = %#v, want nil", localLauncher)
+	}
+
+	configuration.tensorBoard = true
+	remoteLauncher, closeRemote = remoteTensorBoardLauncher(configuration, "lab", io.Discard)
+	defer closeRemote()
+	localLauncher, closeLocal = localTensorBoardLauncher(configuration, io.Discard)
+	defer closeLocal()
+	if remoteLauncher == nil || localLauncher == nil {
+		t.Fatal("enabled TensorBoard launcher is nil")
+	}
+}
+
+func TestLocalServeRoot(t *testing.T) {
+	directory := t.TempDir()
+	root, initialPath, err := localServeRoot(directory)
+	if err != nil || root != filepath.ToSlash(directory) || initialPath != "" {
+		t.Fatalf("localServeRoot(%q) = %q, %q, %v", directory, root, initialPath, err)
+	}
+	fileName := filepath.Join(directory, "paper.pdf")
+	if err := os.WriteFile(fileName, []byte("%PDF-1.4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, initialPath, err = localServeRoot(fileName)
+	if err != nil || root != filepath.ToSlash(directory) || initialPath != filepath.ToSlash(fileName) {
+		t.Fatalf("localServeRoot(%q) = %q, %q, %v", fileName, root, initialPath, err)
+	}
+	if got := serveStartURL("http://127.0.0.1:60000/?token=secret-token", initialPath); !strings.Contains(got, "path=") || !strings.Contains(got, "token=secret-token") {
+		t.Fatalf("serveStartURL = %q", got)
+	}
+	if _, _, err := localServeRoot(filepath.Join(directory, "missing")); err == nil {
+		t.Fatal("localServeRoot accepted a missing path")
+	}
+	token, err := generateAccessToken()
+	if err != nil || len(token) != 32 {
+		t.Fatalf("generated token = %q, %v", token, err)
+	}
+}
+
+func TestNormalizeFlagOrderPreservesSeparator(t *testing.T) {
+	got := normalizeFlagOrder([]string{"-serve", "--", "-folder"})
+	want := []string{"-serve", "--", "-folder"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("normalized arguments = %q, want %q", got, want)
+	}
+}
+
 func TestHelpIsRecognized(t *testing.T) {
 	if _, err := parseFlags([]string{"--help"}, io.Discard); !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("--help error = %v, want flag.ErrHelp", err)
@@ -112,7 +189,7 @@ func TestVersion(t *testing.T) {
 		if err := run([]string{argument}, &output); err != nil {
 			t.Fatal(err)
 		}
-		if got, want := output.String(), "remote-browser "+version+"\n"; got != want {
+		if got, want := output.String(), "open-server "+version+"\n"; got != want {
 			t.Errorf("%s output = %q, want %q", argument, got, want)
 		}
 	}
@@ -169,6 +246,24 @@ func TestRunDurationCleansUp(t *testing.T) {
 	}
 }
 
+func TestRunServeDurationCleansUp(t *testing.T) {
+	root := t.TempDir()
+	var output bytes.Buffer
+	started := time.Now()
+	err := run([]string{"-serve", "-address", "127.0.0.1", "-token", "test-token", "-duration", "100ms", root}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > 4*time.Second {
+		t.Fatal("serve duration-based cleanup took too long")
+	}
+	for _, want := range []string{"Open this network URL: http://127.0.0.1:", "?token=test-token", "WARNING: serve mode uses plain, unencrypted HTTP", "duration expired"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("serve output %q does not contain %q", output.String(), want)
+		}
+	}
+}
+
 func TestRunSignalCleansUp(t *testing.T) {
 	output := newNotifyWriter("Open this local URL")
 	result := make(chan error, 1)
@@ -209,7 +304,7 @@ func TestRunReportsUnexpectedSSHExit(t *testing.T) {
 }
 
 func TestCLIHelperProcess(t *testing.T) {
-	if os.Getenv("REMOTE_BROWSER_CLI_HELPER") != "1" {
+	if os.Getenv("OPEN_SERVER_CLI_HELPER") != "1" {
 		return
 	}
 	server, err := sftp.NewServer(struct {
@@ -219,7 +314,7 @@ func TestCLIHelperProcess(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
-	if os.Getenv("REMOTE_BROWSER_CLI_EXIT") == "1" {
+	if os.Getenv("OPEN_SERVER_CLI_EXIT") == "1" {
 		go func() { _ = server.Serve() }()
 		time.Sleep(2 * time.Second)
 		os.Exit(0)
@@ -238,9 +333,9 @@ func cliWrapper(t *testing.T, exitEarly bool) string {
 	wrapper := filepath.Join(t.TempDir(), "ssh-wrapper")
 	exitVariable := ""
 	if exitEarly {
-		exitVariable = " REMOTE_BROWSER_CLI_EXIT=1"
+		exitVariable = " OPEN_SERVER_CLI_EXIT=1"
 	}
-	contents := "#!/bin/sh\nREMOTE_BROWSER_CLI_HELPER=1" + exitVariable + " " + quoteShell(os.Args[0]) + " -test.run='^TestCLIHelperProcess$' <&0 >&1 2>&2 &\nchild=$!\nexec >/dev/null 2>/dev/null\nwait \"$child\"\n"
+	contents := "#!/bin/sh\nOPEN_SERVER_CLI_HELPER=1" + exitVariable + " " + quoteShell(os.Args[0]) + " -test.run='^TestCLIHelperProcess$' <&0 >&1 2>&2 &\nchild=$!\nexec >/dev/null 2>/dev/null\nwait \"$child\"\n"
 	if err := os.WriteFile(wrapper, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}

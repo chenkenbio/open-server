@@ -97,7 +97,7 @@ func TestSessionDetectsSFTPTransportLoss(t *testing.T) {
 }
 
 func TestSFTPHelperProcess(t *testing.T) {
-	if os.Getenv("REMOTE_BROWSER_SFTP_HELPER") != "1" {
+	if os.Getenv("OPEN_SERVER_SFTP_HELPER") != "1" {
 		return
 	}
 	server, err := sftp.NewServer(struct {
@@ -107,7 +107,7 @@ func TestSFTPHelperProcess(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
-	if os.Getenv("REMOTE_BROWSER_SFTP_DROP") == "1" {
+	if os.Getenv("OPEN_SERVER_SFTP_DROP") == "1" {
 		go func() { _ = server.Serve() }()
 		time.Sleep(300 * time.Millisecond)
 		_ = os.Stdout.Close()
@@ -124,9 +124,9 @@ func helperWrapper(t *testing.T, dropTransport bool) string {
 	name := filepath.Join(t.TempDir(), "ssh-wrapper")
 	drop := ""
 	if dropTransport {
-		drop = " REMOTE_BROWSER_SFTP_DROP=1"
+		drop = " OPEN_SERVER_SFTP_DROP=1"
 	}
-	contents := "#!/bin/sh\nREMOTE_BROWSER_SFTP_HELPER=1" + drop + " " + shellQuote(os.Args[0]) + " -test.run='^TestSFTPHelperProcess$' <&0 >&1 2>&2 &\nchild=$!\nexec >/dev/null 2>/dev/null\nwait \"$child\"\n"
+	contents := "#!/bin/sh\nOPEN_SERVER_SFTP_HELPER=1" + drop + " " + shellQuote(os.Args[0]) + " -test.run='^TestSFTPHelperProcess$' <&0 >&1 2>&2 &\nchild=$!\nexec >/dev/null 2>/dev/null\nwait \"$child\"\n"
 	if err := os.WriteFile(name, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -50,7 +50,7 @@ func TestLocalUploadConflictOverwriteAndCleanup(t *testing.T) {
 	if _, err := os.Stat(filepath.FromSlash(partial)); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("partial upload was exposed: %v", err)
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, ".remote-browser-upload-*"))
+	matches, err := filepath.Glob(filepath.Join(dir, ".open-server-upload-*"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +79,21 @@ func TestLocalReadDirFollowsLinksOutsideStart(t *testing.T) {
 	}
 	if len(entries) != 1 || !entries[0].IsLink() || !entries[0].IsDir() {
 		t.Fatalf("symlink entry = %#v, want followed directory link", entries)
+	}
+}
+
+func TestLocalMkdir(t *testing.T) {
+	t.Parallel()
+	directory := filepath.Join(t.TempDir(), "new-folder")
+	if err := (Local{}).Mkdir(context.Background(), filepath.ToSlash(directory)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(directory)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("created directory = %#v, %v", info, err)
+	}
+	if err := (Local{}).Mkdir(context.Background(), filepath.ToSlash(directory)); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("duplicate Mkdir error = %v, want fs.ErrExist", err)
 	}
 }
 

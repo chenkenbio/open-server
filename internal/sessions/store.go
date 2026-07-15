@@ -7,10 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
-	"remote-browser/internal/target"
+	"open-server/internal/target"
 )
 
 const schemaVersion = 1
@@ -22,8 +23,20 @@ type Store struct {
 }
 
 type Entry struct {
-	Name   string
-	Target string
+	Name    string
+	Target  string
+	Options Options
+}
+
+type Options struct {
+	Port        *int    `yaml:"port,omitempty"`
+	RSH         *string `yaml:"rsh,omitempty"`
+	Duration    *string `yaml:"duration,omitempty"`
+	Title       *string `yaml:"title,omitempty"`
+	NoOpen      *bool   `yaml:"no-open,omitempty"`
+	TensorBoard *bool   `yaml:"tensorboard,omitempty"`
+	Python      *string `yaml:"python-interpreter,omitempty"`
+	LaTeX       *bool   `yaml:"latex,omitempty"`
 }
 
 type savedFile struct {
@@ -32,7 +45,8 @@ type savedFile struct {
 }
 
 type savedSession struct {
-	Target string `yaml:"target"`
+	Target  string   `yaml:"target"`
+	Options *Options `yaml:"options,omitempty"`
 }
 
 func DefaultStore() (Store, error) {
@@ -40,22 +54,29 @@ func DefaultStore() (Store, error) {
 	if err != nil {
 		return Store{}, fmt.Errorf("find user configuration directory: %w", err)
 	}
-	return Store{Path: filepath.Join(configDirectory, "remote-browser", "sessions", "saved-sessions.yaml")}, nil
+	return Store{Path: filepath.Join(configDirectory, "open-server", "sessions", "saved-sessions.yaml")}, nil
 }
 
-func (s Store) Add(name, targetValue string) error {
+func (s Store) Add(name, targetValue string, options Options) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
 	if _, err := target.Parse(targetValue); err != nil {
 		return fmt.Errorf("invalid target for saved session %q: %w", name, err)
 	}
+	if err := validateOptions(options); err != nil {
+		return fmt.Errorf("invalid options for saved session %q: %w", name, err)
+	}
 
 	contents, err := s.load()
 	if err != nil {
 		return err
 	}
-	contents.Sessions[name] = savedSession{Target: targetValue}
+	var savedOptions *Options
+	if !options.empty() {
+		savedOptions = &options
+	}
+	contents.Sessions[name] = savedSession{Target: targetValue, Options: savedOptions}
 	return s.save(contents)
 }
 
@@ -74,19 +95,19 @@ func (s Store) Delete(name string) error {
 	return s.save(contents)
 }
 
-func (s Store) Resolve(name string) (string, error) {
+func (s Store) Resolve(name string) (Entry, error) {
 	if err := validateName(name); err != nil {
-		return "", err
+		return Entry{}, err
 	}
 	contents, err := s.load()
 	if err != nil {
-		return "", err
+		return Entry{}, err
 	}
 	session, ok := contents.Sessions[name]
 	if !ok {
-		return "", fmt.Errorf("%w: %q", ErrNotFound, name)
+		return Entry{}, fmt.Errorf("%w: %q", ErrNotFound, name)
 	}
-	return session.Target, nil
+	return Entry{Name: name, Target: session.Target, Options: session.options()}, nil
 }
 
 func (s Store) List() ([]Entry, error) {
@@ -96,7 +117,7 @@ func (s Store) List() ([]Entry, error) {
 	}
 	entries := make([]Entry, 0, len(contents.Sessions))
 	for name, session := range contents.Sessions {
-		entries = append(entries, Entry{Name: name, Target: session.Target})
+		entries = append(entries, Entry{Name: name, Target: session.Target, Options: session.options()})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return entries, nil
@@ -138,8 +159,41 @@ func (s Store) load() (savedFile, error) {
 		if _, err := target.Parse(session.Target); err != nil {
 			return savedFile{}, fmt.Errorf("read saved sessions %q: invalid target for session %q: %w", s.Path, name, err)
 		}
+		if err := validateOptions(session.options()); err != nil {
+			return savedFile{}, fmt.Errorf("read saved sessions %q: invalid options for session %q: %w", s.Path, name, err)
+		}
 	}
 	return contents, nil
+}
+
+func (s savedSession) options() Options {
+	if s.Options == nil {
+		return Options{}
+	}
+	return *s.Options
+}
+
+func (o Options) empty() bool {
+	return o.Port == nil && o.RSH == nil && o.Duration == nil && o.Title == nil && o.NoOpen == nil && o.TensorBoard == nil && o.Python == nil && o.LaTeX == nil
+}
+
+func validateOptions(options Options) error {
+	if options.Port != nil && (*options.Port < 0 || *options.Port > 65535) {
+		return errors.New("port must be between 0 and 65535")
+	}
+	if options.RSH != nil && *options.RSH == "" {
+		return errors.New("rsh executable cannot be empty")
+	}
+	if options.Python != nil && *options.Python == "" {
+		return errors.New("python interpreter cannot be empty")
+	}
+	if options.Duration != nil {
+		duration, err := time.ParseDuration(*options.Duration)
+		if err != nil || duration < 0 {
+			return errors.New("duration must be a valid non-negative Go duration")
+		}
+	}
+	return nil
 }
 
 func (s Store) save(contents savedFile) error {

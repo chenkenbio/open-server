@@ -77,6 +77,13 @@ func (s SFTP) Open(ctx context.Context, name string) (ReadSeekCloser, error) {
 	}
 }
 
+func (s SFTP) Mkdir(ctx context.Context, name string) error {
+	_, err := awaitSFTP(ctx, func() (struct{}, error) {
+		return struct{}{}, s.Client.Mkdir(name)
+	})
+	return err
+}
+
 func (s SFTP) Readlink(ctx context.Context, name string) (string, error) {
 	return awaitSFTP(ctx, func() (string, error) { return s.Client.ReadLink(name) })
 }
@@ -337,5 +344,5 @@ func sftpTemporaryName(dir string) (string, error) {
 	if _, err := rand.Read(random[:]); err != nil {
 		return "", err
 	}
-	return path.Join(dir, ".remote-browser-upload-"+hex.EncodeToString(random[:])), nil
+	return path.Join(dir, ".open-server-upload-"+hex.EncodeToString(random[:])), nil
 }

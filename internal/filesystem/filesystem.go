@@ -68,6 +68,7 @@ type Backend interface {
 	Lstat(context.Context, string) (fs.FileInfo, error)
 	ReadDir(context.Context, string) ([]Entry, error)
 	Open(context.Context, string) (ReadSeekCloser, error)
+	Mkdir(context.Context, string) error
 	Upload(context.Context, string, io.Reader, bool) (int64, error)
 	Readlink(context.Context, string) (string, error)
 	RealPath(context.Context, string) (string, error)
