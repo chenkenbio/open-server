@@ -1,0 +1,223 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"flag"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/pkg/sftp"
+
+	"remote-browser/internal/filesystem"
+)
+
+func TestParseFlags(t *testing.T) {
+	t.Parallel()
+	configuration, err := parseFlags([]string{"--port", "8123", "--duration", "90m", "--title", "Files", "lab:/tmp"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.target != "lab:/tmp" {
+		t.Fatalf("configuration = %#v", configuration)
+	}
+	for _, arguments := range [][]string{
+		{}, {"--port", "70000", "lab:/tmp"}, {"--duration", "-1s", "lab:/tmp"},
+		{"lab:/one", "lab:/two"},
+	} {
+		if _, err := parseFlags(arguments, io.Discard); err == nil {
+			t.Errorf("parseFlags(%q) succeeded, want error", arguments)
+		}
+	}
+}
+
+func TestHelpIsRecognized(t *testing.T) {
+	if _, err := parseFlags([]string{"--help"}, io.Discard); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("--help error = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestVersion(t *testing.T) {
+	for _, argument := range []string{"-version", "-v"} {
+		var output bytes.Buffer
+		if err := run([]string{argument}, &output); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := output.String(), "remote-browser "+version+"\n"; got != want {
+			t.Errorf("%s output = %q, want %q", argument, got, want)
+		}
+	}
+}
+
+func TestListenLoopbackUsesIPv4Only(t *testing.T) {
+	listener, err := listenLoopback(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || !address.IP.Equal(net.IPv4(127, 0, 0, 1)) {
+		t.Fatalf("listener address = %#v, want 127.0.0.1", listener.Addr())
+	}
+}
+
+func TestLogicalRemoteRootPreservesSpecifiedSymlinkNamespace(t *testing.T) {
+	backend := fixedRealPathBackend{workingDirectory: "/home/user"}
+	absolute, err := logicalRemoteRoot(context.Background(), backend, "/data/logical-link/../root-link")
+	if err != nil || absolute != "/data/root-link" {
+		t.Fatalf("absolute logical root = %q, %v", absolute, err)
+	}
+	relative, err := logicalRemoteRoot(context.Background(), backend, "projects/../root-link")
+	if err != nil || relative != "/home/user/root-link" {
+		t.Fatalf("relative logical root = %q, %v", relative, err)
+	}
+	home, err := logicalRemoteRoot(context.Background(), backend, "~/projects/../root-link")
+	if err != nil || home != "/home/user/root-link" {
+		t.Fatalf("home-relative logical root = %q, %v", home, err)
+	}
+	tilde, err := logicalRemoteRoot(context.Background(), backend, "~")
+	if err != nil || tilde != "/home/user" {
+		t.Fatalf("home logical root = %q, %v", tilde, err)
+	}
+	userHome, err := logicalRemoteRoot(context.Background(), backend, "~other/projects")
+	if err != nil || userHome != "/home/user/~other/projects" {
+		t.Fatalf("other-user logical root = %q, %v", userHome, err)
+	}
+}
+
+func TestRunDurationCleansUp(t *testing.T) {
+	var output bytes.Buffer
+	started := time.Now()
+	err := run([]string{"--rsh", cliWrapper(t, false), "--duration", "500ms", "--no-open", "test-host:."}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > 4*time.Second {
+		t.Fatal("duration-based cleanup took too long")
+	}
+	if !strings.Contains(output.String(), "duration expired") {
+		t.Fatalf("session output = %q", output.String())
+	}
+}
+
+func TestRunSignalCleansUp(t *testing.T) {
+	output := newNotifyWriter("Open this local URL")
+	result := make(chan error, 1)
+	wrapper := cliWrapper(t, false)
+	go func() { result <- run([]string{"--rsh", wrapper, "--no-open", "test-host:."}, output) }()
+	select {
+	case <-output.ready:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("session did not start: %s", output.String())
+	}
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal did not shut down the complete session")
+	}
+}
+
+func TestRunReportsUnexpectedSSHExit(t *testing.T) {
+	var output bytes.Buffer
+	started := time.Now()
+	err := run([]string{"--rsh", cliWrapper(t, true), "--no-open", "test-host:."}, &output)
+	if err == nil || !strings.Contains(err.Error(), "SSH connection closed unexpectedly") {
+		t.Fatalf("run error = %v, output = %q", err, output.String())
+	}
+	if time.Since(started) > 5*time.Second {
+		t.Fatal("unexpected SSH exit was not handled promptly")
+	}
+}
+
+func TestCLIHelperProcess(t *testing.T) {
+	if os.Getenv("REMOTE_BROWSER_CLI_HELPER") != "1" {
+		return
+	}
+	server, err := sftp.NewServer(struct {
+		io.Reader
+		io.WriteCloser
+	}{os.Stdin, os.Stdout})
+	if err != nil {
+		os.Exit(2)
+	}
+	if os.Getenv("REMOTE_BROWSER_CLI_EXIT") == "1" {
+		go func() { _ = server.Serve() }()
+		time.Sleep(2 * time.Second)
+		os.Exit(0)
+	}
+	_ = server.Serve()
+	_ = server.Close()
+	os.Exit(0)
+}
+
+func quoteShell(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func cliWrapper(t *testing.T, exitEarly bool) string {
+	t.Helper()
+	wrapper := filepath.Join(t.TempDir(), "ssh-wrapper")
+	exitVariable := ""
+	if exitEarly {
+		exitVariable = " REMOTE_BROWSER_CLI_EXIT=1"
+	}
+	contents := "#!/bin/sh\nREMOTE_BROWSER_CLI_HELPER=1" + exitVariable + " " + quoteShell(os.Args[0]) + " -test.run='^TestCLIHelperProcess$' <&0 >&1 2>&2 &\nchild=$!\nexec >/dev/null 2>/dev/null\nwait \"$child\"\n"
+	if err := os.WriteFile(wrapper, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return wrapper
+}
+
+type notifyWriter struct {
+	mu        sync.Mutex
+	buffer    bytes.Buffer
+	needle    string
+	ready     chan struct{}
+	readyOnce sync.Once
+}
+
+type fixedRealPathBackend struct {
+	filesystem.Backend
+	workingDirectory string
+}
+
+func (b fixedRealPathBackend) RealPath(context.Context, string) (string, error) {
+	return b.workingDirectory, nil
+}
+
+func newNotifyWriter(needle string) *notifyWriter {
+	return &notifyWriter{needle: needle, ready: make(chan struct{})}
+}
+
+func (w *notifyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buffer.Write(p)
+	if strings.Contains(w.buffer.String(), w.needle) {
+		w.readyOnce.Do(func() { close(w.ready) })
+	}
+	return n, err
+}
+
+func (w *notifyWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buffer.String()
+}

@@ -1,0 +1,24 @@
+# Local design notes
+DESIGN.md
+
+# Build artifacts
+/remote-browser-*
+/bin/
+/dist/
+*.out
+coverage.out
+
+# Go tooling
+vendor/
+
+# Local/editor/OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
