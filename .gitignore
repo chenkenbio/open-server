@@ -2,6 +2,7 @@
 DESIGN.md
 
 # Build artifacts
+/remote-browser
 /remote-browser-*
 /bin/
 /dist/

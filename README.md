@@ -19,6 +19,24 @@ go build -o remote-browser ./cmd/remote-browser
 ./remote-browser lab:~/projects
 ```
 
+Save frequently used targets under a name, list them, open them by name, or delete them:
+
+```sh
+./remote-browser --add work lab:~/projects
+./remote-browser --list
+./remote-browser work
+./remote-browser --delete work
+```
+
+Saved sessions use human-editable YAML in the platform's user configuration directory at `remote-browser/sessions/saved-sessions.yaml`. On Linux this is normally `~/.config/remote-browser/sessions/saved-sessions.yaml`; on macOS it is normally `~/Library/Application Support/remote-browser/sessions/saved-sessions.yaml`; on Windows it is under `%AppData%\remote-browser\sessions\saved-sessions.yaml`. Reusing a name updates its target.
+
+```yaml
+version: 1
+sessions:
+  work:
+    target: lab:~/projects
+```
+
 The target has the form `host:path`:
 
 ```text
@@ -37,9 +55,20 @@ The local server binds only to IPv4 loopback, prints its URL, and normally opens
 ```
 
 ```text
-Usage: remote-browser [options] host:/path
+Usage:
+  remote-browser [options] host:/path
+  remote-browser [options] session-name
+  remote-browser --add name host:/path
+  remote-browser --delete name
+  remote-browser --list
+  -add string
+        save or update a named session
+  -delete string
+        delete a named session
   -duration duration
         session duration (default 7d; for example 2h)
+  -list
+        list saved sessions
   -no-open
         print the URL without opening a browser
   -port int
@@ -60,6 +89,7 @@ If `-rsh` points to a wrapper, it must accept normal OpenSSH arguments and repla
 
 ## Features
 
+- Named SFTP shortcuts stored in a human-editable YAML file
 - Directory navigation with breadcrumbs and name, size, and modified-time sorting
 - Symlink navigation, including links whose targets are outside the starting directory
 - Safe inline previews and ranged downloads

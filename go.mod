@@ -2,7 +2,10 @@ module remote-browser
 
 go 1.25.0
 
-require github.com/pkg/sftp v1.13.11
+require (
+	github.com/pkg/sftp v1.13.11
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/kr/fs v0.1.0 // indirect

@@ -20,12 +20,13 @@ import (
 	"time"
 
 	"remote-browser/internal/filesystem"
+	"remote-browser/internal/sessions"
 	"remote-browser/internal/sshsession"
 	"remote-browser/internal/target"
 	appweb "remote-browser/internal/web"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 const automaticPortStart = 60000
 
@@ -38,6 +39,9 @@ type config struct {
 	title    string
 	noOpen   bool
 	version  bool
+	addName  string
+	delete   string
+	list     bool
 	target   string
 }
 
@@ -60,7 +64,45 @@ func run(arguments []string, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "remote-browser", version)
 		return nil
 	}
-	remote, err := target.Parse(configuration.target)
+	if configuration.addName != "" {
+		store, err := sessions.DefaultStore()
+		if err != nil {
+			return err
+		}
+		if err := store.Add(configuration.addName, configuration.target); err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "Saved session %q -> %s\n", configuration.addName, configuration.target)
+		fmt.Fprintln(stderr, "Config:", store.Path)
+		return nil
+	}
+	if configuration.delete != "" {
+		store, err := sessions.DefaultStore()
+		if err != nil {
+			return err
+		}
+		if err := store.Delete(configuration.delete); err != nil {
+			if errors.Is(err, sessions.ErrNotFound) {
+				return fmt.Errorf("saved session %q was not found", configuration.delete)
+			}
+			return err
+		}
+		fmt.Fprintf(stderr, "Deleted session %q\n", configuration.delete)
+		return nil
+	}
+	if configuration.list {
+		store, err := sessions.DefaultStore()
+		if err != nil {
+			return err
+		}
+		entries, err := store.List()
+		if err != nil {
+			return err
+		}
+		printSavedSessions(stderr, entries)
+		return nil
+	}
+	remote, err := resolveRemoteTarget(configuration.target)
 	if err != nil {
 		return err
 	}
@@ -200,10 +242,18 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	flags.DurationVar(&configuration.duration, "duration", defaultSessionDuration, "session duration (default 7d; for example 2h)")
 	flags.StringVar(&configuration.title, "title", "", "browser page title")
 	flags.BoolVar(&configuration.noOpen, "no-open", false, "print the URL instead of opening a browser")
+	flags.StringVar(&configuration.addName, "add", "", "save or update a named session")
+	flags.StringVar(&configuration.delete, "delete", "", "delete a named session")
+	flags.BoolVar(&configuration.list, "list", false, "list saved sessions")
 	flags.BoolVar(&configuration.version, "version", false, "print the version and exit")
 	flags.BoolVar(&configuration.version, "v", false, "print the version and exit")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: remote-browser [options] host:/path")
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintln(stderr, "  remote-browser [options] host:/path")
+		fmt.Fprintln(stderr, "  remote-browser [options] session-name")
+		fmt.Fprintln(stderr, "  remote-browser --add name host:/path")
+		fmt.Fprintln(stderr, "  remote-browser --delete name")
+		fmt.Fprintln(stderr, "  remote-browser --list")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(arguments); err != nil {
@@ -212,11 +262,33 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	if configuration.version {
 		return configuration, nil
 	}
-	if flags.NArg() != 1 {
-		flags.Usage()
-		return config{}, errors.New("exactly one remote target is required")
+	operations := 0
+	if configuration.addName != "" {
+		operations++
 	}
-	configuration.target = flags.Arg(0)
+	if configuration.delete != "" {
+		operations++
+	}
+	if configuration.list {
+		operations++
+	}
+	if operations > 1 {
+		return config{}, errors.New("add, delete, and list cannot be used together")
+	}
+	if configuration.list || configuration.delete != "" {
+		if flags.NArg() != 0 {
+			flags.Usage()
+			return config{}, errors.New("list and delete do not accept a remote target")
+		}
+	} else if flags.NArg() != 1 {
+		flags.Usage()
+		if configuration.addName != "" {
+			return config{}, errors.New("add requires exactly one remote target")
+		}
+		return config{}, errors.New("exactly one remote target or saved session name is required")
+	} else {
+		configuration.target = flags.Arg(0)
+	}
 	if configuration.port < 0 || configuration.port > 65535 {
 		return config{}, errors.New("port must be between 0 and 65535")
 	}
@@ -227,6 +299,41 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 		return config{}, errors.New("rsh executable cannot be empty")
 	}
 	return configuration, nil
+}
+
+func resolveRemoteTarget(value string) (target.Target, error) {
+	if strings.ContainsRune(value, ':') {
+		return target.Parse(value)
+	}
+	store, err := sessions.DefaultStore()
+	if err != nil {
+		return target.Target{}, err
+	}
+	savedTarget, err := store.Resolve(value)
+	if err != nil {
+		if errors.Is(err, sessions.ErrNotFound) {
+			return target.Target{}, fmt.Errorf("saved session %q was not found; use --list to show saved sessions", value)
+		}
+		return target.Target{}, err
+	}
+	return target.Parse(savedTarget)
+}
+
+func printSavedSessions(output io.Writer, entries []sessions.Entry) {
+	if len(entries) == 0 {
+		fmt.Fprintln(output, "No saved sessions.")
+		return
+	}
+	nameWidth := len("NAME")
+	for _, entry := range entries {
+		if len(entry.Name) > nameWidth {
+			nameWidth = len(entry.Name)
+		}
+	}
+	fmt.Fprintf(output, "%-*s  %s\n", nameWidth, "NAME", "TARGET")
+	for _, entry := range entries {
+		fmt.Fprintf(output, "%-*s  %s\n", nameWidth, entry.Name, entry.Target)
+	}
 }
 
 func openBrowser(parent context.Context, address string) error {

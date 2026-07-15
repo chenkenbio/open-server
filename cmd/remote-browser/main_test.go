@@ -36,13 +36,67 @@ func TestParseFlags(t *testing.T) {
 	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.target != "lab:/tmp" {
 		t.Fatalf("configuration = %#v", configuration)
 	}
+	add, err := parseFlags([]string{"--add", "work", "lab:/srv/work"}, io.Discard)
+	if err != nil || add.addName != "work" || add.target != "lab:/srv/work" {
+		t.Fatalf("add configuration = %#v, %v", add, err)
+	}
+	list, err := parseFlags([]string{"-list"}, io.Discard)
+	if err != nil || !list.list {
+		t.Fatalf("list configuration = %#v, %v", list, err)
+	}
+	remove, err := parseFlags([]string{"-delete", "work"}, io.Discard)
+	if err != nil || remove.delete != "work" {
+		t.Fatalf("delete configuration = %#v, %v", remove, err)
+	}
 	for _, arguments := range [][]string{
 		{}, {"--port", "70000", "lab:/tmp"}, {"--duration", "-1s", "lab:/tmp"},
-		{"lab:/one", "lab:/two"},
+		{"lab:/one", "lab:/two"}, {"--add", "work"}, {"--list", "lab:/tmp"},
+		{"--delete", "work", "lab:/tmp"}, {"--add", "work", "--list", "lab:/tmp"},
 	} {
 		if _, err := parseFlags(arguments, io.Discard); err == nil {
 			t.Errorf("parseFlags(%q) succeeded, want error", arguments)
 		}
+	}
+}
+
+func TestSavedSessionCommands(t *testing.T) {
+	configHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("HOME", configHome)
+
+	var addOutput bytes.Buffer
+	if err := run([]string{"--add", "work", "lab:/srv/work"}, &addOutput); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(addOutput.String(), `Saved session "work" -> lab:/srv/work`) {
+		t.Fatalf("add output = %q", addOutput.String())
+	}
+
+	var listOutput bytes.Buffer
+	if err := run([]string{"--list"}, &listOutput); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(listOutput.String(), "NAME  TARGET") || !strings.Contains(listOutput.String(), "work  lab:/srv/work") {
+		t.Fatalf("list output = %q", listOutput.String())
+	}
+
+	resolved, err := resolveRemoteTarget("work")
+	if err != nil || resolved.Host != "lab" || resolved.Path != "/srv/work" {
+		t.Fatalf("resolveRemoteTarget(work) = %#v, %v", resolved, err)
+	}
+	if _, err := resolveRemoteTarget("missing"); err == nil || !strings.Contains(err.Error(), "use --list") {
+		t.Fatalf("resolveRemoteTarget(missing) error = %v", err)
+	}
+
+	var deleteOutput bytes.Buffer
+	if err := run([]string{"--delete", "work"}, &deleteOutput); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := deleteOutput.String(), "Deleted session \"work\"\n"; got != want {
+		t.Fatalf("delete output = %q, want %q", got, want)
+	}
+	if err := run([]string{"--delete", "work"}, io.Discard); err == nil || !strings.Contains(err.Error(), "was not found") {
+		t.Fatalf("second delete error = %v", err)
 	}
 }
 
