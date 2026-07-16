@@ -13,9 +13,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,11 +29,15 @@ import (
 	appweb "open-server/internal/web"
 )
 
-const version = "0.1.1"
+const version = "0.2.0-beta.1"
 
 const automaticPortStart = 60000
 
+const savedSessionPortStart = 61000
+
 const defaultSessionDuration = 7 * 24 * time.Hour
+
+var errSessionEndedDuringStartup = errors.New("session ended during startup")
 
 type config struct {
 	port        int
@@ -39,6 +45,7 @@ type config struct {
 	duration    time.Duration
 	title       string
 	noOpen      bool
+	local       bool
 	serve       bool
 	address     string
 	token       string
@@ -49,8 +56,42 @@ type config struct {
 	addName     string
 	delete      string
 	list        bool
-	target      string
+	edit        bool
+	targets     []string
 	explicit    map[string]bool
+}
+
+type targetKind uint8
+
+const (
+	localTarget targetKind = iota
+	remoteTarget
+)
+
+type resolvedTarget struct {
+	label     string
+	savedName string
+	kind      targetKind
+	local     string
+	remote    target.Target
+	options   sessions.Options
+}
+
+type runningSession struct {
+	label  string
+	done   <-chan error
+	cancel context.CancelFunc
+}
+
+type synchronizedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+}
+
+func (w *synchronizedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writer.Write(p)
 }
 
 func main() {
@@ -72,16 +113,35 @@ func run(arguments []string, stderr io.Writer) error {
 		fmt.Fprintln(stderr, "open-server", version)
 		return nil
 	}
-	if configuration.addName != "" {
+	if configuration.edit {
 		store, err := sessions.DefaultStore()
 		if err != nil {
 			return err
 		}
-		options := savedSessionOptions(configuration)
-		if err := store.Add(configuration.addName, configuration.target, options); err != nil {
+		return editSavedSessions(store, os.Stdin, os.Stdout, stderr)
+	}
+	stderr = &synchronizedWriter{writer: stderr}
+	if configuration.addName != "" {
+		resolved, err := resolveDirectTarget(configuration.targets[0], configuration.local)
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(stderr, "Saved session %q -> %s\n", configuration.addName, configuration.target)
+		targetValue := configuration.targets[0]
+		if resolved.kind == localTarget {
+			targetValue = resolved.local
+		}
+		store, err := sessions.DefaultStore()
+		if err != nil {
+			return err
+		}
+		options, err := savedSessionOptionsForAdd(store, configuration.addName, configuration)
+		if err != nil {
+			return err
+		}
+		if err := store.Add(configuration.addName, targetValue, options); err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "Saved session %q -> %s\n", configuration.addName, targetValue)
 		if text := formatSessionOptions(options); text != "" {
 			fmt.Fprintln(stderr, "Options:", text)
 		}
@@ -117,68 +177,214 @@ func run(arguments []string, stderr io.Writer) error {
 	if configuration.serve {
 		return runServe(configuration, stderr)
 	}
-	remote, savedOptions, err := resolveRemoteTarget(configuration.target)
-	if err != nil {
-		return err
+	return runSessions(configuration, stderr)
+}
+
+func runSessions(configuration config, stderr io.Writer) error {
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	type sessionEvent struct {
+		session *runningSession
+		err     error
 	}
-	if err := applySavedSessionOptions(&configuration, savedOptions); err != nil {
-		return err
+	events := make(chan sessionEvent, len(configuration.targets))
+	active := make(map[*runningSession]struct{})
+	var sessionErrors []error
+	nextPort := 0
+
+	for _, value := range configuration.targets {
+		if ctx.Err() != nil {
+			break
+		}
+		resolved, err := resolveTarget(value, configuration.local)
+		if err != nil {
+			err = fmt.Errorf("%s: %w", value, err)
+			fmt.Fprintln(stderr, "Could not start session:", err)
+			sessionErrors = append(sessionErrors, err)
+			continue
+		}
+		sessionConfiguration, err := effectiveSessionConfig(configuration, resolved)
+		if err != nil {
+			err = fmt.Errorf("%s: %w", value, err)
+			fmt.Fprintln(stderr, "Could not start session:", err)
+			sessionErrors = append(sessionErrors, err)
+			continue
+		}
+
+		reservedPorts, err := reservedSessionPorts(configuration, resolved)
+		if err != nil {
+			err = fmt.Errorf("%s: load saved port reservations: %w", value, err)
+			fmt.Fprintln(stderr, "Could not start session:", err)
+			sessionErrors = append(sessionErrors, err)
+			continue
+		}
+		listener, assignedPort, err := listenSessionLoopback(configuration, sessionConfiguration, resolved, nextPort, reservedPorts)
+		if err != nil {
+			err = fmt.Errorf("%s: listen on IPv4 loopback: %w", value, err)
+			fmt.Fprintln(stderr, "Could not start session:", err)
+			sessionErrors = append(sessionErrors, err)
+			continue
+		}
+		nextPort = assignedPort + 1
+
+		running, localURL, err := startSession(ctx, sessionConfiguration, resolved, listener, stderr)
+		if err != nil {
+			_ = listener.Close()
+			if errors.Is(err, errSessionEndedDuringStartup) {
+				continue
+			}
+			err = fmt.Errorf("%s: %w", value, err)
+			fmt.Fprintln(stderr, "Could not start session:", err)
+			sessionErrors = append(sessionErrors, err)
+			continue
+		}
+		active[running] = struct{}{}
+		if resolved.savedName != "" {
+			if err := saveSessionPort(resolved.savedName, assignedPort); err != nil {
+				fmt.Fprintf(stderr, "Could not save last port [%s]: %v\n", resolved.savedName, err)
+			}
+		}
+		fmt.Fprintf(stderr, "Open this local URL [%s]: %s\n", value, localURL)
+		if !sessionConfiguration.noOpen {
+			go func(label, address string) {
+				if err := openBrowser(ctx, address); err != nil && ctx.Err() == nil {
+					fmt.Fprintf(stderr, "Could not open a browser automatically for %s.\n", label)
+				}
+			}(value, localURL)
+		}
+		go func(session *runningSession) {
+			events <- sessionEvent{session: session, err: <-session.done}
+		}(running)
 	}
 
-	baseContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
-	ctx := baseContext
+	if len(active) == 0 {
+		if len(sessionErrors) == 0 && ctx.Err() != nil {
+			return nil
+		}
+		return errors.Join(sessionErrors...)
+	}
+
+	for len(active) > 0 {
+		select {
+		case <-ctx.Done():
+			for session := range active {
+				session.cancel()
+			}
+			for len(active) > 0 {
+				event := <-events
+				delete(active, event.session)
+				if event.err != nil {
+					sessionErrors = append(sessionErrors, fmt.Errorf("%s: %w", event.session.label, event.err))
+				}
+			}
+		case event := <-events:
+			delete(active, event.session)
+			if event.err != nil {
+				err := fmt.Errorf("%s: %w", event.session.label, event.err)
+				fmt.Fprintln(stderr, "Session stopped:", err)
+				sessionErrors = append(sessionErrors, err)
+			}
+		}
+	}
+	return errors.Join(sessionErrors...)
+}
+
+func effectiveSessionConfig(configuration config, resolved resolvedTarget) (config, error) {
+	if resolved.kind == localTarget && !configuration.explicit["latex"] {
+		configuration.latex = true
+	}
+	if err := applySavedSessionOptions(&configuration, resolved.options); err != nil {
+		return config{}, err
+	}
+	return configuration, nil
+}
+
+func startSession(parent context.Context, configuration config, resolved resolvedTarget, listener net.Listener, output io.Writer) (*runningSession, string, error) {
+	ctx := parent
 	cancel := func() {}
 	if configuration.duration > 0 {
-		ctx, cancel = context.WithTimeout(baseContext, configuration.duration)
-	}
-	defer cancel()
-
-	session, err := sshsession.Start(ctx, sshsession.Options{Executable: configuration.rsh, Host: remote.Host, Stderr: stderr})
-	if err != nil {
-		if ctx.Err() != nil {
-			reportContextEnd(ctx, stderr)
-			return nil
-		}
-		return err
-	}
-	defer session.Close()
-	backend := filesystem.SFTP{Client: session.Client}
-	root, err := logicalRemoteRoot(ctx, backend, remote.Path)
-	if err != nil {
-		if ctx.Err() != nil {
-			reportContextEnd(ctx, stderr)
-			return nil
-		}
-		return errors.New("the remote starting path could not be resolved")
-	}
-	info, err := backend.Stat(ctx, root)
-	if err != nil {
-		if ctx.Err() != nil {
-			reportContextEnd(ctx, stderr)
-			return nil
-		}
-		return errors.New("the remote starting path is not accessible")
-	}
-	if !info.IsDir() {
-		return errors.New("the remote starting path is not a directory")
+		ctx, cancel = context.WithTimeout(parent, configuration.duration)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
 	}
 
-	listener, err := listenLoopback(configuration.port)
-	if err != nil {
-		return fmt.Errorf("listen on IPv4 loopback: %w", err)
+	backend := filesystem.Backend(filesystem.Local{})
+	root := ""
+	initialPath := ""
+	host := ""
+	var remoteDone <-chan struct{}
+	closeBackend := func() error { return nil }
+	var tensorBoardLauncher tensorboard.Launcher
+	closeTensorBoard := func() {}
+
+	fail := func(err error) (*runningSession, string, error) {
+		closeTensorBoard()
+		_ = closeBackend()
+		cancel()
+		return nil, "", err
 	}
-	defer listener.Close()
-	allowedHost := listener.Addr().String()
-	tensorBoardLauncher, closeTensorBoard := remoteTensorBoardLauncher(configuration, remote.Host, stderr)
-	defer closeTensorBoard()
+	endDuringStartup := func() (*runningSession, string, error) {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			fmt.Fprintf(output, "Session duration expired [%s]; shutting down.\n", resolved.label)
+		}
+		_, _, _ = fail(ctx.Err())
+		return nil, "", errSessionEndedDuringStartup
+	}
+
+	if resolved.kind == localTarget {
+		var err error
+		root, initialPath, err = localServeRoot(resolved.local)
+		if err != nil {
+			return fail(err)
+		}
+		host, err = os.Hostname()
+		if err != nil || host == "" {
+			host = "localhost"
+		}
+		if configuration.title == "" {
+			configuration.title = "Local files — " + root
+		}
+		tensorBoardLauncher, closeTensorBoard = localTensorBoardLauncher(configuration, output)
+	} else {
+		ssh, err := sshsession.Start(ctx, sshsession.Options{Executable: configuration.rsh, Host: resolved.remote.Host, Stderr: output})
+		if err != nil {
+			if ctx.Err() != nil {
+				return endDuringStartup()
+			}
+			return fail(err)
+		}
+		closeBackend = ssh.Close
+		remoteDone = ssh.Done()
+		backend = filesystem.SFTP{Client: ssh.Client}
+		root, err = logicalRemoteRoot(ctx, backend, resolved.remote.Path)
+		if err != nil {
+			if ctx.Err() != nil {
+				return endDuringStartup()
+			}
+			return fail(errors.New("the remote starting path could not be resolved"))
+		}
+		info, err := backend.Stat(ctx, root)
+		if err != nil {
+			if ctx.Err() != nil {
+				return endDuringStartup()
+			}
+			return fail(errors.New("the remote starting path is not accessible"))
+		}
+		if !info.IsDir() {
+			return fail(errors.New("the remote starting path is not a directory"))
+		}
+		host = resolved.remote.Host
+		tensorBoardLauncher, closeTensorBoard = remoteTensorBoardLauncher(configuration, host, output)
+	}
+
 	app, err := appweb.New(appweb.Options{
-		Backend: backend, Root: root, SSHHost: remote.Host,
-		Title: configuration.title, AllowedHost: allowedHost,
+		Backend: backend, Root: root, SSHHost: host,
+		Title: configuration.title, AllowedHost: listener.Addr().String(),
 		TensorBoard: tensorBoardLauncher, LaTeX: configuration.latex,
 	})
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	server := &http.Server{
 		Handler:           app,
@@ -189,52 +395,37 @@ func run(arguments []string, stderr io.Writer) error {
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- server.Serve(listener) }()
 
-	localURL := app.URL()
-	launchContext, cancelLaunch := context.WithCancel(ctx)
-	defer cancelLaunch()
-	fmt.Fprintln(stderr, "Open this local URL:", localURL)
-	var browserResult <-chan error
-	if !configuration.noOpen {
-		result := make(chan error, 1)
-		browserResult = result
-		go func() { result <- openBrowser(launchContext, localURL) }()
-	}
-
-	var result error
-lifecycle:
-	for {
+	done := make(chan error, 1)
+	running := &runningSession{label: resolved.label, done: done, cancel: cancel}
+	go func() {
+		var result error
 		select {
-		case browserErr := <-browserResult:
-			if browserErr != nil {
-				fmt.Fprintln(stderr, "Could not open a browser automatically.")
-			} else {
-				fmt.Fprintln(stderr, "Open server session started for", remote.Host+":"+root)
-			}
-			browserResult = nil
 		case <-ctx.Done():
-			reportContextEnd(ctx, stderr)
-			break lifecycle
-		case <-session.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				fmt.Fprintf(output, "Session duration expired [%s]; shutting down.\n", resolved.label)
+			}
+		case <-remoteDone:
 			if ctx.Err() == nil {
 				result = errors.New("SSH connection closed unexpectedly")
 			}
-			break lifecycle
 		case serveErr := <-serveResult:
 			if !errors.Is(serveErr, http.ErrServerClosed) {
 				result = fmt.Errorf("local HTTP server stopped: %w", serveErr)
 			}
-			break lifecycle
 		}
-	}
-	cancelLaunch()
+		cancel()
+		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := server.Shutdown(shutdownContext); err != nil && result == nil {
+			result = fmt.Errorf("shut down local HTTP server: %w", err)
+		}
+		shutdownCancel()
+		closeTensorBoard()
+		_ = closeBackend()
+		_ = listener.Close()
+		done <- result
+	}()
 
-	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownContext); err != nil && result == nil {
-		result = fmt.Errorf("shut down local HTTP server: %w", err)
-	}
-	_ = session.Close()
-	return result
+	return running, serveStartURL(app.URL(), initialPath), nil
 }
 
 func remoteTensorBoardLauncher(configuration config, host string, output io.Writer) (tensorboard.Launcher, func()) {
@@ -266,31 +457,33 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	var configuration config
 	flags := flag.NewFlagSet("open-server", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	flags.IntVar(&configuration.port, "port", 0, "HTTP port (0 scans from 60000)")
+	flags.IntVar(&configuration.port, "port", 0, "starting HTTP port (direct targets default to 60000; saved sessions remember theirs)")
 	flags.StringVar(&configuration.rsh, "rsh", "ssh", "OpenSSH executable or compatible wrapper")
 	flags.DurationVar(&configuration.duration, "duration", defaultSessionDuration, "session duration (default 7d; for example 2h)")
 	flags.StringVar(&configuration.title, "title", "", "browser page title")
-	flags.BoolVar(&configuration.noOpen, "no-open", false, "do not open a browser in SSH/SFTP mode")
-	flags.BoolVar(&configuration.serve, "serve", false, "serve a local path over token-protected plain HTTP")
+	flags.BoolVar(&configuration.noOpen, "no-open", false, "do not open a browser automatically")
+	flags.BoolVar(&configuration.local, "local", false, "interpret every target as a local path")
+	flags.BoolVar(&configuration.serve, "serve", false, "expose this machine's path over token-protected plain HTTP")
 	flags.StringVar(&configuration.address, "address", "", "reachable IPv4 address or hostname for serve mode (default auto-detected)")
 	flags.StringVar(&configuration.token, "token", "", "access token for serve mode (minimum 8 characters; default random)")
-	flags.BoolVar(&configuration.tensorBoard, "tensorboard", false, "show per-folder TensorBoard actions")
+	flags.BoolVar(&configuration.tensorBoard, "tensorboard", false, "show TensorBoard launch actions for event-log folders")
 	flags.StringVar(&configuration.python, "python-interpreter", "", "Python interpreter containing TensorBoard")
 	flags.StringVar(&configuration.python, "py", "", "Python interpreter containing TensorBoard (shorthand)")
-	flags.BoolVar(&configuration.latex, "latex", false, "show LaTeX table, figure, and live-PDF actions")
+	flags.BoolVar(&configuration.latex, "latex", false, "show LaTeX table, figure, and live-PDF actions (default for local targets)")
 	flags.StringVar(&configuration.addName, "add", "", "save or update a named session")
 	flags.StringVar(&configuration.delete, "delete", "", "delete a named session")
 	flags.BoolVar(&configuration.list, "list", false, "list saved sessions")
+	flags.BoolVar(&configuration.edit, "edit", false, "edit the saved sessions config")
 	flags.BoolVar(&configuration.version, "version", false, "print the version and exit")
 	flags.BoolVar(&configuration.version, "v", false, "print the version and exit")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  open-server [options] host:/path")
-		fmt.Fprintln(stderr, "  open-server [options] session-name")
+		fmt.Fprintln(stderr, "  open-server [options] target [target ...]")
 		fmt.Fprintln(stderr, "  open-server -serve [options] [local-path]")
-		fmt.Fprintln(stderr, "  open-server --add name host:/path")
+		fmt.Fprintln(stderr, "  open-server --add name target")
 		fmt.Fprintln(stderr, "  open-server --delete name")
 		fmt.Fprintln(stderr, "  open-server --list")
+		fmt.Fprintln(stderr, "  open-server --edit")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(normalizeFlagOrder(arguments)); err != nil {
@@ -311,34 +504,46 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	if configuration.list {
 		operations++
 	}
+	if configuration.edit {
+		operations++
+	}
 	if configuration.serve && operations != 0 {
-		return config{}, errors.New("serve cannot be used with add, delete, or list")
+		return config{}, errors.New("serve cannot be used with add, delete, list, or edit")
+	}
+	if configuration.serve && configuration.local {
+		return config{}, errors.New("local cannot be used with serve")
 	}
 	if operations > 1 {
-		return config{}, errors.New("add, delete, and list cannot be used together")
+		return config{}, errors.New("add, delete, list, and edit cannot be used together")
 	}
 	if configuration.serve {
 		if flags.NArg() > 1 {
 			flags.Usage()
 			return config{}, errors.New("serve accepts at most one local path")
 		}
-		configuration.target = "."
+		configuration.targets = []string{"."}
 		if flags.NArg() == 1 {
-			configuration.target = flags.Arg(0)
+			configuration.targets[0] = flags.Arg(0)
 		}
-	} else if configuration.list || configuration.delete != "" {
+	} else if configuration.list || configuration.delete != "" || configuration.edit {
+		if configuration.local {
+			return config{}, errors.New("local cannot be used with list, delete, or edit")
+		}
 		if flags.NArg() != 0 {
 			flags.Usage()
-			return config{}, errors.New("list and delete do not accept a remote target")
+			return config{}, errors.New("list, delete, and edit do not accept targets")
 		}
-	} else if flags.NArg() != 1 {
+	} else if configuration.addName != "" {
+		if flags.NArg() != 1 {
+			flags.Usage()
+			return config{}, errors.New("add requires exactly one target")
+		}
+		configuration.targets = flags.Args()
+	} else if flags.NArg() == 0 {
 		flags.Usage()
-		if configuration.addName != "" {
-			return config{}, errors.New("add requires exactly one remote target")
-		}
-		return config{}, errors.New("exactly one remote target or saved session name is required")
+		return config{}, errors.New("at least one local path, remote target, or saved session name is required")
 	} else {
-		configuration.target = flags.Arg(0)
+		configuration.targets = flags.Args()
 	}
 	if configuration.port < 0 || configuration.port > 65535 {
 		return config{}, errors.New("port must be between 0 and 65535")
@@ -358,24 +563,94 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	return configuration, nil
 }
 
-func resolveRemoteTarget(value string) (target.Target, sessions.Options, error) {
-	if strings.ContainsRune(value, ':') {
-		remote, err := target.Parse(value)
-		return remote, sessions.Options{}, err
+func resolveTarget(value string, forceLocal bool) (resolvedTarget, error) {
+	resolved, direct, err := parseDirectTarget(value, forceLocal)
+	if err != nil || direct {
+		return resolved, err
 	}
 	store, err := sessions.DefaultStore()
 	if err != nil {
-		return target.Target{}, sessions.Options{}, err
+		return resolvedTarget{}, err
 	}
 	saved, err := store.Resolve(value)
 	if err != nil {
 		if errors.Is(err, sessions.ErrNotFound) {
-			return target.Target{}, sessions.Options{}, fmt.Errorf("saved session %q was not found; use --list to show saved sessions", value)
+			return resolvedTarget{}, fmt.Errorf("saved session %q was not found; use --list to show saved sessions or -local to open a bare local name", value)
 		}
+		return resolvedTarget{}, err
+	}
+	resolved, direct, err = parseDirectTarget(saved.Target, false)
+	if err != nil {
+		return resolvedTarget{}, err
+	}
+	if !direct {
+		return resolvedTarget{}, errors.New("saved session has an invalid target")
+	}
+	resolved.label = value
+	resolved.savedName = value
+	resolved.options = saved.Options
+	return resolved, nil
+}
+
+func resolveDirectTarget(value string, forceLocal bool) (resolvedTarget, error) {
+	resolved, direct, err := parseDirectTarget(value, forceLocal)
+	if err != nil {
+		return resolvedTarget{}, err
+	}
+	if !direct {
+		return resolvedTarget{}, errors.New("target must be a local path or have the form host:/path")
+	}
+	return resolved, nil
+}
+
+func parseDirectTarget(value string, forceLocal bool) (resolvedTarget, bool, error) {
+	resolved := resolvedTarget{label: value}
+	localSyntax := forceLocal || isAbsoluteLocalTarget(value) || value == "." || value == ".." || value == "~" ||
+		strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") || strings.HasPrefix(value, "~/") ||
+		strings.HasPrefix(value, `.\`) || strings.HasPrefix(value, `..\`) || strings.HasPrefix(value, `~\`)
+	if localSyntax {
+		localName, err := normalizeLocalTarget(value)
+		if err != nil {
+			return resolvedTarget{}, true, err
+		}
+		resolved.kind = localTarget
+		resolved.local = localName
+		return resolved, true, nil
+	}
+	if strings.ContainsRune(value, ':') {
+		remote, err := target.Parse(value)
+		if err != nil {
+			return resolvedTarget{}, true, err
+		}
+		resolved.kind = remoteTarget
+		resolved.remote = remote
+		return resolved, true, nil
+	}
+	if strings.ContainsAny(value, `/\`) {
+		localName, err := normalizeLocalTarget(value)
+		if err != nil {
+			return resolvedTarget{}, true, err
+		}
+		resolved.kind = localTarget
+		resolved.local = localName
+		return resolved, true, nil
+	}
+	return resolved, false, nil
+}
+
+func isAbsoluteLocalTarget(value string) bool {
+	return filepath.IsAbs(filepath.FromSlash(value))
+}
+
+func resolveRemoteTarget(value string) (target.Target, sessions.Options, error) {
+	resolved, err := resolveTarget(value, false)
+	if err != nil {
 		return target.Target{}, sessions.Options{}, err
 	}
-	remote, err := target.Parse(saved.Target)
-	return remote, saved.Options, err
+	if resolved.kind != remoteTarget {
+		return target.Target{}, sessions.Options{}, errors.New("target is local, not remote")
+	}
+	return resolved.remote, resolved.options, nil
 }
 
 func printSavedSessions(output io.Writer, entries []sessions.Entry) {
@@ -469,6 +744,41 @@ func savedSessionOptions(configuration config) sessions.Options {
 	return options
 }
 
+func savedSessionOptionsForAdd(store sessions.Store, name string, configuration config) (sessions.Options, error) {
+	options := savedSessionOptions(configuration)
+	if options.Port != nil {
+		return options, nil
+	}
+	existing, err := store.Resolve(name)
+	if err == nil && existing.Options.Port != nil {
+		value := *existing.Options.Port
+		options.Port = &value
+		return options, nil
+	}
+	if err != nil && !errors.Is(err, sessions.ErrNotFound) {
+		return sessions.Options{}, err
+	}
+	reserved, err := store.ReservedPorts(name)
+	if err != nil {
+		return sessions.Options{}, err
+	}
+	port, err := firstUnreservedPort(savedSessionPortStart, reserved)
+	if err != nil {
+		return sessions.Options{}, err
+	}
+	options.Port = &port
+	return options, nil
+}
+
+func firstUnreservedPort(start int, reserved map[int]struct{}) (int, error) {
+	for candidate := start; candidate <= 65535; candidate++ {
+		if _, exists := reserved[candidate]; !exists {
+			return candidate, nil
+		}
+	}
+	return 0, fmt.Errorf("no unreserved saved-session port from %d through 65535", start)
+}
+
 func applySavedSessionOptions(configuration *config, options sessions.Options) error {
 	if options.Port != nil && !configuration.explicit["port"] {
 		configuration.port = *options.Port
@@ -546,22 +856,91 @@ func openBrowser(parent context.Context, address string) error {
 }
 
 func listenLoopback(port int) (net.Listener, error) {
-	if port != 0 {
-		return listenLoopbackPort(port)
+	start := port
+	if start == 0 {
+		start = automaticPortStart
 	}
+	listener, _, err := listenLoopbackFrom(start)
+	return listener, err
+}
 
-	var lastErr error
-	for candidate := automaticPortStart; candidate <= 65535; candidate++ {
-		listener, err := listenLoopbackPort(candidate)
+func listenSessionLoopback(invocation, effective config, resolved resolvedTarget, nextPort int, reserved map[int]struct{}) (net.Listener, int, error) {
+	if resolved.savedName != "" && !invocation.explicit["port"] {
+		if resolved.options.Port != nil && *resolved.options.Port > 0 {
+			return listenLoopbackPreferred(*resolved.options.Port, savedSessionPortStart, reserved)
+		}
+		start := savedSessionPortStart
+		if nextPort > start {
+			start = nextPort
+		}
+		return listenLoopbackFromSkipping(start, reserved)
+	}
+	start := effective.port
+	if start == 0 {
+		start = automaticPortStart
+	}
+	if nextPort > start {
+		start = nextPort
+	}
+	return listenLoopbackFrom(start)
+}
+
+func listenLoopbackPreferred(preferred, fallbackStart int, reserved map[int]struct{}) (net.Listener, int, error) {
+	if _, otherSessionOwnsPort := reserved[preferred]; !otherSessionOwnsPort {
+		listener, err := listenLoopbackPort(preferred)
 		if err == nil {
-			return listener, nil
+			return listener, preferred, nil
 		}
 		if !errors.Is(err, syscall.EADDRINUSE) {
-			return nil, err
+			return nil, 0, err
+		}
+	}
+	return listenLoopbackFromSkipping(fallbackStart, reserved)
+}
+
+func reservedSessionPorts(invocation config, resolved resolvedTarget) (map[int]struct{}, error) {
+	if resolved.savedName == "" || invocation.explicit["port"] {
+		return nil, nil
+	}
+	store, err := sessions.DefaultStore()
+	if err != nil {
+		return nil, err
+	}
+	return store.ReservedPorts(resolved.savedName)
+}
+
+func saveSessionPort(name string, port int) error {
+	store, err := sessions.DefaultStore()
+	if err != nil {
+		return err
+	}
+	return store.UpdatePort(name, port)
+}
+
+func listenLoopbackFrom(start int) (net.Listener, int, error) {
+	return listenLoopbackFromSkipping(start, nil)
+}
+
+func listenLoopbackFromSkipping(start int, reserved map[int]struct{}) (net.Listener, int, error) {
+	var lastErr error
+	for candidate := start; candidate <= 65535; candidate++ {
+		if _, exists := reserved[candidate]; exists {
+			lastErr = errors.New("port is reserved by another saved session")
+			continue
+		}
+		listener, err := listenLoopbackPort(candidate)
+		if err == nil {
+			return listener, candidate, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, 0, err
 		}
 		lastErr = err
 	}
-	return nil, fmt.Errorf("no available loopback port from %d through 65535: %w", automaticPortStart, lastErr)
+	if lastErr == nil {
+		lastErr = errors.New("starting port exceeds 65535")
+	}
+	return nil, 0, fmt.Errorf("no available loopback port from %d through 65535: %w", start, lastErr)
 }
 
 func listenLoopbackPort(port int) (net.Listener, error) {

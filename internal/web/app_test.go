@@ -178,6 +178,14 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				if !strings.Contains(body, "Root: <strong>"+fixture.root+"</strong>") {
 					t.Fatal("listing does not show the confined root")
 				}
+				for _, want := range []string{">Path</button>", `class="download-file icon-button"`, `aria-label="Download alpha.txt"`, `<svg viewBox="0 0 24 24" aria-hidden="true"`} {
+					if !strings.Contains(body, want) {
+						t.Errorf("compact file actions are missing %q", want)
+					}
+				}
+				if strings.Contains(body, ">Copy path</button>") || strings.Contains(body, ">Download</button>") {
+					t.Fatal("listing still contains verbose row action text")
+				}
 				if !strings.Contains(body, "addEventListener(&#39;paste&#39;") && !strings.Contains(body, "addEventListener('paste'") {
 					t.Fatal("clipboard file upload handler was not rendered")
 				}
@@ -480,6 +488,9 @@ func TestOptionalUIActions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(filepath.FromSlash(root), "folder", "events.out.tfevents.test"), []byte("event data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Symlink(filepath.Join(filepath.FromSlash(root), "missing.pdf"), filepath.Join(filepath.FromSlash(root), "broken.pdf")); err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +508,7 @@ func TestOptionalUIActions(t *testing.T) {
 
 	listing := request(app, http.MethodGet, "/", nil)
 	body := listing.Body.String()
-	for _, want := range []string{"Create folder", "Show hidden items", "Copy current path", "TensorBoard", "LaTeX tools", ">Table<", ">Figure<", ">Preview<", `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
+	for _, want := range []string{"Create folder", "Show hidden items", "Copy current path", "TensorBoard", ">Launch</button>", "LaTeX tools", ">Table<", ">Figure<", ">Preview<", `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("enhanced listing is missing %q", want)
 		}
@@ -539,7 +550,7 @@ func TestOptionalUIActions(t *testing.T) {
 	tensorRequest.Header.Set("Origin", "http://"+testHost)
 	tensorResponse := httptest.NewRecorder()
 	app.ServeHTTP(tensorResponse, tensorRequest)
-	if tensorResponse.Code != http.StatusSeeOther || !strings.HasPrefix(tensorResponse.Header().Get("Location"), "/tensorboard/") {
+	if tensorResponse.Code != http.StatusSeeOther || !strings.HasPrefix(tensorResponse.Header().Get("Location"), "/tensorboard/") || !strings.HasSuffix(tensorResponse.Header().Get("Location"), "/#scalars") {
 		t.Fatalf("TensorBoard start = %d Location %q body %s", tensorResponse.Code, tensorResponse.Header().Get("Location"), tensorResponse.Body.String())
 	}
 	proxied := request(app, http.MethodGet, tensorResponse.Header().Get("Location"), nil)
@@ -614,6 +625,150 @@ func TestOptionalUIActions(t *testing.T) {
 	latexOnlyBody := request(latexOnly, http.MethodGet, "/", nil).Body.String()
 	if !strings.Contains(latexOnlyBody, `colspan="8"`) || strings.Contains(latexOnlyBody, `<th align="right">TensorBoard</th>`) {
 		t.Fatal("LaTeX-only mode does not add exactly three columns")
+	}
+}
+
+func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
+	root := t.TempDir()
+	logs := filepath.Join(root, "logs")
+	empty := filepath.Join(root, "empty")
+	for _, directory := range []string{logs, empty} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(logs, "events.out.tfevents.test-host.1"), []byte("events"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launcher := &recordingTensorBoardLauncher{handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})}
+	app, err := New(Options{
+		Backend: filesystem.Local{}, Root: filepath.ToSlash(root), SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost, TensorBoard: launcher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listing := request(app, http.MethodGet, "/", nil)
+	if got := strings.Count(listing.Body.String(), ">Launch</button>"); got != 1 {
+		t.Fatalf("Launch button count = %d, want 1; body = %s", got, listing.Body.String())
+	}
+	if strings.Contains(listing.Body.String(), ">TensorBoard</button>") {
+		t.Fatal("legacy TensorBoard button label is still present")
+	}
+
+	emptyRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(empty)), nil)
+	emptyRequest.Host = testHost
+	emptyRequest.Header.Set("Origin", "http://"+testHost)
+	emptyResponse := httptest.NewRecorder()
+	app.ServeHTTP(emptyResponse, emptyRequest)
+	if emptyResponse.Code != http.StatusBadRequest || !strings.Contains(emptyResponse.Body.String(), "event files were not found") {
+		t.Fatalf("non-event directory launch = %d %q", emptyResponse.Code, emptyResponse.Body.String())
+	}
+
+	wrongToken := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(logs)), strings.NewReader("csrf=wrong"))
+	wrongToken.Host = testHost
+	wrongToken.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	wrongTokenResponse := httptest.NewRecorder()
+	app.ServeHTTP(wrongTokenResponse, wrongToken)
+	if wrongTokenResponse.Code != http.StatusForbidden {
+		t.Fatalf("wrong form token status = %d", wrongTokenResponse.Code)
+	}
+
+	form := url.Values{"csrf": {app.csrfToken}}
+	launchRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(logs)), strings.NewReader(form.Encode()))
+	launchRequest.Host = testHost
+	launchRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	launchResponse := httptest.NewRecorder()
+	app.ServeHTTP(launchResponse, launchRequest)
+	if launchResponse.Code != http.StatusSeeOther || !strings.HasPrefix(launchResponse.Header().Get("Location"), "/tensorboard/") || !strings.HasSuffix(launchResponse.Header().Get("Location"), "/#scalars") {
+		t.Fatalf("token-authenticated launch = %d Location %q body %q", launchResponse.Code, launchResponse.Header().Get("Location"), launchResponse.Body.String())
+	}
+	if len(launcher.starts) != 1 || launcher.starts[0].directory != filepath.ToSlash(logs) {
+		t.Fatalf("TensorBoard launches = %#v", launcher.starts)
+	}
+	repeatRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(logs)), nil)
+	repeatRequest.Host = testHost
+	repeatRequest.Header.Set("Origin", "http://"+testHost)
+	repeatResponse := httptest.NewRecorder()
+	app.ServeHTTP(repeatResponse, repeatRequest)
+	if repeatResponse.Code != http.StatusSeeOther || repeatResponse.Header().Get("Location") != launchResponse.Header().Get("Location") {
+		t.Fatalf("repeated launch = %d Location %q, want original Location %q", repeatResponse.Code, repeatResponse.Header().Get("Location"), launchResponse.Header().Get("Location"))
+	}
+	if len(launcher.starts) != 1 {
+		t.Fatalf("repeated Launch started %d TensorBoard processes, want 1", len(launcher.starts))
+	}
+}
+
+func TestConcurrentTensorBoardLaunchesReuseOneProcess(t *testing.T) {
+	root := t.TempDir()
+	logs := filepath.Join(root, "logs")
+	if err := os.Mkdir(logs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logs, "events.out.tfevents.concurrent"), []byte("events"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launcher := &blockingTensorBoardLauncher{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
+	}
+	app, err := New(Options{
+		Backend: filesystem.Local{}, Root: filepath.ToSlash(root), SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost, TensorBoard: launcher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "/tensorboard?path=" + url.QueryEscape(filepath.ToSlash(logs))
+	launch := func(result chan<- *httptest.ResponseRecorder) {
+		request := httptest.NewRequest(http.MethodPost, target, nil)
+		request.Host = testHost
+		request.Header.Set("Origin", "http://"+testHost)
+		response := httptest.NewRecorder()
+		app.ServeHTTP(response, request)
+		result <- response
+	}
+	results := make(chan *httptest.ResponseRecorder, 2)
+	go launch(results)
+	select {
+	case <-launcher.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first TensorBoard launch did not start")
+	}
+	go launch(results)
+	time.Sleep(100 * time.Millisecond)
+	if got := launcher.starts.Load(); got != 1 {
+		t.Fatalf("concurrent requests started %d TensorBoard processes, want 1", got)
+	}
+	close(launcher.release)
+	first, second := <-results, <-results
+	if first.Code != http.StatusSeeOther || second.Code != http.StatusSeeOther || first.Header().Get("Location") != second.Header().Get("Location") {
+		t.Fatalf("concurrent launch responses = (%d, %q) and (%d, %q)", first.Code, first.Header().Get("Location"), second.Code, second.Header().Get("Location"))
+	}
+	if got := launcher.starts.Load(); got != 1 {
+		t.Fatalf("concurrent Launch started %d TensorBoard processes, want 1", got)
+	}
+}
+
+func TestTensorBoardProxyRewritesOriginForBackend(t *testing.T) {
+	target, err := url.Parse("http://127.0.0.1:54321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := newTensorBoardReverseProxy(target)
+	request := httptest.NewRequest(http.MethodPost, "http://"+testHost+"/tensorboard/session/data/plugin", nil)
+	request.Host = testHost
+	request.Header.Set("Origin", "http://"+testHost)
+	proxy.Director(request)
+	if request.URL.Scheme != "http" || request.URL.Host != target.Host || request.Host != target.Host {
+		t.Fatalf("proxied destination = URL %s Host %q", request.URL.String(), request.Host)
+	}
+	if got, want := request.Header.Get("Origin"), "http://"+target.Host; got != want {
+		t.Fatalf("proxied Origin = %q, want %q", got, want)
 	}
 }
 
@@ -995,6 +1150,21 @@ type tensorBoardStart struct {
 type recordingTensorBoardLauncher struct {
 	handler http.Handler
 	starts  []tensorBoardStart
+}
+
+type blockingTensorBoardLauncher struct {
+	starts      atomic.Int32
+	startedOnce sync.Once
+	started     chan struct{}
+	release     chan struct{}
+	handler     http.Handler
+}
+
+func (l *blockingTensorBoardLauncher) Start(_, _ string) (*tensorboard.Instance, error) {
+	l.starts.Add(1)
+	l.startedOnce.Do(func() { close(l.started) })
+	<-l.release
+	return &tensorboard.Instance{Handler: l.handler}, nil
 }
 
 func (l *recordingTensorBoardLauncher) Start(directory, prefix string) (*tensorboard.Instance, error) {

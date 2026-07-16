@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 )
 
-// Local implements Backend with the host filesystem. It is primarily useful
-// for the shared HTTP behavior suite and local development.
+// Local implements Backend with the filesystem on the machine running
+// open-server.
 type Local struct{}
 
 func (Local) Stat(_ context.Context, name string) (fs.FileInfo, error) {

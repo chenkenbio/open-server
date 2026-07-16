@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -91,14 +92,29 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 		}
 		command = exec.Command(executable, arguments...)
 	}
+	var stdinReader, stdinWriter *os.File
+	if l.remote {
+		stdinReader, stdinWriter, err = os.Pipe()
+		if err != nil {
+			return nil, fmt.Errorf("create TensorBoard SSH control pipe: %w", err)
+		}
+		command.Stdin = stdinReader
+	}
 	configureCommand(command)
 	diagnostic := &captureWriter{output: l.output}
 	command.Stdout = diagnostic
 	command.Stderr = diagnostic
 	if err := command.Start(); err != nil {
+		if stdinReader != nil {
+			_ = stdinReader.Close()
+			_ = stdinWriter.Close()
+		}
 		return nil, fmt.Errorf("start TensorBoard: %w", err)
 	}
-	process := newRunningProcess(command)
+	if stdinReader != nil {
+		_ = stdinReader.Close()
+	}
+	process := newRunningProcess(command, stdinWriter)
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -187,11 +203,6 @@ func remoteCommand(rsh, host, pythonInterpreter, logDirectory, pathPrefix string
 	if err != nil {
 		return "", nil, err
 	}
-	quoted := make([]string, 0, len(remoteArguments)+2)
-	quoted = append(quoted, "exec", shellQuote(tensorBoardExecutable))
-	for _, argument := range remoteArguments {
-		quoted = append(quoted, shellQuote(argument))
-	}
 	arguments := []string{
 		"-q", "-T", "-x", "-a",
 		"-o", "ExitOnForwardFailure=yes",
@@ -200,12 +211,46 @@ func remoteCommand(rsh, host, pythonInterpreter, logDirectory, pathPrefix string
 		"-o", "ControlPersist=no",
 		"-o", "PermitLocalCommand=no",
 		"-o", "RemoteCommand=none",
-		"-o", "StdinNull=yes",
 		"-L", forward,
 		host,
-		strings.Join(quoted, " "),
+		remoteTensorBoardScript(tensorBoardExecutable, remoteArguments),
 	}
 	return rsh, arguments, nil
+}
+
+func remoteTensorBoardScript(executable string, arguments []string) string {
+	command := make([]string, 0, len(arguments)+1)
+	command = append(command, shellQuote(executable))
+	for _, argument := range arguments {
+		command = append(command, shellQuote(argument))
+	}
+	return strings.Join([]string{
+		"tensorboard_pid=",
+		"stdin_watcher_pid=",
+		"cleanup() {",
+		`  if [ -n "$tensorboard_pid" ]; then`,
+		`    kill "$tensorboard_pid" 2>/dev/null || :`,
+		`    wait "$tensorboard_pid" 2>/dev/null || :`,
+		"  fi",
+		`  if [ -n "$stdin_watcher_pid" ]; then`,
+		`    kill "$stdin_watcher_pid" 2>/dev/null || :`,
+		`    wait "$stdin_watcher_pid" 2>/dev/null || :`,
+		"  fi",
+		"}",
+		"trap cleanup EXIT",
+		"trap 'exit 143' HUP INT TERM",
+		"exec 3<&0",
+		strings.Join(command, " ") + " &",
+		"tensorboard_pid=$!",
+		`(cat <&3 >/dev/null; kill -TERM "$$" 2>/dev/null || :) &`,
+		"stdin_watcher_pid=$!",
+		`wait "$tensorboard_pid"`,
+		"status=$?",
+		`kill "$stdin_watcher_pid" 2>/dev/null || :`,
+		`wait "$stdin_watcher_pid" 2>/dev/null || :`,
+		"stdin_watcher_pid=",
+		`exit "$status"`,
+	}, "\n")
 }
 
 func shellQuote(value string) string {
@@ -234,14 +279,18 @@ func randomRemotePort() (int, error) {
 
 type runningProcess struct {
 	command  *exec.Cmd
+	stdin    io.Closer
 	done     chan struct{}
 	stopOnce sync.Once
 }
 
-func newRunningProcess(command *exec.Cmd) *runningProcess {
-	process := &runningProcess{command: command, done: make(chan struct{})}
+func newRunningProcess(command *exec.Cmd, stdin io.Closer) *runningProcess {
+	process := &runningProcess{command: command, stdin: stdin, done: make(chan struct{})}
 	go func() {
 		_ = command.Wait()
+		if process.stdin != nil {
+			_ = process.stdin.Close()
+		}
 		close(process.done)
 	}()
 	return process
@@ -253,6 +302,14 @@ func (p *runningProcess) stop() {
 		case <-p.done:
 			return
 		default:
+		}
+		if p.stdin != nil {
+			_ = p.stdin.Close()
+			select {
+			case <-p.done:
+				return
+			case <-time.After(3 * time.Second):
+			}
 		}
 		_ = terminateCommand(p.command)
 		select {

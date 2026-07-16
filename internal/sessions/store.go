@@ -57,11 +57,71 @@ func DefaultStore() (Store, error) {
 	return Store{Path: filepath.Join(configDirectory, "open-server", "sessions", "saved-sessions.yaml")}, nil
 }
 
+// EnsureExists creates an empty saved-sessions file when one does not already
+// exist. Existing files are left untouched so users can edit invalid YAML to
+// repair it.
+func (s Store) EnsureExists() error {
+	if s.Path == "" {
+		return errors.New("saved sessions path cannot be empty")
+	}
+	directory := filepath.Dir(s.Path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return fmt.Errorf("create saved sessions directory %q: %w", directory, err)
+	}
+
+	file, err := os.OpenFile(s.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		info, statErr := os.Stat(s.Path)
+		if statErr != nil {
+			return fmt.Errorf("inspect saved sessions %q: %w", s.Path, statErr)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("saved sessions path %q is a directory", s.Path)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create saved sessions %q: %w", s.Path, err)
+	}
+	removeOnFailure := true
+	defer func() {
+		if removeOnFailure {
+			_ = os.Remove(s.Path)
+		}
+	}()
+
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("secure saved sessions %q: %w", s.Path, err)
+	}
+	encoder := yaml.NewEncoder(file)
+	encoder.SetIndent(2)
+	contents := savedFile{Version: schemaVersion, Sessions: make(map[string]savedSession)}
+	if err := encoder.Encode(contents); err != nil {
+		_ = encoder.Close()
+		_ = file.Close()
+		return fmt.Errorf("initialize saved sessions %q: %w", s.Path, err)
+	}
+	if err := encoder.Close(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("finish saved sessions %q: %w", s.Path, err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync saved sessions %q: %w", s.Path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close saved sessions %q: %w", s.Path, err)
+	}
+	removeOnFailure = false
+	return nil
+}
+
 func (s Store) Add(name, targetValue string, options Options) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
-	if _, err := target.Parse(targetValue); err != nil {
+	if err := validateTarget(targetValue); err != nil {
 		return fmt.Errorf("invalid target for saved session %q: %w", name, err)
 	}
 	if err := validateOptions(options); err != nil {
@@ -95,6 +155,30 @@ func (s Store) Delete(name string) error {
 	return s.save(contents)
 }
 
+// UpdatePort records the last successfully assigned listener port without
+// changing the saved target or any other saved options.
+func (s Store) UpdatePort(name string, port int) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
+	if port < 1 || port > 65535 {
+		return errors.New("port must be between 1 and 65535")
+	}
+	contents, err := s.load()
+	if err != nil {
+		return err
+	}
+	session, ok := contents.Sessions[name]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrNotFound, name)
+	}
+	options := session.options()
+	options.Port = &port
+	session.Options = &options
+	contents.Sessions[name] = session
+	return s.save(contents)
+}
+
 func (s Store) Resolve(name string) (Entry, error) {
 	if err := validateName(name); err != nil {
 		return Entry{}, err
@@ -121,6 +205,30 @@ func (s Store) List() ([]Entry, error) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return entries, nil
+}
+
+// ReservedPorts returns the non-zero remembered ports owned by saved sessions
+// other than excludeName.
+func (s Store) ReservedPorts(excludeName string) (map[int]struct{}, error) {
+	if excludeName != "" {
+		if err := validateName(excludeName); err != nil {
+			return nil, err
+		}
+	}
+	contents, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	ports := make(map[int]struct{})
+	for name, session := range contents.Sessions {
+		if name == excludeName {
+			continue
+		}
+		if port := session.options().Port; port != nil && *port > 0 {
+			ports[*port] = struct{}{}
+		}
+	}
+	return ports, nil
 }
 
 func (s Store) load() (savedFile, error) {
@@ -156,7 +264,7 @@ func (s Store) load() (savedFile, error) {
 		if err := validateName(name); err != nil {
 			return savedFile{}, fmt.Errorf("read saved sessions %q: %w", s.Path, err)
 		}
-		if _, err := target.Parse(session.Target); err != nil {
+		if err := validateTarget(session.Target); err != nil {
 			return savedFile{}, fmt.Errorf("read saved sessions %q: invalid target for session %q: %w", s.Path, name, err)
 		}
 		if err := validateOptions(session.options()); err != nil {
@@ -164,6 +272,14 @@ func (s Store) load() (savedFile, error) {
 		}
 	}
 	return contents, nil
+}
+
+func validateTarget(value string) error {
+	if filepath.IsAbs(filepath.FromSlash(value)) {
+		return nil
+	}
+	_, err := target.Parse(value)
+	return err
 }
 
 func (s savedSession) options() Options {

@@ -25,7 +25,7 @@ import (
 )
 
 func runServe(configuration config, stderr io.Writer) error {
-	root, initialPath, err := localServeRoot(configuration.target)
+	root, initialPath, err := localServeRoot(configuration.targets[0])
 	if err != nil {
 		return err
 	}
@@ -120,11 +120,11 @@ func localTensorBoardLauncher(configuration config, output io.Writer) (tensorboa
 	return launcher, launcher.Close
 }
 
-func localServeRoot(name string) (root, initialPath string, retErr error) {
-	if name == "~" || strings.HasPrefix(name, "~/") {
+func normalizeLocalTarget(name string) (string, error) {
+	if name == "~" || strings.HasPrefix(name, "~/") || strings.HasPrefix(name, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return "", "", fmt.Errorf("find home directory: %w", err)
+			return "", fmt.Errorf("find home directory: %w", err)
 		}
 		if name == "~" {
 			name = home
@@ -134,20 +134,31 @@ func localServeRoot(name string) (root, initialPath string, retErr error) {
 	}
 	absolute, err := filepath.Abs(name)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve local path %q: %w", name, err)
+		return "", fmt.Errorf("resolve local path %q: %w", name, err)
 	}
 	info, err := os.Stat(absolute)
 	if err != nil {
+		return "", fmt.Errorf("access local path %q: %w", name, err)
+	}
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("local path %q is not a regular file or directory", name)
+	}
+	return filepath.ToSlash(filepath.Clean(absolute)), nil
+}
+
+func localServeRoot(name string) (root, initialPath string, retErr error) {
+	cleaned, err := normalizeLocalTarget(name)
+	if err != nil {
+		return "", "", err
+	}
+	info, err := os.Stat(filepath.FromSlash(cleaned))
+	if err != nil {
 		return "", "", fmt.Errorf("access local path %q: %w", name, err)
 	}
-	cleaned := filepath.ToSlash(filepath.Clean(absolute))
 	if info.IsDir() {
 		return cleaned, "", nil
 	}
-	if info.Mode().IsRegular() {
-		return filepath.ToSlash(filepath.Dir(absolute)), cleaned, nil
-	}
-	return "", "", fmt.Errorf("local path %q is not a regular file or directory", name)
+	return filepath.ToSlash(filepath.Dir(filepath.FromSlash(cleaned))), cleaned, nil
 }
 
 func serveStartURL(appURL, initialPath string) string {

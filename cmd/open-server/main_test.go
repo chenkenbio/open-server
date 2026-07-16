@@ -9,14 +9,18 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/pkg/sftp"
 
 	"open-server/internal/filesystem"
+	"open-server/internal/sessions"
 )
 
 func TestParseFlags(t *testing.T) {
@@ -33,11 +37,11 @@ func TestParseFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.target != "lab:/tmp" || !configuration.tensorBoard || configuration.python != "/env/bin/python" || !configuration.latex {
+	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || len(configuration.targets) != 1 || configuration.targets[0] != "lab:/tmp" || !configuration.tensorBoard || configuration.python != "/env/bin/python" || !configuration.latex {
 		t.Fatalf("configuration = %#v", configuration)
 	}
 	add, err := parseFlags([]string{"--add", "work", "lab:/srv/work"}, io.Discard)
-	if err != nil || add.addName != "work" || add.target != "lab:/srv/work" {
+	if err != nil || add.addName != "work" || len(add.targets) != 1 || add.targets[0] != "lab:/srv/work" {
 		t.Fatalf("add configuration = %#v, %v", add, err)
 	}
 	list, err := parseFlags([]string{"-list"}, io.Discard)
@@ -48,14 +52,25 @@ func TestParseFlags(t *testing.T) {
 	if err != nil || remove.delete != "work" {
 		t.Fatalf("delete configuration = %#v, %v", remove, err)
 	}
+	edit, err := parseFlags([]string{"-edit"}, io.Discard)
+	if err != nil || !edit.edit {
+		t.Fatalf("edit configuration = %#v, %v", edit, err)
+	}
 	serve, err := parseFlags([]string{"-serve"}, io.Discard)
-	if err != nil || !serve.serve || serve.target != "." {
+	if err != nil || !serve.serve || len(serve.targets) != 1 || serve.targets[0] != "." {
 		t.Fatalf("serve configuration = %#v, %v", serve, err)
+	}
+	multiple, err := parseFlags([]string{"session-one", "lab:/two", "./local"}, io.Discard)
+	if err != nil || len(multiple.targets) != 3 {
+		t.Fatalf("multiple-target configuration = %#v, %v", multiple, err)
 	}
 	for _, arguments := range [][]string{
 		{}, {"--port", "70000", "lab:/tmp"}, {"--duration", "-1s", "lab:/tmp"},
-		{"lab:/one", "lab:/two"}, {"--add", "work"}, {"--list", "lab:/tmp"},
+		{"--add", "work"}, {"--add", "work", "lab:/one", "lab:/two"}, {"--list", "lab:/tmp"},
 		{"--delete", "work", "lab:/tmp"}, {"--add", "work", "--list", "lab:/tmp"},
+		{"--serve", "--local", "."}, {"--list", "--local"}, {"--edit", "lab:/tmp"},
+		{"--edit", "--list"}, {"--edit", "--add", "work", "lab:/tmp"}, {"--edit", "--serve"},
+		{"--edit", "--local"},
 	} {
 		if _, err := parseFlags(arguments, io.Discard); err == nil {
 			t.Errorf("parseFlags(%q) succeeded, want error", arguments)
@@ -75,7 +90,7 @@ func TestSavedSessionCommands(t *testing.T) {
 	if !strings.Contains(addOutput.String(), `Saved session "work" -> lab:/srv/work`) {
 		t.Fatalf("add output = %q", addOutput.String())
 	}
-	if !strings.Contains(addOutput.String(), "-tensorboard=true") || !strings.Contains(addOutput.String(), `-python-interpreter="/env/bin/python"`) || !strings.Contains(addOutput.String(), "-latex=true") {
+	if !strings.Contains(addOutput.String(), "-port=61000") || !strings.Contains(addOutput.String(), "-tensorboard=true") || !strings.Contains(addOutput.String(), `-python-interpreter="/env/bin/python"`) || !strings.Contains(addOutput.String(), "-latex=true") {
 		t.Fatalf("add output does not show saved options: %q", addOutput.String())
 	}
 
@@ -91,7 +106,7 @@ func TestSavedSessionCommands(t *testing.T) {
 	if err != nil || resolved.Host != "lab" || resolved.Path != "/srv/work" {
 		t.Fatalf("resolveRemoteTarget(work) = %#v, %v", resolved, err)
 	}
-	if options.TensorBoard == nil || !*options.TensorBoard || options.Python == nil || *options.Python != "/env/bin/python" || options.LaTeX == nil || !*options.LaTeX || options.Title == nil || *options.Title != "Dashboards" {
+	if options.Port == nil || *options.Port != savedSessionPortStart || options.TensorBoard == nil || !*options.TensorBoard || options.Python == nil || *options.Python != "/env/bin/python" || options.LaTeX == nil || !*options.LaTeX || options.Title == nil || *options.Title != "Dashboards" {
 		t.Fatalf("saved options = %#v", options)
 	}
 	invocation, err := parseFlags([]string{"work", "--tensorboard=false", "--latex=false"}, io.Discard)
@@ -106,6 +121,30 @@ func TestSavedSessionCommands(t *testing.T) {
 	}
 	if _, _, err := resolveRemoteTarget("missing"); err == nil || !strings.Contains(err.Error(), "use --list") {
 		t.Fatalf("resolveRemoteTarget(missing) error = %v", err)
+	}
+
+	localDirectory := t.TempDir()
+	var localAddOutput bytes.Buffer
+	if err := run([]string{"--add", "local-paper", "--local", localDirectory, "--latex=false"}, &localAddOutput); err != nil {
+		t.Fatal(err)
+	}
+	localSaved, err := resolveTarget("local-paper", false)
+	if err != nil || localSaved.savedName != "local-paper" || localSaved.kind != localTarget || localSaved.local != filepath.ToSlash(localDirectory) {
+		t.Fatalf("resolveTarget(local-paper) = %#v, %v", localSaved, err)
+	}
+	if localSaved.options.LaTeX == nil || *localSaved.options.LaTeX {
+		t.Fatalf("saved local options = %#v", localSaved.options)
+	}
+	if localSaved.options.Port == nil || *localSaved.options.Port != savedSessionPortStart+1 {
+		t.Fatalf("second saved session port = %#v, want %d", localSaved.options.Port, savedSessionPortStart+1)
+	}
+	localPort := *localSaved.options.Port
+	if err := run([]string{"--add", "local-paper", "--local", localDirectory, "--title", "Updated paper"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	localSaved, err = resolveTarget("local-paper", false)
+	if err != nil || localSaved.options.Port == nil || *localSaved.options.Port != localPort {
+		t.Fatalf("updated saved session port = %#v, %v; want preserved %d", localSaved.options.Port, err, localPort)
 	}
 
 	var deleteOutput bytes.Buffer
@@ -169,6 +208,140 @@ func TestLocalServeRoot(t *testing.T) {
 	}
 }
 
+func TestLocalTargetResolutionAndDefaults(t *testing.T) {
+	directory := t.TempDir()
+	resolved, err := resolveDirectTarget(directory, false)
+	if err != nil || resolved.kind != localTarget || resolved.local != filepath.ToSlash(directory) {
+		t.Fatalf("resolveDirectTarget(%q) = %#v, %v", directory, resolved, err)
+	}
+	if _, direct, err := parseDirectTarget("bare-name", false); err != nil || direct {
+		t.Fatalf("bare target direct = %v, %v; want saved-session lookup", direct, err)
+	}
+	if _, err := resolveDirectTarget("missing-bare-name", true); err == nil || !strings.Contains(err.Error(), "access local path") {
+		t.Fatalf("forced missing local error = %v", err)
+	}
+
+	base := config{explicit: make(map[string]bool)}
+	effective, err := effectiveSessionConfig(base, resolvedTarget{kind: localTarget})
+	if err != nil || !effective.latex {
+		t.Fatalf("local default configuration = %#v, %v", effective, err)
+	}
+	latex := false
+	effective, err = effectiveSessionConfig(base, resolvedTarget{kind: localTarget, options: sessions.Options{LaTeX: &latex}})
+	if err != nil || effective.latex {
+		t.Fatalf("saved local LaTeX override = %#v, %v", effective, err)
+	}
+	explicit := config{latex: false, explicit: map[string]bool{"latex": true}}
+	effective, err = effectiveSessionConfig(explicit, resolvedTarget{kind: localTarget})
+	if err != nil || effective.latex {
+		t.Fatalf("explicit local LaTeX override = %#v, %v", effective, err)
+	}
+}
+
+func TestRunMultipleLocalSessionsIsolatesFailureAndAllocatesPorts(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+	output := newNotifyWriter("never-ready")
+	err := run([]string{"--duration", "100ms", "--no-open", first, missing, second}, output)
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("multi-session error = %v", err)
+	}
+	matches := regexp.MustCompile(`http://127\.0\.0\.1:(\d+)/`).FindAllStringSubmatch(output.String(), -1)
+	if len(matches) != 2 {
+		t.Fatalf("session output has %d URLs, want 2: %s", len(matches), output.String())
+	}
+	firstPort, _ := strconv.Atoi(matches[0][1])
+	secondPort, _ := strconv.Atoi(matches[1][1])
+	if secondPort <= firstPort {
+		t.Fatalf("allocated ports = %d, %d; want increasing", firstPort, secondPort)
+	}
+}
+
+func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
+	configHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("HOME", configHome)
+	root := t.TempDir()
+	if err := run([]string{"--add", "remember-port", "--local", root}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"--add", "reserved-port", "--local", t.TempDir()}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	launch := func() int {
+		t.Helper()
+		var output bytes.Buffer
+		if err := run([]string{"--duration", "100ms", "--no-open", "remember-port"}, &output); err != nil {
+			t.Fatal(err)
+		}
+		match := regexp.MustCompile(`http://127\.0\.0\.1:(\d+)/`).FindStringSubmatch(output.String())
+		if len(match) != 2 {
+			t.Fatalf("session output has no local URL: %s", output.String())
+		}
+		port, err := strconv.Atoi(match[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return port
+	}
+
+	firstPort := launch()
+	if firstPort < savedSessionPortStart {
+		t.Fatalf("first saved-session port = %d, want at least %d", firstPort, savedSessionPortStart)
+	}
+	store, err := sessions.DefaultStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := store.Resolve("remember-port")
+	if err != nil || saved.Options.Port == nil || *saved.Options.Port != firstPort {
+		t.Fatalf("saved port after first launch = %#v, %v; want %d", saved.Options.Port, err, firstPort)
+	}
+	if secondPort := launch(); secondPort != firstPort {
+		t.Fatalf("reused saved-session port = %d, want %d", secondPort, firstPort)
+	}
+
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	occupiedPort := occupied.Addr().(*net.TCPAddr).Port
+	if err := store.UpdatePort("remember-port", occupiedPort); err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := store.Resolve("reserved-port")
+	if err != nil || reserved.Options.Port == nil {
+		t.Fatalf("reserved session = %#v, %v", reserved, err)
+	}
+	reservedPort := *reserved.Options.Port
+	startBlocker, startBlockerErr := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(savedSessionPortStart)))
+	if startBlockerErr == nil {
+		defer startBlocker.Close()
+	} else if !errors.Is(startBlockerErr, syscall.EADDRINUSE) {
+		t.Fatal(startBlockerErr)
+	}
+	fallbackPort := launch()
+	if fallbackPort == occupiedPort || fallbackPort == reservedPort || fallbackPort <= reservedPort {
+		t.Fatalf("fallback saved-session port = %d with occupied preference %d and reserved port %d; want a later unreserved port", fallbackPort, occupiedPort, reservedPort)
+	}
+	saved, err = store.Resolve("remember-port")
+	if err != nil || saved.Options.Port == nil || *saved.Options.Port != fallbackPort {
+		t.Fatalf("saved fallback port = %#v, %v; want %d", saved.Options.Port, err, fallbackPort)
+	}
+}
+
+func TestPortAllocationStarts(t *testing.T) {
+	if automaticPortStart != 60000 {
+		t.Fatalf("direct target port start = %d, want 60000", automaticPortStart)
+	}
+	if savedSessionPortStart != 61000 {
+		t.Fatalf("saved-session port start = %d, want 61000", savedSessionPortStart)
+	}
+}
+
 func TestNormalizeFlagOrderPreservesSeparator(t *testing.T) {
 	got := normalizeFlagOrder([]string{"-serve", "--", "-folder"})
 	want := []string{"-serve", "--", "-folder"}
@@ -204,6 +377,26 @@ func TestListenLoopbackUsesIPv4Only(t *testing.T) {
 	address, ok := listener.Addr().(*net.TCPAddr)
 	if !ok || !address.IP.Equal(net.IPv4(127, 0, 0, 1)) {
 		t.Fatalf("listener address = %#v, want 127.0.0.1", listener.Addr())
+	}
+}
+
+func TestListenLoopbackSkipsOccupiedPort(t *testing.T) {
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	occupiedPort := occupied.Addr().(*net.TCPAddr).Port
+	if occupiedPort == 65535 {
+		t.Skip("ephemeral listener used the final TCP port")
+	}
+	listener, assignedPort, err := listenLoopbackFrom(occupiedPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if assignedPort <= occupiedPort {
+		t.Fatalf("assigned port = %d, want greater than occupied port %d", assignedPort, occupiedPort)
 	}
 }
 

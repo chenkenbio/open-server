@@ -19,10 +19,13 @@ func TestRemoteCommandQuotesPathsAndForwardsLoopback(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(arguments, " ")
-	for _, want := range []string{"-q", "127.0.0.1:60123:127.0.0.1:51234", "lab", `'--logdir' '/data/run '\''one'\'''`, `'--path_prefix' '/tensorboard/abc'`} {
+	for _, want := range []string{"-q", "127.0.0.1:60123:127.0.0.1:51234", "lab", `'--logdir' '/data/run '\''one'\'''`, `'--path_prefix' '/tensorboard/abc'`, "trap cleanup EXIT", `exec 3<&0`, `cat <&3 >/dev/null`, `kill -TERM "$$"`} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("remote arguments %q do not contain %q", joined, want)
 		}
+	}
+	if strings.Contains(joined, "StdinNull=yes") {
+		t.Fatalf("remote arguments disable the control pipe: %q", joined)
 	}
 	if executable != "ssh-wrapper" {
 		t.Fatalf("executable = %q", executable)
@@ -41,7 +44,7 @@ func TestPythonInterpreterCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(remoteArguments, " "), `exec '/opt/venv/bin/python' '-m' 'tensorboard.main'`) {
+	if !strings.Contains(strings.Join(remoteArguments, " "), `'/opt/venv/bin/python' '-m' 'tensorboard.main'`) {
 		t.Fatalf("remote Python arguments = %q", remoteArguments)
 	}
 }

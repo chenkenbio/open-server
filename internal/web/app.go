@@ -42,6 +42,13 @@ type Options struct {
 
 var errOutsideRoot = errors.New("path is outside the configured root")
 
+type tensorBoardLaunch struct {
+	id     string
+	prefix string
+	ready  chan struct{}
+	err    error
+}
+
 type App struct {
 	backend     filesystem.Backend
 	root        string
@@ -49,11 +56,13 @@ type App struct {
 	title       string
 	allowedHost string
 	accessToken string
+	csrfToken   string
 	httpClient  *http.Client
 	tensorBoard tensorboard.Launcher
 	latex       bool
 	tensorMu    sync.RWMutex
 	tensorProxy map[string]http.Handler
+	tensorByDir map[string]*tensorBoardLaunch
 	template    *template.Template
 }
 
@@ -83,6 +92,14 @@ func New(options Options) (*App, error) {
 			},
 		}
 	}
+	csrfToken := ""
+	if options.TensorBoard != nil {
+		var token [16]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return nil, fmt.Errorf("create request token: %w", err)
+		}
+		csrfToken = hex.EncodeToString(token[:])
+	}
 	tmpl, err := template.New("directory").Funcs(template.FuncMap{
 		"size": formatSize,
 		"time": func(t time.Time) string { return t.Local().Format("2006-01-02 15:04:05") },
@@ -97,10 +114,12 @@ func New(options Options) (*App, error) {
 		title:       options.Title,
 		allowedHost: options.AllowedHost,
 		accessToken: options.AccessToken,
+		csrfToken:   csrfToken,
 		httpClient:  options.HTTPClient,
 		tensorBoard: options.TensorBoard,
 		latex:       options.LaTeX,
 		tensorProxy: make(map[string]http.Handler),
+		tensorByDir: make(map[string]*tensorBoardLaunch),
 		template:    tmpl,
 	}, nil
 }
@@ -126,7 +145,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !a.authorize(w, r) {
 		return
 	}
-	if isStateChanging(r.Method) && !a.validOrigin(r) {
+	if isStateChanging(r.Method) && !a.validStateChangingRequest(r) {
 		http.Error(w, "invalid Origin header", http.StatusForbidden)
 		return
 	}
@@ -263,6 +282,18 @@ func (a *App) validOrigin(r *http.Request) bool {
 	return err == nil && parsed.Scheme == "http" && parsed.Host == a.allowedHost && parsed.User == nil && parsed.Path == "" && parsed.RawQuery == "" && parsed.Fragment == ""
 }
 
+func (a *App) validStateChangingRequest(r *http.Request) bool {
+	if a.validOrigin(r) {
+		return true
+	}
+	if r.URL.Path != "/tensorboard" || a.csrfToken == "" || r.ParseForm() != nil {
+		return false
+	}
+	got := []byte(r.PostForm.Get("csrf"))
+	want := []byte(a.csrfToken)
+	return len(got) == len(want) && subtle.ConstantTimeCompare(got, want) == 1
+}
+
 type directoryView struct {
 	Title              string
 	SSHHost            string
@@ -276,6 +307,7 @@ type directoryView struct {
 	HiddenToggleLabel  string
 	ShowHidden         bool
 	TensorBoardEnabled bool
+	CSRFToken          string
 	LaTeXEnabled       bool
 	ColumnCount        int
 	NameSortURL        string
@@ -367,6 +399,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		HiddenToggleURL:    a.appURL("/", current, sortKey, order, !showHidden),
 		ShowHidden:         showHidden,
 		TensorBoardEnabled: a.tensorBoard != nil,
+		CSRFToken:          a.csrfToken,
 		LaTeXEnabled:       a.latex,
 		NameSortURL:        a.sortURL(current, sortKey, order, "name", showHidden),
 		ModifiedSortURL:    a.sortURL(current, sortKey, order, "modified", showHidden),
@@ -392,7 +425,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		view.HasParent = true
 		view.ParentPath = path.Dir(current)
 		view.ParentURL = a.appURL("/", view.ParentPath, sortKey, order, showHidden)
-		if a.tensorBoard != nil {
+		if a.tensorBoard != nil && a.directoryHasTensorBoardEvents(r.Context(), view.ParentPath) {
 			view.ParentTensorBoard = a.appURL("/tensorboard", view.ParentPath, "", "", showHidden)
 		}
 	}
@@ -408,7 +441,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 			entryURL = a.appURL("/preview", fullName, "", "", showHidden)
 		}
 		tensorBoardURL := ""
-		if entry.IsDir() && a.tensorBoard != nil {
+		if entry.IsDir() && a.tensorBoard != nil && a.directoryHasTensorBoardEvents(r.Context(), fullName) {
 			tensorBoardURL = a.appURL("/tensorboard", fullName, "", "", showHidden)
 		}
 		figureSnippet, tableSnippet := "", ""
@@ -637,39 +670,110 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "TensorBoard path must be a directory", http.StatusBadRequest)
 		return
 	}
-	var randomID [8]byte
-	if _, err := rand.Read(randomID[:]); err != nil {
+	entries, err := a.backend.ReadDir(r.Context(), directory)
+	if err != nil {
+		a.pathError(w, err)
+		return
+	}
+	if !hasTensorBoardEvents(entries) {
+		http.Error(w, "TensorBoard event files were not found in this directory", http.StatusBadRequest)
+		return
+	}
+	launch, owner, err := a.acquireTensorBoardLaunch(directory)
+	if err != nil {
 		http.Error(w, "could not create TensorBoard session", http.StatusInternalServerError)
 		return
 	}
-	id := hex.EncodeToString(randomID[:])
-	prefix := "/tensorboard/" + id
-	instance, err := a.tensorBoard.Start(directory, prefix)
-	if err != nil {
-		http.Error(w, "could not start TensorBoard: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	if instance == nil || (instance.Target == nil && instance.Handler == nil) {
-		http.Error(w, "could not start TensorBoard", http.StatusBadGateway)
-		return
-	}
-	var handler http.Handler = instance.Handler
-	if handler == nil {
-		proxy := httputil.NewSingleHostReverseProxy(instance.Target)
-		director := proxy.Director
-		proxy.Director = func(request *http.Request) {
-			director(request)
-			request.Host = instance.Target.Host
+	if owner {
+		instance, startErr := a.tensorBoard.Start(directory, launch.prefix)
+		var handler http.Handler
+		if startErr == nil {
+			if instance == nil || (instance.Target == nil && instance.Handler == nil) {
+				startErr = errors.New("launcher returned no backend")
+			} else {
+				handler = instance.Handler
+				if handler == nil {
+					proxy := newTensorBoardReverseProxy(instance.Target)
+					proxy.ErrorHandler = func(response http.ResponseWriter, _ *http.Request, _ error) {
+						http.Error(response, "TensorBoard is starting or unavailable; retry shortly", http.StatusBadGateway)
+					}
+					handler = proxy
+				}
+			}
 		}
-		proxy.ErrorHandler = func(response http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(response, "TensorBoard is starting or unavailable; retry shortly", http.StatusBadGateway)
-		}
-		handler = proxy
+		a.completeTensorBoardLaunch(directory, launch, handler, startErr)
 	}
+	a.respondTensorBoardLaunch(w, r, launch)
+}
+
+func (a *App) acquireTensorBoardLaunch(directory string) (*tensorBoardLaunch, bool, error) {
 	a.tensorMu.Lock()
-	a.tensorProxy[id] = handler
+	defer a.tensorMu.Unlock()
+	if existing := a.tensorByDir[directory]; existing != nil {
+		return existing, false, nil
+	}
+	var randomID [8]byte
+	if _, err := rand.Read(randomID[:]); err != nil {
+		return nil, false, err
+	}
+	id := hex.EncodeToString(randomID[:])
+	launch := &tensorBoardLaunch{id: id, prefix: "/tensorboard/" + id, ready: make(chan struct{})}
+	a.tensorByDir[directory] = launch
+	return launch, true, nil
+}
+
+func (a *App) completeTensorBoardLaunch(directory string, launch *tensorBoardLaunch, handler http.Handler, err error) {
+	a.tensorMu.Lock()
+	launch.err = err
+	if err == nil {
+		a.tensorProxy[launch.id] = handler
+	} else if a.tensorByDir[directory] == launch {
+		delete(a.tensorByDir, directory)
+	}
+	close(launch.ready)
 	a.tensorMu.Unlock()
-	http.Redirect(w, r, prefix+"/", http.StatusSeeOther)
+}
+
+func (a *App) respondTensorBoardLaunch(w http.ResponseWriter, r *http.Request, launch *tensorBoardLaunch) {
+	select {
+	case <-launch.ready:
+	case <-r.Context().Done():
+		return
+	}
+	if launch.err != nil {
+		http.Error(w, "could not start TensorBoard: "+launch.err.Error(), http.StatusBadGateway)
+		return
+	}
+	http.Redirect(w, r, launch.prefix+"/#scalars", http.StatusSeeOther)
+}
+
+const tensorBoardEventPrefix = "events.out.tfevents."
+
+func hasTensorBoardEvents(entries []filesystem.Entry) bool {
+	for _, entry := range entries {
+		if entry.Info != nil && entry.Info.Mode().IsRegular() && len(entry.Name) > len(tensorBoardEventPrefix) && strings.HasPrefix(entry.Name, tensorBoardEventPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) directoryHasTensorBoardEvents(ctx context.Context, directory string) bool {
+	entries, err := a.backend.ReadDir(ctx, directory)
+	return err == nil && hasTensorBoardEvents(entries)
+}
+
+func newTensorBoardReverseProxy(target *url.URL) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	director := proxy.Director
+	proxy.Director = func(request *http.Request) {
+		director(request)
+		request.Host = target.Host
+		if request.Header.Get("Origin") != "" {
+			request.Header.Set("Origin", target.Scheme+"://"+target.Host)
+		}
+	}
+	return proxy
 }
 
 func (a *App) serveTensorBoard(w http.ResponseWriter, r *http.Request) {
