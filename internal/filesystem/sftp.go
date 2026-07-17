@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -105,11 +106,7 @@ func (s SFTP) Upload(ctx context.Context, name string, src io.Reader, overwrite 
 		}
 	}
 
-	temporary, err := sftpTemporaryName(path.Dir(name))
-	if err != nil {
-		return 0, err
-	}
-	f, err := s.openUploadFile(ctx, temporary)
+	stagingDirectory, temporary, f, err := s.openUploadFile(ctx, path.Dir(name))
 	if err != nil {
 		return 0, err
 	}
@@ -119,15 +116,11 @@ func (s SFTP) Upload(ctx context.Context, name string, src io.Reader, overwrite 
 			// asynchronously so a disconnected HTTP request is not held open while
 			// an in-flight SFTP packet finishes.
 			go func() {
-				_ = f.Close()
-				_ = s.Client.Remove(temporary)
+				s.cleanupUploadStage(stagingDirectory, temporary, f)
 			}()
 			return
 		}
-		_ = f.Close()
-		if retErr != nil {
-			_ = s.Client.Remove(temporary)
-		}
+		s.cleanupUploadStage(stagingDirectory, temporary, f)
 	}()
 
 	written, err = copySFTPContext(ctx, f, src)
@@ -157,6 +150,9 @@ func (s SFTP) Upload(ctx context.Context, name string, src io.Reader, overwrite 
 		if err = awaitSFTPError(ctx, func() error { return s.Client.Remove(temporary) }); err != nil {
 			return written, err
 		}
+		if err = awaitSFTPError(ctx, func() error { return s.Client.RemoveDirectory(stagingDirectory) }); err != nil {
+			return written, err
+		}
 		return written, nil
 	}
 
@@ -164,6 +160,9 @@ func (s SFTP) Upload(ctx context.Context, name string, src io.Reader, overwrite 
 	// If a server does not implement it, preserve the old file under a temporary
 	// name until the new upload has been moved into place.
 	if err = awaitSFTPError(ctx, func() error { return s.Client.PosixRename(temporary, name) }); err == nil {
+		if err = awaitSFTPError(ctx, func() error { return s.Client.RemoveDirectory(stagingDirectory) }); err != nil {
+			return written, err
+		}
 		return written, nil
 	}
 	if isOperationUnsupported(err) {
@@ -176,31 +175,81 @@ func (s SFTP) Upload(ctx context.Context, name string, src io.Reader, overwrite 
 }
 
 type sftpOpenResult struct {
-	file *sftp.File
-	err  error
+	directory string
+	name      string
+	file      *sftp.File
+	err       error
 }
 
-func (s SFTP) openUploadFile(ctx context.Context, name string) (*sftp.File, error) {
+func (s SFTP) openUploadFile(ctx context.Context, parent string) (string, string, *sftp.File, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return "", "", nil, err
 	}
+	directory, err := sftpTemporaryName(parent)
+	if err != nil {
+		return "", "", nil, err
+	}
+	name := path.Join(directory, "payload")
 	result := make(chan sftpOpenResult, 1)
 	go func() {
-		f, err := s.Client.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
-		result <- sftpOpenResult{file: f, err: err}
+		// pkg/sftp v1 cannot set the creation mode in OpenFile. Create no
+		// payload until an empty staging directory has been made private.
+		if err := s.Client.Mkdir(directory); err != nil {
+			result <- sftpOpenResult{err: err}
+			return
+		}
+
+		var f *sftp.File
+		err := s.Client.Chmod(directory, 0o700)
+		if err == nil {
+			var info fs.FileInfo
+			info, err = s.Client.Lstat(directory)
+			if err == nil && (!info.IsDir() || info.Mode().Perm() != 0o700) {
+				err = fmt.Errorf("SFTP upload staging directory is not private: mode %#o", info.Mode().Perm())
+			}
+		}
+		if err == nil {
+			f, err = s.Client.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+		}
+		if err == nil {
+			err = f.Chmod(0o600)
+		}
+		if err == nil {
+			var info fs.FileInfo
+			info, err = f.Stat()
+			if err == nil && (!info.Mode().IsRegular() || info.Mode().Perm() != 0o600) {
+				err = fmt.Errorf("SFTP upload staging file is not private: mode %#o", info.Mode().Perm())
+			}
+		}
+		if err != nil {
+			s.cleanupUploadStage(directory, name, f)
+			f = nil
+		}
+		result <- sftpOpenResult{directory: directory, name: name, file: f, err: err}
 	}()
 	select {
 	case opened := <-result:
-		return opened.file, opened.err
+		return opened.directory, opened.name, opened.file, opened.err
 	case <-ctx.Done():
 		go func() {
 			opened := <-result
 			if opened.file != nil {
-				_ = opened.file.Close()
-				_ = s.Client.Remove(name)
+				s.cleanupUploadStage(opened.directory, opened.name, opened.file)
 			}
 		}()
-		return nil, ctx.Err()
+		return "", "", nil, ctx.Err()
+	}
+}
+
+func (s SFTP) cleanupUploadStage(directory, name string, f *sftp.File) {
+	if f != nil {
+		_ = f.Close()
+	}
+	if name != "" {
+		_ = s.Client.Remove(name)
+	}
+	if directory != "" {
+		_ = s.Client.RemoveDirectory(directory)
 	}
 }
 

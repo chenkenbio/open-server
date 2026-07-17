@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"open-server/internal/filesystem"
+	"open-server/internal/jupyter"
 	"open-server/internal/sessions"
 	"open-server/internal/sshsession"
 	"open-server/internal/target"
@@ -29,7 +30,7 @@ import (
 	appweb "open-server/internal/web"
 )
 
-const version = "0.2.0-beta.1"
+const version = "0.2.0"
 
 const automaticPortStart = 60000
 
@@ -44,12 +45,14 @@ type config struct {
 	rsh         string
 	duration    time.Duration
 	title       string
+	fontSize    int
 	noOpen      bool
 	local       bool
 	serve       bool
 	address     string
 	token       string
 	tensorBoard bool
+	jupyter     bool
 	python      string
 	latex       bool
 	version     bool
@@ -317,8 +320,11 @@ func startSession(parent context.Context, configuration config, resolved resolve
 	closeBackend := func() error { return nil }
 	var tensorBoardLauncher tensorboard.Launcher
 	closeTensorBoard := func() {}
+	var jupyterLauncher jupyter.Launcher
+	closeJupyter := func() {}
 
 	fail := func(err error) (*runningSession, string, error) {
+		closeJupyter()
 		closeTensorBoard()
 		_ = closeBackend()
 		cancel()
@@ -346,6 +352,10 @@ func startSession(parent context.Context, configuration config, resolved resolve
 			configuration.title = "Local files — " + root
 		}
 		tensorBoardLauncher, closeTensorBoard = localTensorBoardLauncher(configuration, output)
+		jupyterLauncher, closeJupyter = localJupyterLauncher(configuration, output)
+		if configuration.tensorBoard || configuration.jupyter {
+			printLocalAppWarning(output)
+		}
 	} else {
 		ssh, err := sshsession.Start(ctx, sshsession.Options{Executable: configuration.rsh, Host: resolved.remote.Host, Stderr: output})
 		if err != nil {
@@ -376,12 +386,15 @@ func startSession(parent context.Context, configuration config, resolved resolve
 		}
 		host = resolved.remote.Host
 		tensorBoardLauncher, closeTensorBoard = remoteTensorBoardLauncher(configuration, host, output)
+		jupyterLauncher, closeJupyter = remoteJupyterLauncher(configuration, host, output)
 	}
 
 	app, err := appweb.New(appweb.Options{
 		Backend: backend, Root: root, SSHHost: host,
 		Title: configuration.title, AllowedHost: listener.Addr().String(),
-		TensorBoard: tensorBoardLauncher, LaTeX: configuration.latex,
+		TensorBoard: tensorBoardLauncher, Jupyter: jupyterLauncher,
+		DefaultPython: configuration.python, LaTeX: configuration.latex,
+		FontSize: configuration.fontSize,
 	})
 	if err != nil {
 		return fail(err)
@@ -419,6 +432,7 @@ func startSession(parent context.Context, configuration config, resolved resolve
 			result = fmt.Errorf("shut down local HTTP server: %w", err)
 		}
 		shutdownCancel()
+		closeJupyter()
 		closeTensorBoard()
 		_ = closeBackend()
 		_ = listener.Close()
@@ -433,6 +447,22 @@ func remoteTensorBoardLauncher(configuration config, host string, output io.Writ
 		return nil, func() {}
 	}
 	launcher := tensorboard.NewRemote(configuration.rsh, host, configuration.python, output)
+	return launcher, launcher.Close
+}
+
+func localJupyterLauncher(configuration config, output io.Writer) (jupyter.Launcher, func()) {
+	if !configuration.jupyter {
+		return nil, func() {}
+	}
+	launcher := jupyter.NewLocal(configuration.python, output)
+	return launcher, launcher.Close
+}
+
+func remoteJupyterLauncher(configuration config, host string, output io.Writer) (jupyter.Launcher, func()) {
+	if !configuration.jupyter {
+		return nil, func() {}
+	}
+	launcher := jupyter.NewRemote(configuration.rsh, host, configuration.python, output)
 	return launcher, launcher.Close
 }
 
@@ -461,14 +491,16 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	flags.StringVar(&configuration.rsh, "rsh", "ssh", "OpenSSH executable or compatible wrapper")
 	flags.DurationVar(&configuration.duration, "duration", defaultSessionDuration, "session duration (default 7d; for example 2h)")
 	flags.StringVar(&configuration.title, "title", "", "browser page title")
+	flags.IntVar(&configuration.fontSize, "fontsize", appweb.DefaultFontSize, fmt.Sprintf("file browser font size in pixels (%d-%d)", appweb.MinFontSize, appweb.MaxFontSize))
 	flags.BoolVar(&configuration.noOpen, "no-open", false, "do not open a browser automatically")
 	flags.BoolVar(&configuration.local, "local", false, "interpret every target as a local path")
 	flags.BoolVar(&configuration.serve, "serve", false, "expose this machine's path over token-protected plain HTTP")
 	flags.StringVar(&configuration.address, "address", "", "reachable IPv4 address or hostname for serve mode (default auto-detected)")
 	flags.StringVar(&configuration.token, "token", "", "access token for serve mode (minimum 8 characters; default random)")
 	flags.BoolVar(&configuration.tensorBoard, "tensorboard", false, "show TensorBoard launch actions for event-log folders")
-	flags.StringVar(&configuration.python, "python-interpreter", "", "Python interpreter containing TensorBoard")
-	flags.StringVar(&configuration.python, "py", "", "Python interpreter containing TensorBoard (shorthand)")
+	flags.BoolVar(&configuration.jupyter, "jupyter", false, "show JupyterLab launch actions for folders")
+	flags.StringVar(&configuration.python, "python-interpreter", "", "Python interpreter containing TensorBoard and JupyterLab")
+	flags.StringVar(&configuration.python, "py", "", "Python interpreter containing TensorBoard and JupyterLab (shorthand)")
 	flags.BoolVar(&configuration.latex, "latex", false, "show LaTeX table, figure, and live-PDF actions (default for local targets)")
 	flags.StringVar(&configuration.addName, "add", "", "save or update a named session")
 	flags.StringVar(&configuration.delete, "delete", "", "delete a named session")
@@ -513,6 +545,12 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	if configuration.serve && configuration.local {
 		return config{}, errors.New("local cannot be used with serve")
 	}
+	if configuration.serve && configuration.jupyter {
+		return config{}, errors.New("jupyter cannot be used with serve; use a local or SSH/SFTP session")
+	}
+	if configuration.serve && configuration.tensorBoard {
+		return config{}, errors.New("tensorboard cannot be used with serve; use a local or SSH/SFTP session")
+	}
 	if operations > 1 {
 		return config{}, errors.New("add, delete, list, and edit cannot be used together")
 	}
@@ -550,6 +588,9 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	}
 	if configuration.duration < 0 {
 		return config{}, errors.New("duration cannot be negative")
+	}
+	if configuration.fontSize < appweb.MinFontSize || configuration.fontSize > appweb.MaxFontSize {
+		return config{}, fmt.Errorf("fontsize must be between %d and %d", appweb.MinFontSize, appweb.MaxFontSize)
 	}
 	if configuration.rsh == "" {
 		return config{}, errors.New("rsh executable cannot be empty")
@@ -674,6 +715,7 @@ func normalizeFlagOrder(arguments []string) []string {
 	valueFlags := map[string]bool{
 		"-port": true, "--port": true, "-rsh": true, "--rsh": true,
 		"-duration": true, "--duration": true, "-title": true, "--title": true,
+		"-fontsize": true, "--fontsize": true,
 		"-address": true, "--address": true, "-token": true, "--token": true,
 		"-add": true, "--add": true, "-delete": true, "--delete": true,
 		"-python-interpreter": true, "--python-interpreter": true, "-py": true,
@@ -725,6 +767,10 @@ func savedSessionOptions(configuration config) sessions.Options {
 		value := configuration.title
 		options.Title = &value
 	}
+	if configuration.explicit["fontsize"] {
+		value := configuration.fontSize
+		options.FontSize = &value
+	}
 	if configuration.explicit["no-open"] {
 		value := configuration.noOpen
 		options.NoOpen = &value
@@ -732,6 +778,10 @@ func savedSessionOptions(configuration config) sessions.Options {
 	if configuration.explicit["tensorboard"] {
 		value := configuration.tensorBoard
 		options.TensorBoard = &value
+	}
+	if configuration.explicit["jupyter"] {
+		value := configuration.jupyter
+		options.Jupyter = &value
 	}
 	if configuration.explicit["python-interpreter"] || configuration.explicit["py"] {
 		value := configuration.python
@@ -796,11 +846,17 @@ func applySavedSessionOptions(configuration *config, options sessions.Options) e
 	if options.Title != nil && !configuration.explicit["title"] {
 		configuration.title = *options.Title
 	}
+	if options.FontSize != nil && !configuration.explicit["fontsize"] {
+		configuration.fontSize = *options.FontSize
+	}
 	if options.NoOpen != nil && !configuration.explicit["no-open"] {
 		configuration.noOpen = *options.NoOpen
 	}
 	if options.TensorBoard != nil && !configuration.explicit["tensorboard"] {
 		configuration.tensorBoard = *options.TensorBoard
+	}
+	if options.Jupyter != nil && !configuration.explicit["jupyter"] {
+		configuration.jupyter = *options.Jupyter
 	}
 	if options.Python != nil && !configuration.explicit["python-interpreter"] && !configuration.explicit["py"] {
 		configuration.python = *options.Python
@@ -825,11 +881,17 @@ func formatSessionOptions(options sessions.Options) string {
 	if options.Title != nil {
 		values = append(values, "-title="+strconv.Quote(*options.Title))
 	}
+	if options.FontSize != nil {
+		values = append(values, "-fontsize="+strconv.Itoa(*options.FontSize))
+	}
 	if options.NoOpen != nil {
 		values = append(values, "-no-open="+strconv.FormatBool(*options.NoOpen))
 	}
 	if options.TensorBoard != nil {
 		values = append(values, "-tensorboard="+strconv.FormatBool(*options.TensorBoard))
+	}
+	if options.Jupyter != nil {
+		values = append(values, "-jupyter="+strconv.FormatBool(*options.Jupyter))
 	}
 	if options.Python != nil {
 		values = append(values, "-python-interpreter="+strconv.Quote(*options.Python))

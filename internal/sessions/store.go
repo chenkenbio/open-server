@@ -16,6 +16,10 @@ import (
 
 const schemaVersion = 1
 
+const minFontSize = 8
+
+const maxFontSize = 72
+
 var ErrNotFound = errors.New("saved session not found")
 
 type Store struct {
@@ -33,8 +37,10 @@ type Options struct {
 	RSH         *string `yaml:"rsh,omitempty"`
 	Duration    *string `yaml:"duration,omitempty"`
 	Title       *string `yaml:"title,omitempty"`
+	FontSize    *int    `yaml:"fontsize,omitempty"`
 	NoOpen      *bool   `yaml:"no-open,omitempty"`
 	TensorBoard *bool   `yaml:"tensorboard,omitempty"`
+	Jupyter     *bool   `yaml:"jupyter,omitempty"`
 	Python      *string `yaml:"python-interpreter,omitempty"`
 	LaTeX       *bool   `yaml:"latex,omitempty"`
 }
@@ -290,7 +296,7 @@ func (s savedSession) options() Options {
 }
 
 func (o Options) empty() bool {
-	return o.Port == nil && o.RSH == nil && o.Duration == nil && o.Title == nil && o.NoOpen == nil && o.TensorBoard == nil && o.Python == nil && o.LaTeX == nil
+	return o.Port == nil && o.RSH == nil && o.Duration == nil && o.Title == nil && o.FontSize == nil && o.NoOpen == nil && o.TensorBoard == nil && o.Jupyter == nil && o.Python == nil && o.LaTeX == nil
 }
 
 func validateOptions(options Options) error {
@@ -299,6 +305,9 @@ func validateOptions(options Options) error {
 	}
 	if options.RSH != nil && *options.RSH == "" {
 		return errors.New("rsh executable cannot be empty")
+	}
+	if options.FontSize != nil && (*options.FontSize < minFontSize || *options.FontSize > maxFontSize) {
+		return fmt.Errorf("fontsize must be between %d and %d", minFontSize, maxFontSize)
 	}
 	if options.Python != nil && *options.Python == "" {
 		return errors.New("python interpreter cannot be empty")

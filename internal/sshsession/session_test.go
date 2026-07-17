@@ -126,7 +126,9 @@ func helperWrapper(t *testing.T, dropTransport bool) string {
 	if dropTransport {
 		drop = " OPEN_SERVER_SFTP_DROP=1"
 	}
-	contents := "#!/bin/sh\nOPEN_SERVER_SFTP_HELPER=1" + drop + " " + shellQuote(os.Args[0]) + " -test.run='^TestSFTPHelperProcess$' <&0 >&1 2>&2 &\nchild=$!\nexec >/dev/null 2>/dev/null\nwait \"$child\"\n"
+	// Preserve stdin before starting the helper in the background; POSIX shells
+	// may otherwise connect an asynchronous command's stdin to /dev/null.
+	contents := "#!/bin/sh\nexec 3<&0\nOPEN_SERVER_SFTP_HELPER=1" + drop + " " + shellQuote(os.Args[0]) + " -test.run='^TestSFTPHelperProcess$' <&3 3<&- >&1 2>&2 &\nchild=$!\nexec 3<&- >/dev/null 2>/dev/null\nwait \"$child\"\n"
 	if err := os.WriteFile(name, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}

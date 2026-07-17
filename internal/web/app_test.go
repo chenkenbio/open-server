@@ -62,6 +62,15 @@ func createFixture(t *testing.T) string {
 		"active.html":      "<script>parent.pwned=true</script>",
 		"active.js":        "parent.pwned=true",
 		"active.svg":       "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>parent.pwned=true</script></svg>",
+		"config.xml":       "<?xml version=\"1.0\"?><root>value</root>",
+		"data.csv":         "name,value\nalpha,1\n",
+		"data.tsv":         "name\tvalue\nalpha\t1\n",
+		"figure.eps":       "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\n",
+		"paper.tex":        "\\documentclass{article}\n",
+		"README":           "extensionless text\n",
+		"preview.pdf":      "%PDF-1.4\n%%EOF\n",
+		"pixel.png":        "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+		"binary.dat":       "\x00\x01\x02\x03\xff",
 		"weird <&\".txt":   "escaped",
 		"empty.txt":        "",
 		"space 日本語 #?.txt": "unicode",
@@ -172,18 +181,21 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				if !strings.Contains(body, `var uploadURL = "/upload?path=`) || !strings.Contains(body, `var importURL = "/import?path=`) {
 					t.Fatal("rendered transfer endpoints are not root-relative JavaScript strings")
 				}
-				if strings.Contains(body, "Parent Directory") || !strings.Contains(body, "Name ^") {
+				if strings.Contains(body, `>..</a>`) || !strings.Contains(body, "Name ^") {
 					t.Fatal("root listing exposes parent navigation or is missing the active sort marker")
 				}
-				if !strings.Contains(body, "Root: <strong>"+fixture.root+"</strong>") {
-					t.Fatal("listing does not show the confined root")
+				if !strings.Contains(body, `class="site-name">open-server</span>`) {
+					t.Fatal("listing does not show the compact application header")
 				}
-				for _, want := range []string{">Path</button>", `class="download-file icon-button"`, `aria-label="Download alpha.txt"`, `<svg viewBox="0 0 24 24" aria-hidden="true"`} {
+				if !strings.Contains(body, `class="root-path">`+fixture.root+`</span>`) {
+					t.Fatal("listing does not show the session root path")
+				}
+				for _, want := range []string{`<th align="right">Path</th>`, `class="copy-path icon-button"`, `aria-label="Copy path"`, `title="Copy path"`, `class="download-file icon-button"`, `aria-label="Download alpha.txt"`, `<svg viewBox="0 0 24 24" aria-hidden="true"`} {
 					if !strings.Contains(body, want) {
 						t.Errorf("compact file actions are missing %q", want)
 					}
 				}
-				if strings.Contains(body, ">Copy path</button>") || strings.Contains(body, ">Download</button>") {
+				if strings.Contains(body, ">Path</button>") || strings.Contains(body, ">Copy path</button>") || strings.Contains(body, ">Download</button>") {
 					t.Fatal("listing still contains verbose row action text")
 				}
 				if !strings.Contains(body, "addEventListener(&#39;paste&#39;") && !strings.Contains(body, "addEventListener('paste'") {
@@ -191,6 +203,16 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				}
 				if strings.Contains(body, `Remote <files>`) || strings.Contains(body, `weird <&".txt`) {
 					t.Fatal("unescaped remote metadata appeared in HTML")
+				}
+				for _, fileName := range []string{"README", "active.html", "binary.dat", "data.tsv"} {
+					match := regexp.MustCompile(`href="([^"]+)">` + regexp.QuoteMeta(fileName) + `</a>`).FindStringSubmatch(body)
+					if len(match) != 2 {
+						t.Fatalf("listing is missing the link for %s", fileName)
+					}
+					linked, parseErr := url.Parse(html.UnescapeString(match[1]))
+					if parseErr != nil || linked.Path != "/preview" {
+						t.Fatalf("%s link = %q, parsed as %#v, %v", fileName, match[1], linked, parseErr)
+					}
 				}
 				sortLinks := regexp.MustCompile(`href="([^"]*sort=name[^"]*)"`).FindAllStringSubmatch(body, -1)
 				preservesCurrentPath := false
@@ -206,8 +228,26 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				}
 				insideLink := filepath.ToSlash(filepath.Join(fixture.root, "inside-link"))
 				insideResponse := request(app, http.MethodGet, "/?path="+url.QueryEscape(insideLink), nil)
-				if insideResponse.Code != http.StatusOK || !strings.Contains(insideResponse.Body.String(), "inside.txt") || !strings.Contains(insideResponse.Body.String(), "Parent Directory") {
+				if insideResponse.Code != http.StatusOK || !strings.Contains(insideResponse.Body.String(), "inside.txt") || !strings.Contains(insideResponse.Body.String(), `>..</a>`) {
 					t.Fatalf("navigation through internal symlink = %d %s", insideResponse.Code, insideResponse.Body.String())
+				}
+				tableBodyIndex := strings.Index(insideResponse.Body.String(), `<tbody>`)
+				if tableBodyIndex == -1 {
+					t.Fatal("nested listing is missing the directory table body")
+				}
+				tableBody := insideResponse.Body.String()[tableBodyIndex:]
+				parentIndex := strings.Index(tableBody, `>..</a>`)
+				currentIndex := strings.Index(tableBody, `>.</a>`)
+				if parentIndex == -1 || currentIndex == -1 || parentIndex >= currentIndex {
+					t.Fatal("parent directory must appear above the current directory")
+				}
+				rootLink := regexp.MustCompile(`<a href="([^"]+)" title="Session root">\.</a>`).FindStringSubmatch(insideResponse.Body.String())
+				if len(rootLink) != 2 {
+					t.Fatal("nested listing is missing the confined-root breadcrumb link")
+				}
+				parsedRootLink, parseRootErr := url.Parse(html.UnescapeString(rootLink[1]))
+				if parseRootErr != nil || parsedRootLink.Query().Get("path") != fixture.root {
+					t.Fatalf("confined-root breadcrumb = %q, parsed as %#v, %v", rootLink[1], parsedRootLink, parseRootErr)
 				}
 				nestedFile := filepath.ToSlash(filepath.Join(fixture.root, "inside-link", "inside.txt"))
 				nestedResponse := request(app, http.MethodGet, "/download?path="+url.QueryEscape(nestedFile), nil)
@@ -287,18 +327,86 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				}
 			})
 
-			t.Run("safe and active preview headers", func(t *testing.T) {
-				textName := filepath.ToSlash(filepath.Join(fixture.root, "alpha.txt"))
-				textResponse := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(textName), nil)
-				if !strings.HasPrefix(textResponse.Header().Get("Content-Disposition"), "inline") {
-					t.Fatalf("text disposition = %q", textResponse.Header().Get("Content-Disposition"))
+			t.Run("preview MIME security and streaming", func(t *testing.T) {
+				textFiles := map[string]string{
+					"alpha.txt":   "0123456789",
+					"active.html": "<script>parent.pwned=true</script>",
+					"active.js":   "parent.pwned=true",
+					"active.svg":  "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>parent.pwned=true</script></svg>",
+					"config.xml":  "<?xml version=\"1.0\"?><root>value</root>",
+					"data.csv":    "name,value\nalpha,1\n",
+					"data.tsv":    "name\tvalue\nalpha\t1\n",
+					"figure.eps":  "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\n",
+					"paper.tex":   "\\documentclass{article}\n",
+					"README":      "extensionless text\n",
 				}
-				for _, activeName := range []string{"active.html", "active.svg", "active.js"} {
-					activePath := filepath.ToSlash(filepath.Join(fixture.root, activeName))
-					activeResponse := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(activePath), nil)
-					if !strings.HasPrefix(activeResponse.Header().Get("Content-Disposition"), "attachment") || activeResponse.Header().Get("X-Content-Type-Options") != "nosniff" {
-						t.Fatalf("%s response headers = %#v", activeName, activeResponse.Header())
+				for fileName, contents := range textFiles {
+					fileName, contents := fileName, contents
+					t.Run(fileName, func(t *testing.T) {
+						filePath := filepath.ToSlash(filepath.Join(fixture.root, fileName))
+						response := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(filePath), nil)
+						if response.Code != http.StatusOK || response.Body.String() != contents {
+							t.Fatalf("preview = %d %q", response.Code, response.Body.String())
+						}
+						if response.Header().Get("Content-Type") != "text/plain; charset=utf-8" || !strings.HasPrefix(response.Header().Get("Content-Disposition"), "inline") {
+							t.Fatalf("preview headers = %#v", response.Header())
+						}
+						csp := response.Header().Get("Content-Security-Policy")
+						for _, policy := range []string{"sandbox", "default-src 'none'", "script-src 'none'", "object-src 'none'", "form-action 'none'", "frame-ancestors 'none'"} {
+							if !strings.Contains(csp, policy) {
+								t.Errorf("preview CSP %q is missing %q", csp, policy)
+							}
+						}
+						if strings.Contains(csp, "unsafe-inline") || response.Header().Get("X-Content-Type-Options") != "nosniff" || response.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+							t.Fatalf("unsafe preview headers = %#v", response.Header())
+						}
+					})
+				}
+
+				for _, media := range []struct {
+					name        string
+					contentType string
+				}{
+					{name: "pixel.png", contentType: "image/png"},
+					{name: "preview.pdf", contentType: "application/pdf"},
+				} {
+					mediaPath := filepath.ToSlash(filepath.Join(fixture.root, media.name))
+					response := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(mediaPath), nil)
+					if response.Code != http.StatusOK || response.Header().Get("Content-Type") != media.contentType || !strings.HasPrefix(response.Header().Get("Content-Disposition"), "inline") {
+						t.Errorf("%s preview = %d headers %#v", media.name, response.Code, response.Header())
 					}
+				}
+
+				binaryPath := filepath.ToSlash(filepath.Join(fixture.root, "binary.dat"))
+				binaryResponse := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(binaryPath), nil)
+				if binaryResponse.Code != http.StatusOK || binaryResponse.Header().Get("Content-Type") != "application/octet-stream" || !strings.HasPrefix(binaryResponse.Header().Get("Content-Disposition"), "attachment") || binaryResponse.Body.String() != "\x00\x01\x02\x03\xff" {
+					t.Fatalf("binary preview fallback = %d headers %#v body %q", binaryResponse.Code, binaryResponse.Header(), binaryResponse.Body.String())
+				}
+
+				csvPath := filepath.ToSlash(filepath.Join(fixture.root, "data.csv"))
+				csvDownload := request(app, http.MethodGet, "/download?path="+url.QueryEscape(csvPath), nil)
+				if csvDownload.Header().Get("Content-Type") != "text/csv; charset=utf-8" || !strings.HasPrefix(csvDownload.Header().Get("Content-Disposition"), "attachment") {
+					t.Fatalf("CSV download headers = %#v", csvDownload.Header())
+				}
+
+				textPath := filepath.ToSlash(filepath.Join(fixture.root, "alpha.txt"))
+				rangeRequest := httptest.NewRequest(http.MethodGet, "/preview?path="+url.QueryEscape(textPath), nil)
+				rangeRequest.Host = testHost
+				rangeRequest.Header.Set("Range", "bytes=2-5")
+				rangeResponse := httptest.NewRecorder()
+				app.ServeHTTP(rangeResponse, rangeRequest)
+				if rangeResponse.Code != http.StatusPartialContent || rangeResponse.Body.String() != "2345" || rangeResponse.Header().Get("Content-Range") != "bytes 2-5/10" {
+					t.Fatalf("preview range = %d %q Content-Range %q", rangeResponse.Code, rangeResponse.Body.String(), rangeResponse.Header().Get("Content-Range"))
+				}
+				headResponse := request(app, http.MethodHead, "/preview?path="+url.QueryEscape(textPath), nil)
+				if headResponse.Code != http.StatusOK || headResponse.Body.Len() != 0 || headResponse.Header().Get("Content-Length") != "10" || headResponse.Header().Get("Content-Type") != "text/plain; charset=utf-8" {
+					t.Fatalf("preview HEAD = %d headers %#v body length %d", headResponse.Code, headResponse.Header(), headResponse.Body.Len())
+				}
+
+				directPath := filepath.ToSlash(filepath.Join(fixture.root, "README"))
+				directResponse := request(app, http.MethodGet, "/?path="+url.QueryEscape(directPath), nil)
+				if directResponse.Code != http.StatusOK || directResponse.Header().Get("Content-Type") != "text/plain; charset=utf-8" || !strings.Contains(directResponse.Header().Get("Content-Security-Policy"), "sandbox") {
+					t.Fatalf("direct file preview = %d headers %#v", directResponse.Code, directResponse.Header())
 				}
 			})
 
@@ -400,7 +508,7 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 }
 
 func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
-	pathIndex := strings.Index(directoryTemplate, `Path: {{range`)
+	pathIndex := strings.Index(directoryTemplate, `class="header-path"`)
 	uploadIndex := strings.Index(directoryTemplate, `id="drop-zone"`)
 	headerIndex := strings.Index(directoryTemplate, `<tr><th align="left"`)
 	if pathIndex == -1 || uploadIndex == -1 || headerIndex == -1 || !(pathIndex < uploadIndex && uploadIndex < headerIndex) {
@@ -421,6 +529,9 @@ func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 		`pasteName.value = file.name || defaultPasteName(file.type)`,
 		`xhr.upload.addEventListener('progress'`,
 		`dz.addEventListener('drop'`,
+		`class="upload-hint">or drag files here</span>`,
+		`tbody tr:hover td`,
+		`class="page-header"`,
 	} {
 		if !strings.Contains(directoryTemplate, want) {
 			t.Errorf("directory template is missing %q", want)
@@ -428,6 +539,63 @@ func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 	}
 	if strings.Contains(directoryTemplate, `items[index].type.indexOf('image/')`) {
 		t.Error("paste upload must not reject non-image clipboard files")
+	}
+	if strings.Contains(directoryTemplate, `border: 2px dashed #999`) {
+		t.Error("upload toolbar still contains the old always-visible drop-zone border")
+	}
+}
+
+func TestDirectoryFontSizeAndDensity(t *testing.T) {
+	root := createFixture(t)
+	for _, test := range []struct {
+		name     string
+		fontSize int
+		want     string
+	}{
+		{name: "default", want: "14px"},
+		{name: "custom", fontSize: 18, want: "18px"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			app, err := New(Options{
+				Backend: filesystem.Local{}, Root: root, SSHHost: "lab",
+				Title: "Files", AllowedHost: testHost, FontSize: test.fontSize,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := request(app, http.MethodGet, "/", nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			if !strings.Contains(body, "font-size: "+test.want+"; }") {
+				t.Fatalf("directory CSS does not contain font size %s", test.want)
+			}
+			if !strings.Contains(body, "button, input, select, textarea { font-size: inherit; }") {
+				t.Fatal("form controls do not inherit the configured font size")
+			}
+		})
+	}
+	for _, want := range []string{
+		"table { width: 100%; border-collapse: collapse; font-size: 0.95em; }",
+		"th { padding: 0.23em 0.5em;",
+		"td { padding: 0.21em 0.5em;",
+		".icon-button { padding: 0.15em;",
+		"width: 1.3em; height: 1.3em;",
+	} {
+		if !strings.Contains(directoryTemplate, want) {
+			t.Errorf("directory template is missing compact font/height rule %q", want)
+		}
+	}
+
+	for _, fontSize := range []int{7, 73} {
+		_, err := New(Options{
+			Backend: filesystem.Local{}, Root: root, SSHHost: "lab",
+			Title: "Files", AllowedHost: testHost, FontSize: fontSize,
+		})
+		if err == nil || !strings.Contains(err.Error(), "font size must be between 8 and 72 pixels") {
+			t.Errorf("New with font size %d error = %v", fontSize, err)
+		}
 	}
 }
 
@@ -508,7 +676,7 @@ func TestOptionalUIActions(t *testing.T) {
 
 	listing := request(app, http.MethodGet, "/", nil)
 	body := listing.Body.String()
-	for _, want := range []string{"Create folder", "Show hidden items", "Copy current path", "TensorBoard", ">Launch</button>", "LaTeX tools", ">Table<", ">Figure<", ">Preview<", `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
+	for _, want := range []string{"+ New folder", "Show hidden items", "Copy path", ">Actions</th>", "/assets/apps/tensorboard.png", `aria-label="LaTeX tools"`, `title="Launch TensorBoard"`, `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("enhanced listing is missing %q", want)
 		}
@@ -516,15 +684,15 @@ func TestOptionalUIActions(t *testing.T) {
 	if strings.Contains(body, ".hidden.txt") {
 		t.Fatal("hidden item is visible by default")
 	}
-	if got := strings.Count(body, `class="copy-snippet"`); got != 4 {
-		t.Fatalf("copy snippet button count = %d, want 4", got)
+	if got := strings.Count(body, `class="copy-snippet icon-button"`); got != 8 {
+		t.Fatalf("copy snippet button count = %d, want 8", got)
 	}
-	if got := strings.Count(body, `class="open-live"`); got != 1 {
-		t.Fatalf("live button count = %d, want 1", got)
+	if got := strings.Count(body, `class="open-live icon-button"`); got != 2 {
+		t.Fatalf("live button count = %d, want 2", got)
 	}
-	for _, button := range []string{">Table</button>", ">Figure</button>", ">Preview</button>"} {
-		if !strings.Contains(body, button) {
-			t.Errorf("enhanced listing is missing button %q", button)
+	for _, button := range []string{">Table</button>", ">Figure</button>"} {
+		if strings.Contains(body, button) {
+			t.Errorf("enhanced listing still contains text button %q", button)
 		}
 	}
 	shown := request(app, http.MethodGet, "/?hidden=1", nil)
@@ -562,12 +730,19 @@ func TestOptionalUIActions(t *testing.T) {
 	}
 
 	live := request(app, http.MethodGet, "/live?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
-	if live.Code != http.StatusOK || !strings.Contains(live.Body.String(), "watching every 2 seconds") {
+	if live.Code != http.StatusOK || !strings.Contains(live.Body.String(), `data-initial-ready="true"`) {
 		t.Fatalf("live PDF response = %d %s", live.Code, live.Body.String())
 	}
+	if liveBody := live.Body.String(); !strings.Contains(liveBody, `id="pageNumber"`) || !strings.Contains(liveBody, `id="viewer" class="pdfViewer"`) || !strings.Contains(liveBody, `src="/live/assets/live-v2.mjs"`) || strings.Contains(liveBody, "<iframe") {
+		t.Fatalf("live PDF does not use the controlled PDF.js viewer: %s", liveBody)
+	}
 	preview := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
-	if preview.Code != http.StatusOK || preview.Header().Get("X-Frame-Options") != "SAMEORIGIN" || !strings.Contains(preview.Header().Get("Content-Security-Policy"), "frame-ancestors 'self'") {
-		t.Fatalf("live PDF preview framing policy = %d X-Frame-Options %q CSP %q", preview.Code, preview.Header().Get("X-Frame-Options"), preview.Header().Get("Content-Security-Policy"))
+	if preview.Code != http.StatusOK || preview.Header().Get("X-Frame-Options") != "DENY" || !strings.Contains(preview.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Fatalf("PDF preview framing policy = %d X-Frame-Options %q CSP %q", preview.Code, preview.Header().Get("X-Frame-Options"), preview.Header().Get("Content-Security-Policy"))
+	}
+	textPreview := request(app, http.MethodGet, "/preview?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "alpha.txt"))), nil)
+	if textPreview.Header().Get("X-Frame-Options") != "DENY" || !strings.Contains(textPreview.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Fatalf("non-PDF preview framing policy = X-Frame-Options %q CSP %q", textPreview.Header().Get("X-Frame-Options"), textPreview.Header().Get("Content-Security-Policy"))
 	}
 	status := request(app, http.MethodGet, "/live/status?path="+url.QueryEscape(filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "report.pdf"))), nil)
 	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"version"`) || !strings.Contains(status.Body.String(), `"ready":true`) {
@@ -579,7 +754,7 @@ func TestOptionalUIActions(t *testing.T) {
 	}
 	incompleteURL := "/live?path=" + url.QueryEscape(filepath.ToSlash(incompleteName))
 	incompleteLive := request(app, http.MethodGet, incompleteURL, nil)
-	if incompleteLive.Code != http.StatusOK || !strings.Contains(incompleteLive.Body.String(), "waiting for PDF compilation") || strings.Contains(incompleteLive.Body.String(), `src="/preview`) {
+	if incompleteLive.Code != http.StatusOK || !strings.Contains(incompleteLive.Body.String(), "waiting for PDF compilation") || !strings.Contains(incompleteLive.Body.String(), `data-initial-ready="false"`) {
 		t.Fatalf("incomplete live PDF response = %d %s", incompleteLive.Code, incompleteLive.Body.String())
 	}
 	incompleteStatus := request(app, http.MethodGet, "/live/status?path="+url.QueryEscape(filepath.ToSlash(incompleteName)), nil)
@@ -623,8 +798,8 @@ func TestOptionalUIActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	latexOnlyBody := request(latexOnly, http.MethodGet, "/", nil).Body.String()
-	if !strings.Contains(latexOnlyBody, `colspan="8"`) || strings.Contains(latexOnlyBody, `<th align="right">TensorBoard</th>`) {
-		t.Fatal("LaTeX-only mode does not add exactly three columns")
+	if !strings.Contains(latexOnlyBody, `colspan="1">Actions</th>`) || !strings.Contains(latexOnlyBody, `colspan="3" aria-label="LaTeX tools"`) {
+		t.Fatal("LaTeX-only mode does not use fixed Download, Preview, Table, and Figure columns")
 	}
 }
 
@@ -652,11 +827,11 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	}
 
 	listing := request(app, http.MethodGet, "/", nil)
-	if got := strings.Count(listing.Body.String(), ">Launch</button>"); got != 1 {
-		t.Fatalf("Launch button count = %d, want 1; body = %s", got, listing.Body.String())
+	if got := strings.Count(listing.Body.String(), `aria-label="Launch TensorBoard"`); got != 1 {
+		t.Fatalf("TensorBoard icon count = %d, want 1; body = %s", got, listing.Body.String())
 	}
-	if strings.Contains(listing.Body.String(), ">TensorBoard</button>") {
-		t.Fatal("legacy TensorBoard button label is still present")
+	if strings.Contains(listing.Body.String(), ">Launch</button>") || strings.Contains(listing.Body.String(), ">TensorBoard</button>") {
+		t.Fatal("legacy visible launcher button label is still present")
 	}
 
 	emptyRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(empty)), nil)
@@ -759,7 +934,7 @@ func TestTensorBoardProxyRewritesOriginForBackend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy := newTensorBoardReverseProxy(target)
+	proxy := newTensorBoardReverseProxy(target, "secret-token")
 	request := httptest.NewRequest(http.MethodPost, "http://"+testHost+"/tensorboard/session/data/plugin", nil)
 	request.Host = testHost
 	request.Header.Set("Origin", "http://"+testHost)
@@ -770,19 +945,22 @@ func TestTensorBoardProxyRewritesOriginForBackend(t *testing.T) {
 	if got, want := request.Header.Get("Origin"), "http://"+target.Host; got != want {
 		t.Fatalf("proxied Origin = %q, want %q", got, want)
 	}
+	if got := request.Header.Get("Authorization"); got != "Bearer secret-token" {
+		t.Fatalf("proxied Authorization = %q", got)
+	}
 }
 
 func TestLaTeXSnippets(t *testing.T) {
 	figure := "\\begin{figure}[htbp]\n" +
 		"  \\centering\n" +
 		"  \\includegraphics[width=1.00\\textwidth]{\\detokenize{/paper/Figure One.PNG}}\n" +
-		"  \\caption{}\n" +
+		"  % \\caption{}\n" +
 		"  % \\label{fig:figure-one}\n" +
 		"\\end{figure}"
 	table := "\\begin{table}[htbp]\n" +
 		"  \\centering\n" +
 		"  \\csvautotabular[separator=tab]{\\detokenize{/paper/Data Set.TSV}}\n" +
-		"  \\caption{}\n" +
+		"  % \\caption{}\n" +
 		"  % \\label{tab:data-set}\n" +
 		"\\end{table}"
 
@@ -898,7 +1076,7 @@ func TestConfiguredSymlinkRootRemainsLogical(t *testing.T) {
 	}
 	app := newTestApp(t, backendFixture{backend: filesystem.Local{}, root: filepath.ToSlash(logicalRoot)}, nil)
 	listing := request(app, http.MethodGet, "/", nil)
-	if listing.Code != http.StatusOK || !strings.Contains(listing.Body.String(), "Root: <strong>"+filepath.ToSlash(logicalRoot)+"</strong>") || !strings.Contains(listing.Body.String(), "note.txt") {
+	if listing.Code != http.StatusOK || !strings.Contains(listing.Body.String(), `data-path="`+filepath.ToSlash(logicalRoot)+`"`) || !strings.Contains(listing.Body.String(), "note.txt") {
 		t.Fatalf("logical symlink root listing = %d %s", listing.Code, listing.Body.String())
 	}
 	logicalFile := filepath.ToSlash(filepath.Join(logicalRoot, "note.txt"))
@@ -1077,6 +1255,90 @@ func closeFixtures(fixtures []backendFixture) {
 	}
 }
 
+func TestPreviewContentTypePolicy(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+	for _, test := range []struct {
+		name        string
+		fileName    string
+		sample      []byte
+		contentType string
+		inline      bool
+	}{
+		{name: "extensionless text", fileName: "README", sample: []byte("plain text\n"), contentType: "text/plain; charset=utf-8", inline: true},
+		{name: "HTML disguised as PNG", fileName: "payload.png", sample: []byte("<script>alert(1)</script>"), contentType: "text/plain; charset=utf-8", inline: true},
+		{name: "PNG disguised as HTML remains source", fileName: "payload.HTML", sample: png, contentType: "text/plain; charset=utf-8", inline: true},
+		{name: "PostScript source", fileName: "figure.eps", sample: []byte("%!PS-Adobe-3.0"), contentType: "text/plain; charset=utf-8", inline: true},
+		{name: "signature detected PNG", fileName: "image.unknown", sample: png, contentType: "image/png", inline: true},
+		{name: "signature detected PDF", fileName: "paper.unknown", sample: []byte("%PDF-1.7\n"), contentType: "application/pdf", inline: true},
+		{name: "AVIF extension fallback", fileName: "image.avif", sample: []byte("\x00\x01\x02\x03"), contentType: "image/avif", inline: true},
+		{name: "archive fails closed", fileName: "archive.zip", sample: []byte("PK\x03\x04payload"), contentType: "application/octet-stream", inline: false},
+		{name: "WASM fails closed", fileName: "module.wasm", sample: []byte("\x00asm\x01\x00\x00\x00"), contentType: "application/octet-stream", inline: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			contentType, inline := previewContentType(test.fileName, test.sample)
+			if contentType != test.contentType || inline != test.inline {
+				t.Fatalf("previewContentType(%q) = %q, %v; want %q, %v", test.fileName, contentType, inline, test.contentType, test.inline)
+			}
+		})
+	}
+}
+
+func TestPreviewRejectsNonRegularFilesAndReadFailures(t *testing.T) {
+	readFailure := errors.New("read failed")
+	seekFailure := errors.New("seek failed")
+	for _, test := range []struct {
+		name       string
+		info       fs.FileInfo
+		open       func() (filesystem.ReadSeekCloser, error)
+		wantStatus int
+		wantOpen   bool
+	}{
+		{
+			name:       "named pipe",
+			info:       fixedFileInfo{name: "pipe", mode: fs.ModeNamedPipe},
+			open:       func() (filesystem.ReadSeekCloser, error) { return nil, errors.New("must not open") },
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "read error",
+			info: fixedFileInfo{name: "file", mode: 0o600, size: 1},
+			open: func() (filesystem.ReadSeekCloser, error) {
+				return &stubReadSeekCloser{read: func([]byte) (int, error) { return 0, readFailure }}, nil
+			},
+			wantStatus: http.StatusBadGateway,
+			wantOpen:   true,
+		},
+		{
+			name: "seek error",
+			info: fixedFileInfo{name: "file", mode: 0o600, size: 1},
+			open: func() (filesystem.ReadSeekCloser, error) {
+				reader := bytes.NewReader([]byte("x"))
+				return &stubReadSeekCloser{
+					read: reader.Read,
+					seek: func(int64, int) (int64, error) { return 0, seekFailure },
+				}, nil
+			},
+			wantStatus: http.StatusBadGateway,
+			wantOpen:   true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := &previewTestBackend{info: test.info, open: test.open}
+			app, err := New(Options{Backend: backend, Root: "/root", SSHHost: "test", AllowedHost: testHost})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := request(app, http.MethodGet, "/preview?path=/root/file", nil)
+			if response.Code != test.wantStatus || backend.opened.Load() != test.wantOpen {
+				t.Fatalf("response = %d, opened = %v; want %d, %v", response.Code, backend.opened.Load(), test.wantStatus, test.wantOpen)
+			}
+			if !strings.Contains(response.Header().Get("Content-Security-Policy"), "sandbox") {
+				t.Fatalf("preview error is missing sandbox CSP: %#v", response.Header())
+			}
+		})
+	}
+}
+
 func TestBackendErrorsAreSanitized(t *testing.T) {
 	root := createFixture(t)
 	for _, test := range []struct {
@@ -1179,4 +1441,82 @@ type statErrorBackend struct {
 
 func (b statErrorBackend) Stat(context.Context, string) (fs.FileInfo, error) {
 	return nil, b.err
+}
+
+type fixedFileInfo struct {
+	name string
+	size int64
+	mode fs.FileMode
+}
+
+func (i fixedFileInfo) Name() string       { return i.name }
+func (i fixedFileInfo) Size() int64        { return i.size }
+func (i fixedFileInfo) Mode() fs.FileMode  { return i.mode }
+func (i fixedFileInfo) ModTime() time.Time { return time.Time{} }
+func (i fixedFileInfo) IsDir() bool        { return i.mode.IsDir() }
+func (i fixedFileInfo) Sys() any           { return nil }
+
+type previewTestBackend struct {
+	filesystem.Backend
+	info   fs.FileInfo
+	open   func() (filesystem.ReadSeekCloser, error)
+	opened atomic.Bool
+}
+
+func (b *previewTestBackend) Stat(context.Context, string) (fs.FileInfo, error) {
+	return b.info, nil
+}
+
+func (b *previewTestBackend) Open(context.Context, string) (filesystem.ReadSeekCloser, error) {
+	b.opened.Store(true)
+	return b.open()
+}
+
+type stubReadSeekCloser struct {
+	read func([]byte) (int, error)
+	seek func(int64, int) (int64, error)
+}
+
+func (f *stubReadSeekCloser) Read(buffer []byte) (int, error) {
+	return f.read(buffer)
+}
+
+func (f *stubReadSeekCloser) Seek(offset int64, whence int) (int64, error) {
+	if f.seek == nil {
+		return offset, nil
+	}
+	return f.seek(offset, whence)
+}
+
+func (f *stubReadSeekCloser) Close() error { return nil }
+
+func TestUploadsFinishWithPrivatePermissions(t *testing.T) {
+	for _, fixture := range fixtures(t) {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) {
+			defer fixture.close()
+			ctx := context.Background()
+			name := filepath.ToSlash(filepath.Join(fixture.root, "uploaded.txt"))
+			if _, err := fixture.backend.Upload(ctx, name, strings.NewReader("secret"), false); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("new upload mode = %#o, want 0600", info.Mode().Perm())
+			}
+			if _, err := fixture.backend.Upload(ctx, name, strings.NewReader("replacement"), true); err != nil {
+				t.Fatal(err)
+			}
+			info, err = os.Stat(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("replaced upload mode = %#o, want 0600", info.Mode().Perm())
+			}
+		})
+	}
 }

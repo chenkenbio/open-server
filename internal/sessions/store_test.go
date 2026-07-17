@@ -24,22 +24,24 @@ func TestStoreAddResolveListAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	tensorBoard := true
+	jupyter := true
 	latex := true
 	python := "/env/bin/python"
 	title := "Project dashboard"
-	if err := store.Add("production", "prod:/srv/new-app", Options{TensorBoard: &tensorBoard, Python: &python, LaTeX: &latex, Title: &title}); err != nil {
+	fontSize := 18
+	if err := store.Add("production", "prod:/srv/new-app", Options{TensorBoard: &tensorBoard, Jupyter: &jupyter, Python: &python, LaTeX: &latex, Title: &title, FontSize: &fontSize}); err != nil {
 		t.Fatal(err)
 	}
 
 	resolved, err := store.Resolve("production")
-	if err != nil || resolved.Target != "prod:/srv/new-app" || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title {
+	if err != nil || resolved.Target != "prod:/srv/new-app" || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Jupyter == nil || !*resolved.Options.Jupyter || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title || resolved.Options.FontSize == nil || *resolved.Options.FontSize != fontSize {
 		t.Fatalf("Resolve(production) = %#v, %v", resolved, err)
 	}
 	if err := store.UpdatePort("production", 61234); err != nil {
 		t.Fatal(err)
 	}
 	resolved, err = store.Resolve("production")
-	if err != nil || resolved.Options.Port == nil || *resolved.Options.Port != 61234 || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title {
+	if err != nil || resolved.Options.Port == nil || *resolved.Options.Port != 61234 || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Jupyter == nil || !*resolved.Options.Jupyter || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title || resolved.Options.FontSize == nil || *resolved.Options.FontSize != fontSize {
 		t.Fatalf("Resolve(production) after UpdatePort = %#v, %v", resolved, err)
 	}
 	ports, err := store.ReservedPorts("")
@@ -77,7 +79,7 @@ func TestStoreAddResolveListAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(contents)
-	if !strings.Contains(text, "version: 1") || !strings.Contains(text, "production:") || !strings.Contains(text, "target: prod:/srv/new-app") || !strings.Contains(text, "port: 61234") || !strings.Contains(text, "tensorboard: true") || !strings.Contains(text, "python-interpreter: /env/bin/python") || !strings.Contains(text, "latex: true") || !strings.Contains(text, "title: Project dashboard") || strings.Contains(text, "development:") {
+	if !strings.Contains(text, "version: 1") || !strings.Contains(text, "production:") || !strings.Contains(text, "target: prod:/srv/new-app") || !strings.Contains(text, "port: 61234") || !strings.Contains(text, "fontsize: 18") || !strings.Contains(text, "tensorboard: true") || !strings.Contains(text, "jupyter: true") || !strings.Contains(text, "python-interpreter: /env/bin/python") || !strings.Contains(text, "latex: true") || !strings.Contains(text, "title: Project dashboard") || strings.Contains(text, "development:") {
 		t.Fatalf("saved YAML = %q", text)
 	}
 	info, err := os.Stat(path)
@@ -157,6 +159,39 @@ func TestStoreMissingAndInvalidData(t *testing.T) {
 	}
 	if err := store.Add("valid", "not-a-target", Options{}); err == nil {
 		t.Fatal("Add with invalid target succeeded")
+	}
+	for _, fontSize := range []int{7, 73} {
+		if err := store.Add("bad-fontsize", "lab:/tmp", Options{FontSize: &fontSize}); err == nil || !strings.Contains(err.Error(), "fontsize must be between 8 and 72") {
+			t.Errorf("Add with fontsize %d error = %v", fontSize, err)
+		}
+	}
+}
+
+func TestStoreLoadsOlderConfigWithoutFontSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "saved-sessions.yaml")
+	contents := "version: 1\nsessions:\n  work:\n    target: lab:/tmp\n    options:\n      title: Files\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := (Store{Path: path}).Resolve("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Options.FontSize != nil {
+		t.Fatalf("older config font size = %#v, want nil", entry.Options.FontSize)
+	}
+}
+
+func TestStoreRejectsOutOfRangeSavedFontSize(t *testing.T) {
+	for _, fontSize := range []string{"7", "73"} {
+		path := filepath.Join(t.TempDir(), "saved-sessions.yaml")
+		contents := "version: 1\nsessions:\n  work:\n    target: lab:/tmp\n    options:\n      fontsize: " + fontSize + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := (Store{Path: path}).Resolve("work"); err == nil || !strings.Contains(err.Error(), "fontsize must be between 8 and 72") {
+			t.Errorf("Resolve with fontsize %s error = %v", fontSize, err)
+		}
 	}
 }
 

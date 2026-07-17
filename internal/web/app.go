@@ -25,19 +25,29 @@ import (
 	"time"
 
 	"open-server/internal/filesystem"
+	"open-server/internal/jupyter"
 	"open-server/internal/tensorboard"
 )
 
+const DefaultFontSize = 14
+
+const MinFontSize = 8
+
+const MaxFontSize = 72
+
 type Options struct {
-	Backend     filesystem.Backend
-	Root        string
-	SSHHost     string
-	Title       string
-	AllowedHost string
-	AccessToken string
-	HTTPClient  *http.Client
-	TensorBoard tensorboard.Launcher
-	LaTeX       bool
+	Backend       filesystem.Backend
+	Root          string
+	SSHHost       string
+	Title         string
+	AllowedHost   string
+	AccessToken   string
+	HTTPClient    *http.Client
+	TensorBoard   tensorboard.Launcher
+	Jupyter       jupyter.Launcher
+	DefaultPython string
+	LaTeX         bool
+	FontSize      int
 }
 
 var errOutsideRoot = errors.New("path is outside the configured root")
@@ -49,26 +59,45 @@ type tensorBoardLaunch struct {
 	err    error
 }
 
+type jupyterLaunch struct {
+	id     string
+	prefix string
+	ready  chan struct{}
+	err    error
+}
+
 type App struct {
-	backend     filesystem.Backend
-	root        string
-	sshHost     string
-	title       string
-	allowedHost string
-	accessToken string
-	csrfToken   string
-	httpClient  *http.Client
-	tensorBoard tensorboard.Launcher
-	latex       bool
-	tensorMu    sync.RWMutex
-	tensorProxy map[string]http.Handler
-	tensorByDir map[string]*tensorBoardLaunch
-	template    *template.Template
+	backend       filesystem.Backend
+	root          string
+	sshHost       string
+	title         string
+	allowedHost   string
+	accessToken   string
+	csrfToken     string
+	httpClient    *http.Client
+	tensorBoard   tensorboard.Launcher
+	jupyter       jupyter.Launcher
+	defaultPython string
+	latex         bool
+	fontSize      int
+	tensorMu      sync.RWMutex
+	tensorProxy   map[string]http.Handler
+	tensorByDir   map[string]*tensorBoardLaunch
+	jupyterMu     sync.RWMutex
+	jupyterProxy  map[string]http.Handler
+	jupyterByKey  map[string]*jupyterLaunch
+	template      *template.Template
 }
 
 func New(options Options) (*App, error) {
 	if options.Backend == nil || options.AllowedHost == "" {
 		return nil, errors.New("backend and allowed host are required")
+	}
+	if options.FontSize == 0 {
+		options.FontSize = DefaultFontSize
+	}
+	if options.FontSize < MinFontSize || options.FontSize > MaxFontSize {
+		return nil, fmt.Errorf("font size must be between %d and %d pixels", MinFontSize, MaxFontSize)
 	}
 	if options.AccessToken != "" && len(options.AccessToken) < 8 {
 		return nil, errors.New("access token must be at least 8 characters")
@@ -93,7 +122,7 @@ func New(options Options) (*App, error) {
 		}
 	}
 	csrfToken := ""
-	if options.TensorBoard != nil {
+	if options.TensorBoard != nil || options.Jupyter != nil {
 		var token [16]byte
 		if _, err := rand.Read(token[:]); err != nil {
 			return nil, fmt.Errorf("create request token: %w", err)
@@ -108,19 +137,24 @@ func New(options Options) (*App, error) {
 		return nil, err
 	}
 	return &App{
-		backend:     options.Backend,
-		root:        root,
-		sshHost:     options.SSHHost,
-		title:       options.Title,
-		allowedHost: options.AllowedHost,
-		accessToken: options.AccessToken,
-		csrfToken:   csrfToken,
-		httpClient:  options.HTTPClient,
-		tensorBoard: options.TensorBoard,
-		latex:       options.LaTeX,
-		tensorProxy: make(map[string]http.Handler),
-		tensorByDir: make(map[string]*tensorBoardLaunch),
-		template:    tmpl,
+		backend:       options.Backend,
+		root:          root,
+		sshHost:       options.SSHHost,
+		title:         options.Title,
+		allowedHost:   options.AllowedHost,
+		accessToken:   options.AccessToken,
+		csrfToken:     csrfToken,
+		httpClient:    options.HTTPClient,
+		tensorBoard:   options.TensorBoard,
+		jupyter:       options.Jupyter,
+		defaultPython: strings.TrimSpace(options.DefaultPython),
+		latex:         options.LaTeX,
+		fontSize:      options.FontSize,
+		tensorProxy:   make(map[string]http.Handler),
+		tensorByDir:   make(map[string]*tensorBoardLaunch),
+		jupyterProxy:  make(map[string]http.Handler),
+		jupyterByKey:  make(map[string]*jupyterLaunch),
+		template:      tmpl,
 	}, nil
 }
 
@@ -134,9 +168,15 @@ func (a *App) URL() string {
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route := r.URL.Path
-	proxyRoute := strings.HasPrefix(r.URL.Path, "/tensorboard/")
+	proxyRoute := isAppProxyRoute(r.URL.Path)
 	if !proxyRoute {
-		a.securityHeaders(w, a.latex && route == "/preview")
+		if route == "/live" {
+			a.liveSecurityHeaders(w)
+		} else if route == "/preview" {
+			a.previewSecurityHeaders(w, false)
+		} else {
+			a.securityHeaders(w, false)
+		}
 	}
 	if r.Host != a.allowedHost {
 		http.Error(w, "invalid Host header", http.StatusMisdirectedRequest)
@@ -150,7 +190,19 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if proxyRoute {
-		a.serveTensorBoard(w, r)
+		if strings.HasPrefix(route, "/jupyter/") {
+			a.serveJupyter(w, r)
+		} else {
+			a.serveTensorBoard(w, r)
+		}
+		return
+	}
+	if strings.HasPrefix(route, appAssetRoutePrefix) {
+		a.serveAppAsset(w, r)
+		return
+	}
+	if strings.HasPrefix(route, liveAssetRoutePrefix) {
+		a.serveLiveAsset(w, r)
 		return
 	}
 
@@ -197,6 +249,12 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.startTensorBoard(w, r)
+	case "/jupyter":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		a.startJupyter(w, r)
 	case "/live":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w, http.MethodGet, http.MethodHead)
@@ -212,6 +270,18 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func isAppProxyRoute(name string) bool {
+	for _, prefix := range []string{"/tensorboard/", "/jupyter/"} {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		remainder := strings.TrimPrefix(name, prefix)
+		id := strings.SplitN(remainder, "/", 2)[0]
+		return id != ""
+	}
+	return false
 }
 
 const authCookieMaxAge = 12 * 60 * 60
@@ -272,6 +342,32 @@ func (a *App) securityHeaders(w http.ResponseWriter, allowSameOriginFrame bool) 
 	w.Header().Set("X-Frame-Options", frameOptions)
 }
 
+func (a *App) previewSecurityHeaders(w http.ResponseWriter, allowSameOriginFrame bool) {
+	frameAncestors := "'none'"
+	frameOptions := "DENY"
+	if allowSameOriginFrame {
+		frameAncestors = "'self'"
+		frameOptions = "SAMEORIGIN"
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; script-src 'none'; object-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors "+frameAncestors)
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", frameOptions)
+}
+
+// liveSecurityHeaders restrict the same-origin PDF.js application while
+// allowing only its modules, worker, fetched PDF data, and rendering assets.
+func (a *App) liveSecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self' data: blob:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+}
+
 func isStateChanging(method string) bool {
 	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
@@ -286,7 +382,7 @@ func (a *App) validStateChangingRequest(r *http.Request) bool {
 	if a.validOrigin(r) {
 		return true
 	}
-	if r.URL.Path != "/tensorboard" || a.csrfToken == "" || r.ParseForm() != nil {
+	if (r.URL.Path != "/tensorboard" && r.URL.Path != "/jupyter") || a.csrfToken == "" || r.ParseForm() != nil {
 		return false
 	}
 	got := []byte(r.PostForm.Get("csrf"))
@@ -297,6 +393,7 @@ func (a *App) validStateChangingRequest(r *http.Request) bool {
 type directoryView struct {
 	Title              string
 	SSHHost            string
+	FontSize           int
 	PlainHTTPWarning   bool
 	RootPath           string
 	CurrentPath        string
@@ -307,8 +404,11 @@ type directoryView struct {
 	HiddenToggleLabel  string
 	ShowHidden         bool
 	TensorBoardEnabled bool
+	JupyterEnabled     bool
+	DefaultPython      string
 	CSRFToken          string
 	LaTeXEnabled       bool
+	ActionColumnCount  int
 	ColumnCount        int
 	NameSortURL        string
 	ModifiedSortURL    string
@@ -317,9 +417,13 @@ type directoryView struct {
 	ModifiedSortMarker string
 	SizeSortMarker     string
 	HasParent          bool
+	CurrentURL         string
+	CurrentTensorBoard string
+	CurrentJupyter     string
 	ParentPath         string
 	ParentURL          string
 	ParentTensorBoard  string
+	ParentJupyter      string
 	Breadcrumbs        []breadcrumbView
 	Entries            []entryView
 }
@@ -335,6 +439,7 @@ type entryView struct {
 	URL           string
 	Download      string
 	TensorBoard   string
+	Jupyter       string
 	TableSnippet  string
 	FigureSnippet string
 	LiveURL       string
@@ -344,7 +449,6 @@ type entryView struct {
 	IsLink        bool
 	Broken        bool
 	LinkTarget    string
-	Preview       bool
 }
 
 func (a *App) browse(w http.ResponseWriter, r *http.Request) {
@@ -359,7 +463,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !info.IsDir() {
-		a.serveNamedFile(w, r, current, previewable(current))
+		a.serveNamedFile(w, r, current, true)
 		return
 	}
 	entries, err := a.backend.ReadDir(r.Context(), current)
@@ -367,6 +471,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		a.pathError(w, err)
 		return
 	}
+	currentHasTensorBoard := a.tensorBoard != nil && hasTensorBoardEvents(entries)
 	showHidden := r.URL.Query().Get("hidden") == "1"
 	if !showHidden {
 		visible := entries[:0]
@@ -390,6 +495,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	view := directoryView{
 		Title:              a.title,
 		SSHHost:            a.sshHost,
+		FontSize:           a.fontSize,
 		PlainHTTPWarning:   a.accessToken != "",
 		RootPath:           a.root,
 		CurrentPath:        current,
@@ -399,6 +505,8 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		HiddenToggleURL:    a.appURL("/", current, sortKey, order, !showHidden),
 		ShowHidden:         showHidden,
 		TensorBoardEnabled: a.tensorBoard != nil,
+		JupyterEnabled:     a.jupyter != nil,
+		DefaultPython:      a.defaultPython,
 		CSRFToken:          a.csrfToken,
 		LaTeXEnabled:       a.latex,
 		NameSortURL:        a.sortURL(current, sortKey, order, "name", showHidden),
@@ -411,16 +519,27 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	if showHidden {
 		view.HiddenToggleLabel = "Hide hidden items"
 	}
-	view.ColumnCount = 5
-	if view.TensorBoardEnabled {
-		view.ColumnCount++
+	view.ActionColumnCount = 1
+	if view.JupyterEnabled {
+		view.ActionColumnCount++
 	}
+	if view.TensorBoardEnabled {
+		view.ActionColumnCount++
+	}
+	view.ColumnCount = 4 + view.ActionColumnCount
 	if view.LaTeXEnabled {
 		view.ColumnCount += 3
 	}
 	view.NameSortMarker = sortMarker(sortKey, order, "name")
 	view.ModifiedSortMarker = sortMarker(sortKey, order, "modified")
 	view.SizeSortMarker = sortMarker(sortKey, order, "size")
+	view.CurrentURL = a.appURL("/", current, sortKey, order, showHidden)
+	if currentHasTensorBoard {
+		view.CurrentTensorBoard = a.appURL("/tensorboard", current, "", "", showHidden)
+	}
+	if a.jupyter != nil {
+		view.CurrentJupyter = a.appURL("/jupyter", current, "", "", showHidden)
+	}
 	if current != a.root {
 		view.HasParent = true
 		view.ParentPath = path.Dir(current)
@@ -428,21 +547,26 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		if a.tensorBoard != nil && a.directoryHasTensorBoardEvents(r.Context(), view.ParentPath) {
 			view.ParentTensorBoard = a.appURL("/tensorboard", view.ParentPath, "", "", showHidden)
 		}
+		if a.jupyter != nil {
+			view.ParentJupyter = a.appURL("/jupyter", view.ParentPath, "", "", showHidden)
+		}
 	}
 	for _, entry := range entries {
 		fullName, childErr := filesystem.Child(current, entry.Name)
 		if childErr != nil {
 			continue
 		}
-		entryURL := a.appURL("/download", fullName, "", "", showHidden)
+		entryURL := a.appURL("/preview", fullName, "", "", showHidden)
 		if entry.IsDir() {
 			entryURL = a.appURL("/", fullName, sortKey, order, showHidden)
-		} else if previewable(fullName) {
-			entryURL = a.appURL("/preview", fullName, "", "", showHidden)
 		}
 		tensorBoardURL := ""
 		if entry.IsDir() && a.tensorBoard != nil && a.directoryHasTensorBoardEvents(r.Context(), fullName) {
 			tensorBoardURL = a.appURL("/tensorboard", fullName, "", "", showHidden)
+		}
+		jupyterURL := ""
+		if entry.IsDir() && a.jupyter != nil {
+			jupyterURL = a.appURL("/jupyter", fullName, "", "", showHidden)
 		}
 		figureSnippet, tableSnippet := "", ""
 		liveURL := ""
@@ -458,6 +582,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 			URL:           entryURL,
 			Download:      a.appURL("/download", fullName, "", "", showHidden),
 			TensorBoard:   tensorBoardURL,
+			Jupyter:       jupyterURL,
 			TableSnippet:  tableSnippet,
 			FigureSnippet: figureSnippet,
 			LiveURL:       liveURL,
@@ -467,7 +592,6 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 			IsLink:        entry.IsLink(),
 			Broken:        entry.IsLink() && entry.Info == nil,
 			LinkTarget:    entry.LinkTarget,
-			Preview:       !entry.IsDir() && previewable(fullName),
 		})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -588,7 +712,7 @@ func makeLaTeXSnippets(name string) (figure, table string) {
 		return "\\begin{figure}[htbp]\n" +
 			"  \\centering\n" +
 			"  \\includegraphics[width=1.00\\textwidth]{" + fileArgument + "}\n" +
-			"  \\caption{}\n" +
+			"  % \\caption{}\n" +
 			"  % \\label{fig:" + label + "}\n" +
 			"\\end{figure}", ""
 	case ".csv", ".tsv":
@@ -599,7 +723,7 @@ func makeLaTeXSnippets(name string) (figure, table string) {
 		return "", "\\begin{table}[htbp]\n" +
 			"  \\centering\n" +
 			"  \\csvautotabular" + options + "{" + fileArgument + "}\n" +
-			"  \\caption{}\n" +
+			"  % \\caption{}\n" +
 			"  % \\label{tab:" + label + "}\n" +
 			"\\end{table}"
 	default:
@@ -693,7 +817,7 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 			} else {
 				handler = instance.Handler
 				if handler == nil {
-					proxy := newTensorBoardReverseProxy(instance.Target)
+					proxy := newTensorBoardReverseProxy(instance.Target, instance.Token)
 					proxy.ErrorHandler = func(response http.ResponseWriter, _ *http.Request, _ error) {
 						http.Error(response, "TensorBoard is starting or unavailable; retry shortly", http.StatusBadGateway)
 					}
@@ -704,6 +828,100 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 		a.completeTensorBoardLaunch(directory, launch, handler, startErr)
 	}
 	a.respondTensorBoardLaunch(w, r, launch)
+}
+
+func (a *App) startJupyter(w http.ResponseWriter, r *http.Request) {
+	if a.jupyter == nil {
+		http.NotFound(w, r)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid Jupyter launch request", http.StatusBadRequest)
+		return
+	}
+	directory, err := a.requestPath(r)
+	if err != nil {
+		a.pathError(w, err)
+		return
+	}
+	info, err := a.backend.Stat(r.Context(), directory)
+	if err != nil {
+		a.pathError(w, err)
+		return
+	}
+	if !info.IsDir() {
+		http.Error(w, "Jupyter path must be a directory", http.StatusBadRequest)
+		return
+	}
+	kernelPython := strings.TrimSpace(r.Form.Get("python"))
+	if kernelPython == "" {
+		kernelPython = a.defaultPython
+	}
+	key := directory + "\x00" + kernelPython
+	launch, owner, err := a.acquireJupyterLaunch(key)
+	if err != nil {
+		http.Error(w, "could not create Jupyter session", http.StatusInternalServerError)
+		return
+	}
+	if owner {
+		instance, startErr := a.jupyter.Start(directory, kernelPython, launch.prefix)
+		var handler http.Handler
+		if startErr == nil {
+			if instance == nil || instance.Target == nil || instance.Token == "" {
+				startErr = errors.New("launcher returned no authenticated backend")
+			} else {
+				proxy := newJupyterReverseProxy(instance.Target, instance.Token)
+				proxy.ErrorHandler = func(response http.ResponseWriter, _ *http.Request, _ error) {
+					http.Error(response, "Jupyter is starting or unavailable; retry shortly", http.StatusBadGateway)
+				}
+				handler = proxy
+			}
+		}
+		a.completeJupyterLaunch(key, launch, handler, startErr)
+	}
+	a.respondJupyterLaunch(w, r, launch)
+}
+
+func (a *App) acquireJupyterLaunch(key string) (*jupyterLaunch, bool, error) {
+	a.jupyterMu.Lock()
+	defer a.jupyterMu.Unlock()
+	if existing := a.jupyterByKey[key]; existing != nil {
+		return existing, false, nil
+	}
+	var randomID [8]byte
+	if _, err := rand.Read(randomID[:]); err != nil {
+		return nil, false, err
+	}
+	id := hex.EncodeToString(randomID[:])
+	launch := &jupyterLaunch{id: id, prefix: "/jupyter/" + id, ready: make(chan struct{})}
+	a.jupyterByKey[key] = launch
+	return launch, true, nil
+}
+
+func (a *App) completeJupyterLaunch(key string, launch *jupyterLaunch, handler http.Handler, err error) {
+	a.jupyterMu.Lock()
+	launch.err = err
+	if err == nil {
+		a.jupyterProxy[launch.id] = handler
+	} else if a.jupyterByKey[key] == launch {
+		delete(a.jupyterByKey, key)
+	}
+	close(launch.ready)
+	a.jupyterMu.Unlock()
+}
+
+func (a *App) respondJupyterLaunch(w http.ResponseWriter, r *http.Request, launch *jupyterLaunch) {
+	select {
+	case <-launch.ready:
+	case <-r.Context().Done():
+		return
+	}
+	if launch.err != nil {
+		http.Error(w, "could not start Jupyter: "+launch.err.Error(), http.StatusBadGateway)
+		return
+	}
+	http.Redirect(w, r, launch.prefix+"/lab", http.StatusSeeOther)
 }
 
 func (a *App) acquireTensorBoardLaunch(directory string) (*tensorBoardLaunch, bool, error) {
@@ -763,12 +981,29 @@ func (a *App) directoryHasTensorBoardEvents(ctx context.Context, directory strin
 	return err == nil && hasTensorBoardEvents(entries)
 }
 
-func newTensorBoardReverseProxy(target *url.URL) *httputil.ReverseProxy {
+func newTensorBoardReverseProxy(target *url.URL, token string) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	director := proxy.Director
 	proxy.Director = func(request *http.Request) {
 		director(request)
 		request.Host = target.Host
+		if token != "" {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
+		if request.Header.Get("Origin") != "" {
+			request.Header.Set("Origin", target.Scheme+"://"+target.Host)
+		}
+	}
+	return proxy
+}
+
+func newJupyterReverseProxy(target *url.URL, token string) *httputil.ReverseProxy {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	director := proxy.Director
+	proxy.Director = func(request *http.Request) {
+		director(request)
+		request.Host = target.Host
+		request.Header.Set("Authorization", "token "+token)
 		if request.Header.Get("Origin") != "" {
 			request.Header.Set("Origin", target.Scheme+"://"+target.Host)
 		}
@@ -789,6 +1024,35 @@ func (a *App) serveTensorBoard(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
+func (a *App) serveJupyter(w http.ResponseWriter, r *http.Request) {
+	if isWebSocketUpgrade(r) && !a.validOrigin(r) {
+		http.Error(w, "invalid Origin header", http.StatusForbidden)
+		return
+	}
+	remainder := strings.TrimPrefix(r.URL.Path, "/jupyter/")
+	id := strings.SplitN(remainder, "/", 2)[0]
+	a.jupyterMu.RLock()
+	proxy := a.jupyterProxy[id]
+	a.jupyterMu.RUnlock()
+	if proxy == nil {
+		http.NotFound(w, r)
+		return
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func isWebSocketUpgrade(r *http.Request) bool {
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+		return false
+	}
+	for _, value := range strings.Split(r.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(value), "upgrade") {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *App) livePDF(w http.ResponseWriter, r *http.Request) {
 	name, info, err := a.livePDFInfo(r)
 	if err != nil {
@@ -807,17 +1071,25 @@ func (a *App) livePDF(w http.ResponseWriter, r *http.Request) {
 	data := struct {
 		Title          string
 		PreviewURL     string
+		DownloadURL    string
 		StatusURL      string
 		InitialVersion string
 		InitialReady   bool
 		PlainHTTP      bool
+		ControllerURL  string
+		StylesURL      string
+		PDFJSStylesURL string
 	}{
 		Title:          path.Base(name),
 		PreviewURL:     a.appURL("/preview", name, "", "", false),
+		DownloadURL:    a.appURL("/download", name, "", "", false),
 		StatusURL:      a.appURL("/live/status", name, "", "", false),
 		InitialVersion: initialVersion,
 		InitialReady:   ready,
 		PlainHTTP:      a.accessToken != "",
+		ControllerURL:  liveControllerURL,
+		StylesURL:      liveStylesURL,
+		PDFJSStylesURL: pdfJSRoutePrefix + "web/pdf_viewer.css",
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = livePDFPage.Execute(w, data)
@@ -929,6 +1201,10 @@ func (a *App) serveNamedFile(w http.ResponseWriter, r *http.Request, name string
 		http.Error(w, "path is a directory", http.StatusBadRequest)
 		return
 	}
+	if inline && !info.Mode().IsRegular() {
+		http.Error(w, "path is not a regular file", http.StatusBadRequest)
+		return
+	}
 	f, err := a.backend.Open(r.Context(), name)
 	if err != nil {
 		a.pathError(w, err)
@@ -938,23 +1214,123 @@ func (a *App) serveNamedFile(w http.ResponseWriter, r *http.Request, name string
 	stopClose := context.AfterFunc(r.Context(), func() { _ = f.Close() })
 	defer stopClose()
 
-	w.Header().Set("Content-Type", contentType(name))
+	responseType := contentType(name)
 	disposition := "attachment"
-	if inline && previewable(name) {
-		disposition = "inline"
+	if inline {
+		sample, readErr := io.ReadAll(io.LimitReader(f, 512))
+		if readErr != nil {
+			a.pathError(w, readErr)
+			return
+		}
+		if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+			a.pathError(w, seekErr)
+			return
+		}
+		responseType, inline = previewContentType(name, sample)
+		if inline {
+			disposition = "inline"
+		}
+		a.previewSecurityHeaders(w, false)
 	}
+	w.Header().Set("Content-Type", responseType)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": path.Base(name)}))
 	http.ServeContent(w, r, path.Base(name), info.ModTime(), f)
 }
 
-func previewable(name string) bool {
+func previewContentType(name string, sample []byte) (string, bool) {
+	detected := http.DetectContentType(sample)
+	if forcedTextPreview(name) || textLikeContentType(contentType(name)) || textLikeContentType(detected) {
+		if strings.HasPrefix(strings.ToLower(detected), "text/plain;") {
+			return detected, true
+		}
+		return "text/plain; charset=utf-8", true
+	}
+	if passivePreviewContentType(detected) {
+		return detected, true
+	}
+	if detected == "application/octet-stream" {
+		if fallback := passivePreviewTypeByExtension(name); fallback != "" {
+			return fallback, true
+		}
+	}
+	return "application/octet-stream", false
+}
+
+func forcedTextPreview(name string) bool {
 	switch strings.ToLower(path.Ext(name)) {
-	case ".txt", ".log", ".md", ".csv", ".json", ".yaml", ".yml",
-		".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico", ".pdf",
-		".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".webm", ".mov":
+	case ".html", ".htm", ".xhtml", ".svg", ".xml", ".xsl", ".xslt",
+		".js", ".mjs", ".cjs", ".css", ".eps", ".ps", ".tex", ".pgf", ".tikz":
 		return true
 	default:
 		return false
+	}
+}
+
+func textLikeContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return false
+	}
+	if strings.HasPrefix(mediaType, "text/") {
+		return true
+	}
+	switch mediaType {
+	case "application/json", "application/javascript", "application/x-javascript",
+		"application/xml", "application/xhtml+xml", "application/postscript", "image/svg+xml":
+		return true
+	default:
+		return false
+	}
+}
+
+func passivePreviewContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return false
+	}
+	switch mediaType {
+	case "application/pdf", "application/ogg",
+		"image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp", "image/x-icon",
+		"audio/aiff", "audio/mpeg", "audio/midi", "audio/wave",
+		"video/avi", "video/mp4", "video/webm":
+		return true
+	default:
+		return false
+	}
+}
+
+func passivePreviewTypeByExtension(name string) string {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".avif":
+		return "image/avif"
+	case ".bmp":
+		return "image/bmp"
+	case ".ico":
+		return "image/x-icon"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".wav":
+		return "audio/wav"
+	case ".ogg":
+		return "application/ogg"
+	case ".m4a":
+		return "audio/mp4"
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	default:
+		return ""
 	}
 }
 
@@ -966,6 +1342,8 @@ func contentType(name string) string {
 		return "text/markdown; charset=utf-8"
 	case ".csv":
 		return "text/csv; charset=utf-8"
+	case ".tsv":
+		return "text/tab-separated-values; charset=utf-8"
 	case ".json":
 		return "application/json"
 	}

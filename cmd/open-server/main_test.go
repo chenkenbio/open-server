@@ -32,13 +32,27 @@ func TestParseFlags(t *testing.T) {
 	if defaults.duration != defaultSessionDuration {
 		t.Fatalf("default duration = %s, want %s", defaults.duration, defaultSessionDuration)
 	}
+	if defaults.fontSize != 14 {
+		t.Fatalf("default font size = %d, want 14", defaults.fontSize)
+	}
 
-	configuration, err := parseFlags([]string{"--port", "8123", "--duration", "90m", "--title", "Files", "lab:/tmp", "--tensorboard", "--python-interpreter", "/env/bin/python", "--latex"}, io.Discard)
+	configuration, err := parseFlags([]string{"--port", "8123", "--duration", "90m", "--title", "Files", "lab:/tmp", "--fontsize", "18", "--tensorboard", "--jupyter", "--python-interpreter", "/env/bin/python", "--latex"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || len(configuration.targets) != 1 || configuration.targets[0] != "lab:/tmp" || !configuration.tensorBoard || configuration.python != "/env/bin/python" || !configuration.latex {
+	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.fontSize != 18 || len(configuration.targets) != 1 || configuration.targets[0] != "lab:/tmp" || !configuration.tensorBoard || !configuration.jupyter || configuration.python != "/env/bin/python" || !configuration.latex {
 		t.Fatalf("configuration = %#v", configuration)
+	}
+	for _, value := range []string{"8", "72"} {
+		bounded, err := parseFlags([]string{"lab:/tmp", "--fontsize=" + value}, io.Discard)
+		if err != nil {
+			t.Errorf("parse fontsize %s: %v", value, err)
+			continue
+		}
+		want, _ := strconv.Atoi(value)
+		if bounded.fontSize != want {
+			t.Errorf("font size = %d, want %d", bounded.fontSize, want)
+		}
 	}
 	add, err := parseFlags([]string{"--add", "work", "lab:/srv/work"}, io.Discard)
 	if err != nil || add.addName != "work" || len(add.targets) != 1 || add.targets[0] != "lab:/srv/work" {
@@ -66,11 +80,14 @@ func TestParseFlags(t *testing.T) {
 	}
 	for _, arguments := range [][]string{
 		{}, {"--port", "70000", "lab:/tmp"}, {"--duration", "-1s", "lab:/tmp"},
+		{"lab:/tmp", "--fontsize", "7"}, {"lab:/tmp", "--fontsize", "73"}, {"lab:/tmp", "--fontsize", "-1"},
 		{"--add", "work"}, {"--add", "work", "lab:/one", "lab:/two"}, {"--list", "lab:/tmp"},
 		{"--delete", "work", "lab:/tmp"}, {"--add", "work", "--list", "lab:/tmp"},
 		{"--serve", "--local", "."}, {"--list", "--local"}, {"--edit", "lab:/tmp"},
 		{"--edit", "--list"}, {"--edit", "--add", "work", "lab:/tmp"}, {"--edit", "--serve"},
 		{"--edit", "--local"},
+		{"--serve", "--jupyter"},
+		{"--serve", "--tensorboard"},
 	} {
 		if _, err := parseFlags(arguments, io.Discard); err == nil {
 			t.Errorf("parseFlags(%q) succeeded, want error", arguments)
@@ -84,13 +101,13 @@ func TestSavedSessionCommands(t *testing.T) {
 	t.Setenv("HOME", configHome)
 
 	var addOutput bytes.Buffer
-	if err := run([]string{"--add", "work", "lab:/srv/work", "--tensorboard", "-py", "/env/bin/python", "--latex", "--title", "Dashboards"}, &addOutput); err != nil {
+	if err := run([]string{"--add", "work", "lab:/srv/work", "--tensorboard", "--jupyter", "-py", "/env/bin/python", "--latex", "--title", "Dashboards", "--fontsize", "18"}, &addOutput); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(addOutput.String(), `Saved session "work" -> lab:/srv/work`) {
 		t.Fatalf("add output = %q", addOutput.String())
 	}
-	if !strings.Contains(addOutput.String(), "-port=61000") || !strings.Contains(addOutput.String(), "-tensorboard=true") || !strings.Contains(addOutput.String(), `-python-interpreter="/env/bin/python"`) || !strings.Contains(addOutput.String(), "-latex=true") {
+	if !strings.Contains(addOutput.String(), "-port=61000") || !strings.Contains(addOutput.String(), "-fontsize=18") || !strings.Contains(addOutput.String(), "-tensorboard=true") || !strings.Contains(addOutput.String(), "-jupyter=true") || !strings.Contains(addOutput.String(), `-python-interpreter="/env/bin/python"`) || !strings.Contains(addOutput.String(), "-latex=true") {
 		t.Fatalf("add output does not show saved options: %q", addOutput.String())
 	}
 
@@ -106,18 +123,28 @@ func TestSavedSessionCommands(t *testing.T) {
 	if err != nil || resolved.Host != "lab" || resolved.Path != "/srv/work" {
 		t.Fatalf("resolveRemoteTarget(work) = %#v, %v", resolved, err)
 	}
-	if options.Port == nil || *options.Port != savedSessionPortStart || options.TensorBoard == nil || !*options.TensorBoard || options.Python == nil || *options.Python != "/env/bin/python" || options.LaTeX == nil || !*options.LaTeX || options.Title == nil || *options.Title != "Dashboards" {
+	if options.Port == nil || *options.Port != savedSessionPortStart || options.FontSize == nil || *options.FontSize != 18 || options.TensorBoard == nil || !*options.TensorBoard || options.Jupyter == nil || !*options.Jupyter || options.Python == nil || *options.Python != "/env/bin/python" || options.LaTeX == nil || !*options.LaTeX || options.Title == nil || *options.Title != "Dashboards" {
 		t.Fatalf("saved options = %#v", options)
 	}
-	invocation, err := parseFlags([]string{"work", "--tensorboard=false", "--latex=false"}, io.Discard)
+	invocation, err := parseFlags([]string{"work", "--tensorboard=false", "--jupyter=false", "--latex=false"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := applySavedSessionOptions(&invocation, options); err != nil {
 		t.Fatal(err)
 	}
-	if invocation.tensorBoard || invocation.python != "/env/bin/python" || invocation.latex || invocation.title != "Dashboards" {
+	if invocation.tensorBoard || invocation.jupyter || invocation.python != "/env/bin/python" || invocation.latex || invocation.title != "Dashboards" || invocation.fontSize != 18 {
 		t.Fatalf("merged saved options = %#v", invocation)
+	}
+	override, err := parseFlags([]string{"work", "--fontsize", "20"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applySavedSessionOptions(&override, options); err != nil {
+		t.Fatal(err)
+	}
+	if override.fontSize != 20 {
+		t.Fatalf("explicit font-size override = %d, want 20", override.fontSize)
 	}
 	if _, _, err := resolveRemoteTarget("missing"); err == nil || !strings.Contains(err.Error(), "use --list") {
 		t.Fatalf("resolveRemoteTarget(missing) error = %v", err)
@@ -145,6 +172,26 @@ func TestSavedSessionCommands(t *testing.T) {
 	localSaved, err = resolveTarget("local-paper", false)
 	if err != nil || localSaved.options.Port == nil || *localSaved.options.Port != localPort {
 		t.Fatalf("updated saved session port = %#v, %v; want preserved %d", localSaved.options.Port, err, localPort)
+	}
+	if err := run([]string{"--add", "work", "lab:/srv/work"}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	_, resetOptions, err := resolveRemoteTarget("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resetOptions.FontSize != nil {
+		t.Fatalf("font size after re-add without -fontsize = %#v, want nil", resetOptions.FontSize)
+	}
+	resetInvocation, err := parseFlags([]string{"work"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applySavedSessionOptions(&resetInvocation, resetOptions); err != nil {
+		t.Fatal(err)
+	}
+	if resetInvocation.fontSize != 14 {
+		t.Fatalf("font size after re-add = %d, want default 14", resetInvocation.fontSize)
 	}
 
 	var deleteOutput bytes.Buffer
@@ -179,6 +226,56 @@ func TestTensorBoardLauncherIsNilWhenDisabled(t *testing.T) {
 	defer closeLocal()
 	if remoteLauncher == nil || localLauncher == nil {
 		t.Fatal("enabled TensorBoard launcher is nil")
+	}
+}
+
+func TestJupyterLauncherIsNilWhenDisabled(t *testing.T) {
+	configuration := config{rsh: "ssh"}
+	remoteLauncher, closeRemote := remoteJupyterLauncher(configuration, "lab", io.Discard)
+	defer closeRemote()
+	if remoteLauncher != nil {
+		t.Fatalf("disabled remote Jupyter launcher = %#v, want nil", remoteLauncher)
+	}
+	localLauncher, closeLocal := localJupyterLauncher(configuration, io.Discard)
+	defer closeLocal()
+	if localLauncher != nil {
+		t.Fatalf("disabled local Jupyter launcher = %#v, want nil", localLauncher)
+	}
+
+	configuration.jupyter = true
+	remoteLauncher, closeRemote = remoteJupyterLauncher(configuration, "lab", io.Discard)
+	defer closeRemote()
+	localLauncher, closeLocal = localJupyterLauncher(configuration, io.Discard)
+	defer closeLocal()
+	if remoteLauncher == nil || localLauncher == nil {
+		t.Fatal("enabled Jupyter launcher is nil")
+	}
+}
+
+func TestHelpersCannotBeUsedWithServe(t *testing.T) {
+	_, err := parseFlags([]string{"--serve", "--jupyter"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "jupyter cannot be used with serve") {
+		t.Fatalf("parseFlags serve Jupyter error = %v", err)
+	}
+	_, err = parseFlags([]string{"--serve", "--tensorboard"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "tensorboard cannot be used with serve") {
+		t.Fatalf("parseFlags serve TensorBoard error = %v", err)
+	}
+}
+
+func TestJupyterFlagAndPythonHelp(t *testing.T) {
+	var output bytes.Buffer
+	if _, err := parseFlags([]string{"--help"}, &output); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("--help error = %v, want flag.ErrHelp", err)
+	}
+	help := output.String()
+	for _, want := range []string{"-jupyter", "Python interpreter containing TensorBoard and JupyterLab", "-fontsize", "file browser font size in pixels (8-72)"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help output does not contain %q: %s", want, help)
+		}
+	}
+	if _, err := parseFlags([]string{"--jupyterlab", "lab:/tmp"}, io.Discard); err == nil {
+		t.Fatal("unsupported --jupyterlab alias was accepted")
 	}
 }
 
@@ -357,6 +454,9 @@ func TestHelpIsRecognized(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
+	if version != "0.2.0" {
+		t.Fatalf("version = %q, want stable 0.2.0", version)
+	}
 	for _, argument := range []string{"-version", "-v"} {
 		var output bytes.Buffer
 		if err := run([]string{argument}, &output); err != nil {
@@ -364,6 +464,20 @@ func TestVersion(t *testing.T) {
 		}
 		if got, want := output.String(), "open-server "+version+"\n"; got != want {
 			t.Errorf("%s output = %q, want %q", argument, got, want)
+		}
+	}
+}
+
+func TestLocalAppWarningDescribesProxyBoundary(t *testing.T) {
+	var output bytes.Buffer
+	printLocalAppWarning(&output)
+	for _, want := range []string{
+		"open-server's unauthenticated 127.0.0.1 listener",
+		"enabled TensorBoard or JupyterLab",
+		"private socket",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("local app warning = %q, want %q", output.String(), want)
 		}
 	}
 }
@@ -528,7 +642,9 @@ func cliWrapper(t *testing.T, exitEarly bool) string {
 	if exitEarly {
 		exitVariable = " OPEN_SERVER_CLI_EXIT=1"
 	}
-	contents := "#!/bin/sh\nOPEN_SERVER_CLI_HELPER=1" + exitVariable + " " + quoteShell(os.Args[0]) + " -test.run='^TestCLIHelperProcess$' <&0 >&1 2>&2 &\nchild=$!\nexec >/dev/null 2>/dev/null\nwait \"$child\"\n"
+	// Preserve stdin before starting the helper in the background; POSIX shells
+	// may otherwise connect an asynchronous command's stdin to /dev/null.
+	contents := "#!/bin/sh\nexec 3<&0\nOPEN_SERVER_CLI_HELPER=1" + exitVariable + " " + quoteShell(os.Args[0]) + " -test.run='^TestCLIHelperProcess$' <&3 3<&- >&1 2>&2 &\nchild=$!\nexec 3<&- >/dev/null 2>/dev/null\nwait \"$child\"\n"
 	if err := os.WriteFile(wrapper, []byte(contents), 0o700); err != nil {
 		t.Fatal(err)
 	}

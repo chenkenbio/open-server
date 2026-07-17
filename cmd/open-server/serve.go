@@ -61,12 +61,11 @@ func runServe(configuration config, stderr io.Writer) error {
 	if title == "" {
 		title = root
 	}
-	tensorBoardLauncher, closeTensorBoard := localTensorBoardLauncher(configuration, stderr)
-	defer closeTensorBoard()
 	app, err := appweb.New(appweb.Options{
 		Backend: filesystem.Local{}, Root: root, SSHHost: hostname,
 		Title: title, AllowedHost: allowedHost, AccessToken: token,
-		TensorBoard: tensorBoardLauncher, LaTeX: configuration.latex,
+		DefaultPython: configuration.python, LaTeX: configuration.latex,
+		FontSize: configuration.fontSize,
 	})
 	if err != nil {
 		return err
@@ -243,4 +242,11 @@ func printServeWarning(output io.Writer) {
 	fmt.Fprintln(output, "WARNING: serve mode uses plain, unencrypted HTTP.")
 	fmt.Fprintln(output, "The access token limits who can connect, but URLs, file names, uploads, and downloads")
 	fmt.Fprintln(output, "are not encrypted in transit. Use this mode only on a trusted network.")
+}
+
+func printLocalAppWarning(output io.Writer) {
+	fmt.Fprintln(output)
+	fmt.Fprintln(output, "WARNING: local app access is exposed through open-server's unauthenticated 127.0.0.1 listener.")
+	fmt.Fprintln(output, "On a shared machine, any other local user can reach enabled TensorBoard or JupyterLab. Use an SSH target")
+	fmt.Fprintln(output, "(open-server host:/path) so the service runs behind a private socket instead.")
 }
