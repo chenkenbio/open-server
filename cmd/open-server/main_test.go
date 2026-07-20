@@ -7,6 +7,7 @@ import (
 	"flag"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -355,6 +356,102 @@ func TestRunMultipleLocalSessionsIsolatesFailureAndAllocatesPorts(t *testing.T) 
 	}
 }
 
+func TestCloseSessionExitsAllSessions(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	output := newNotifyWriter("Open this local URL [" + second + "]")
+	result := make(chan error, 1)
+	go func() {
+		result <- run([]string{"--duration", "15s", "--no-open", first, second}, output)
+	}()
+
+	select {
+	case <-output.ready:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("sessions did not start: %s", output.String())
+	}
+	addresses := regexp.MustCompile(`http://127\.0\.0\.1:\d+/`).FindAllString(output.String(), -1)
+	if len(addresses) != 2 {
+		t.Fatalf("session output has %d URLs, want 2: %s", len(addresses), output.String())
+	}
+
+	listingResponse, err := http.Get(addresses[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	listingBody, readErr := io.ReadAll(listingResponse.Body)
+	_ = listingResponse.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	csrfMatch := regexp.MustCompile(`name="csrf" value="([0-9a-f]+)"`).FindSubmatch(listingBody)
+	if len(csrfMatch) != 2 {
+		t.Fatalf("listing has no close CSRF token: %s", listingBody)
+	}
+	request, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(addresses[0], "/")+"/close", strings.NewReader("csrf="+string(csrfMatch[1])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "null")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("close response = %d %s", response.StatusCode, body)
+	}
+	closePage := string(body)
+	for _, want := range []string{"open-server is closing", "Exit reason: user close", "Exit time:", "press Ctrl-C to close it manually"} {
+		if !strings.Contains(closePage, want) {
+			t.Errorf("close response is missing %q", want)
+		}
+	}
+	requestTimeMatch := regexp.MustCompile(`Exit time: ([^<]+)</p>`).FindStringSubmatch(closePage)
+	if len(requestTimeMatch) != 2 {
+		t.Fatalf("close response has no exit time: %s", closePage)
+	}
+	if _, err := time.Parse(time.RFC3339, requestTimeMatch[1]); err != nil {
+		t.Fatalf("close response time = %q: %v", requestTimeMatch[1], err)
+	}
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("open-server did not exit after user close")
+	}
+	terminal := output.String()
+	for _, want := range []string{
+		"Exit reason: user close",
+		"Exit requested by [" + first + "] at " + requestTimeMatch[1],
+		"Exit time:",
+	} {
+		if !strings.Contains(terminal, want) {
+			t.Errorf("terminal output is missing %q: %s", want, terminal)
+		}
+	}
+	exitTimeMatch := regexp.MustCompile(`Exit time: (\S+)`).FindStringSubmatch(terminal)
+	if len(exitTimeMatch) != 2 {
+		t.Fatalf("terminal output has no exit time: %s", terminal)
+	}
+	if _, err := time.Parse(time.RFC3339, exitTimeMatch[1]); err != nil {
+		t.Fatalf("terminal exit time = %q: %v", exitTimeMatch[1], err)
+	}
+
+	if response, err := http.Get(addresses[1]); err == nil {
+		_ = response.Body.Close()
+		t.Fatalf("other session remained reachable with status %d", response.StatusCode)
+	}
+}
+
 func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
 	configHome := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configHome)
@@ -454,8 +551,8 @@ func TestHelpIsRecognized(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	if version != "0.2.0" {
-		t.Fatalf("version = %q, want stable 0.2.0", version)
+	if version != "0.2.1" {
+		t.Fatalf("version = %q, want 0.2.1", version)
 	}
 	for _, argument := range []string{"-version", "-v"} {
 		var output bytes.Buffer

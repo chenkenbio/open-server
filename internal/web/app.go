@@ -42,6 +42,7 @@ type Options struct {
 	Title         string
 	AllowedHost   string
 	AccessToken   string
+	Closeable     bool
 	HTTPClient    *http.Client
 	TensorBoard   tensorboard.Launcher
 	Jupyter       jupyter.Launcher
@@ -73,6 +74,9 @@ type App struct {
 	title         string
 	allowedHost   string
 	accessToken   string
+	closeable     bool
+	closeOnce     sync.Once
+	closeSignal   chan time.Time
 	csrfToken     string
 	httpClient    *http.Client
 	tensorBoard   tensorboard.Launcher
@@ -122,7 +126,7 @@ func New(options Options) (*App, error) {
 		}
 	}
 	csrfToken := ""
-	if options.TensorBoard != nil || options.Jupyter != nil {
+	if options.Closeable || options.TensorBoard != nil || options.Jupyter != nil {
 		var token [16]byte
 		if _, err := rand.Read(token[:]); err != nil {
 			return nil, fmt.Errorf("create request token: %w", err)
@@ -143,6 +147,8 @@ func New(options Options) (*App, error) {
 		title:         options.Title,
 		allowedHost:   options.AllowedHost,
 		accessToken:   options.AccessToken,
+		closeable:     options.Closeable,
+		closeSignal:   make(chan time.Time, 1),
 		csrfToken:     csrfToken,
 		httpClient:    options.HTTPClient,
 		tensorBoard:   options.TensorBoard,
@@ -164,6 +170,11 @@ func (a *App) URL() string {
 		return address
 	}
 	return address + "?token=" + url.QueryEscape(a.accessToken)
+}
+
+// CloseRequested sends the time when the user asks to exit open-server.
+func (a *App) CloseRequested() <-chan time.Time {
+	return a.closeSignal
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +254,16 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.mkdir(w, r)
+	case "/close":
+		if !a.closeable {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		a.closeSession(w)
 	case "/tensorboard":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -270,6 +291,32 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (a *App) closeSession(w http.ResponseWriter) {
+	closedAt := time.Now()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-server is closing</title>
+</head>
+<body>
+<main>
+<h1>open-server is closing</h1>
+<p>Exit reason: user close</p>
+<p>Exit time: %s</p>
+<p>If open-server does not exit, return to its terminal and press Ctrl-C to close it manually.</p>
+<p>You can close this tab.</p>
+</main>
+</body>
+</html>`, closedAt.Format(time.RFC3339))
+	a.closeOnce.Do(func() {
+		a.closeSignal <- closedAt
+		close(a.closeSignal)
+	})
 }
 
 func isAppProxyRoute(name string) bool {
@@ -382,7 +429,7 @@ func (a *App) validStateChangingRequest(r *http.Request) bool {
 	if a.validOrigin(r) {
 		return true
 	}
-	if (r.URL.Path != "/tensorboard" && r.URL.Path != "/jupyter") || a.csrfToken == "" || r.ParseForm() != nil {
+	if (r.URL.Path != "/close" && r.URL.Path != "/tensorboard" && r.URL.Path != "/jupyter") || a.csrfToken == "" || r.ParseForm() != nil {
 		return false
 	}
 	got := []byte(r.PostForm.Get("csrf"))
@@ -400,6 +447,7 @@ type directoryView struct {
 	UploadURL          string
 	ImportURL          string
 	MkdirURL           string
+	Closeable          bool
 	HiddenToggleURL    string
 	HiddenToggleLabel  string
 	ShowHidden         bool
@@ -433,6 +481,11 @@ type breadcrumbView struct {
 	URL  string
 }
 
+type latexSnippet struct {
+	Full  string
+	Short string
+}
+
 type entryView struct {
 	Name          string
 	FullPath      string
@@ -440,8 +493,8 @@ type entryView struct {
 	Download      string
 	TensorBoard   string
 	Jupyter       string
-	TableSnippet  string
-	FigureSnippet string
+	TableSnippet  latexSnippet
+	FigureSnippet latexSnippet
 	LiveURL       string
 	Size          int64
 	ModTime       time.Time
@@ -502,6 +555,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		UploadURL:          a.appURL("/upload", current, "", "", showHidden),
 		ImportURL:          a.appURL("/import", current, "", "", showHidden),
 		MkdirURL:           a.appURL("/mkdir", current, "", "", showHidden),
+		Closeable:          a.closeable,
 		HiddenToggleURL:    a.appURL("/", current, sortKey, order, !showHidden),
 		ShowHidden:         showHidden,
 		TensorBoardEnabled: a.tensorBoard != nil,
@@ -568,7 +622,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		if entry.IsDir() && a.jupyter != nil {
 			jupyterURL = a.appURL("/jupyter", fullName, "", "", showHidden)
 		}
-		figureSnippet, tableSnippet := "", ""
+		var figureSnippet, tableSnippet latexSnippet
 		liveURL := ""
 		if a.latex && entry.Info != nil && entry.Info.Mode().IsRegular() {
 			figureSnippet, tableSnippet = makeLaTeXSnippets(fullName)
@@ -703,31 +757,39 @@ func sortEntries(entries []filesystem.Entry, key string, descending bool) {
 	})
 }
 
-func makeLaTeXSnippets(name string) (figure, table string) {
+func makeLaTeXSnippets(name string) (figure, table latexSnippet) {
 	extension := strings.ToLower(path.Ext(name))
 	fileArgument := `\detokenize{` + name + `}`
 	label := latexLabel(strings.TrimSuffix(path.Base(name), path.Ext(name)))
 	switch extension {
 	case ".png", ".jpg", ".jpeg", ".pdf":
-		return "\\begin{figure}[htbp]\n" +
-			"  \\centering\n" +
-			"  \\includegraphics[width=1.00\\textwidth]{" + fileArgument + "}\n" +
-			"  % \\caption{}\n" +
-			"  % \\label{fig:" + label + "}\n" +
-			"\\end{figure}", ""
+		command := "\\includegraphics[width=1.00\\textwidth]{" + fileArgument + "}"
+		return latexSnippet{
+			Full: "\\begin{figure}[htbp]\n" +
+				"  \\centering\n" +
+				"  " + command + "\n" +
+				"  % \\caption{}\n" +
+				"  % \\label{fig:" + label + "}\n" +
+				"\\end{figure}",
+			Short: command,
+		}, latexSnippet{}
 	case ".csv", ".tsv":
 		options := ""
 		if extension == ".tsv" {
 			options = "[separator=tab]"
 		}
-		return "", "\\begin{table}[htbp]\n" +
-			"  \\centering\n" +
-			"  \\csvautotabular" + options + "{" + fileArgument + "}\n" +
-			"  % \\caption{}\n" +
-			"  % \\label{tab:" + label + "}\n" +
-			"\\end{table}"
+		command := "\\csvautotabular" + options + "{" + fileArgument + "}"
+		return latexSnippet{}, latexSnippet{
+			Full: "\\begin{table}[htbp]\n" +
+				"  \\centering\n" +
+				"  " + command + "\n" +
+				"  % \\caption{}\n" +
+				"  % \\label{tab:" + label + "}\n" +
+				"\\end{table}",
+			Short: command,
+		}
 	default:
-		return "", ""
+		return latexSnippet{}, latexSnippet{}
 	}
 }
 

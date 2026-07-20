@@ -51,6 +51,12 @@ go build -o open-server ./cmd/open-server
 The program prints a loopback URL and normally opens it in the default browser.
 Use `-no-open` to print the URL without opening a tab.
 
+Use **Close open-server** in any local or SSH/SFTP file-browser header to exit
+the program and stop all of its sessions, including launched JupyterLab or
+TensorBoard processes. The result page records the user-close time and advises
+using Ctrl-C in the terminal if manual shutdown is needed. The control is not
+available with `-serve`.
+
 ## Targets and saved sessions
 
 Remote targets use `host:path` syntax:
@@ -135,9 +141,13 @@ SSH/SFTP or sharing sessions.
 
 | File | Function |
 | --- | --- |
-| `.csv`, `.tsv` | Copy a complete `table` environment using `\csvautotabular`. |
-| `.png`, `.jpg`, `.jpeg`, `.pdf` | Copy a complete `figure` environment using `\includegraphics`. |
+| `.csv`, `.tsv` | Copy a `table` environment or its inner `\csvautotabular` command. |
+| `.png`, `.jpg`, `.jpeg`, `.pdf` | Copy a `figure` environment or its inner `\includegraphics` command. |
 | `.pdf` | Follow a compiled PDF, waiting for a completed and stable file before reloading. |
+
+Use the **Short / Full env** switch below the LaTeX heading to choose the copied
+snippet format. Full environments remain the default, and the browser remembers
+the selected format while navigating between directories.
 
 The live viewer keeps the currently displayed page across rebuilds. If a rebuilt
 PDF has fewer pages, it clamps to the last available page (or page 1 before a

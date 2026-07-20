@@ -30,7 +30,7 @@ import (
 	appweb "open-server/internal/web"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 const automaticPortStart = 60000
 
@@ -187,6 +187,19 @@ func runSessions(configuration config, stderr io.Writer) error {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	type userCloseEvent struct {
+		label       string
+		requestedAt time.Time
+	}
+	userCloseEvents := make(chan userCloseEvent, 1)
+	var userCloseOnce sync.Once
+	requestUserClose := func(label string, requestedAt time.Time) {
+		userCloseOnce.Do(func() {
+			userCloseEvents <- userCloseEvent{label: label, requestedAt: requestedAt}
+			stopSignals()
+		})
+	}
+
 	type sessionEvent struct {
 		session *runningSession
 		err     error
@@ -231,7 +244,7 @@ func runSessions(configuration config, stderr io.Writer) error {
 		}
 		nextPort = assignedPort + 1
 
-		running, localURL, err := startSession(ctx, sessionConfiguration, resolved, listener, stderr)
+		running, localURL, err := startSession(ctx, requestUserClose, sessionConfiguration, resolved, listener, stderr)
 		if err != nil {
 			_ = listener.Close()
 			if errors.Is(err, errSessionEndedDuringStartup) {
@@ -251,7 +264,7 @@ func runSessions(configuration config, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "Open this local URL [%s]: %s\n", value, localURL)
 		if !sessionConfiguration.noOpen {
 			go func(label, address string) {
-				if err := openBrowser(ctx, address); err != nil && ctx.Err() == nil {
+				if err := openBrowser(address); err != nil && ctx.Err() == nil {
 					fmt.Fprintf(stderr, "Could not open a browser automatically for %s.\n", label)
 				}
 			}(value, localURL)
@@ -290,6 +303,13 @@ func runSessions(configuration config, stderr io.Writer) error {
 			}
 		}
 	}
+	select {
+	case event := <-userCloseEvents:
+		fmt.Fprintln(stderr, "Exit reason: user close")
+		fmt.Fprintf(stderr, "Exit requested by [%s] at %s\n", event.label, event.requestedAt.Format(time.RFC3339))
+		fmt.Fprintln(stderr, "Exit time:", time.Now().Format(time.RFC3339))
+	default:
+	}
 	return errors.Join(sessionErrors...)
 }
 
@@ -303,7 +323,7 @@ func effectiveSessionConfig(configuration config, resolved resolvedTarget) (conf
 	return configuration, nil
 }
 
-func startSession(parent context.Context, configuration config, resolved resolvedTarget, listener net.Listener, output io.Writer) (*runningSession, string, error) {
+func startSession(parent context.Context, requestUserClose func(string, time.Time), configuration config, resolved resolvedTarget, listener net.Listener, output io.Writer) (*runningSession, string, error) {
 	ctx := parent
 	cancel := func() {}
 	if configuration.duration > 0 {
@@ -392,6 +412,7 @@ func startSession(parent context.Context, configuration config, resolved resolve
 	app, err := appweb.New(appweb.Options{
 		Backend: backend, Root: root, SSHHost: host,
 		Title: configuration.title, AllowedHost: listener.Addr().String(),
+		Closeable:   true,
 		TensorBoard: tensorBoardLauncher, Jupyter: jupyterLauncher,
 		DefaultPython: configuration.python, LaTeX: configuration.latex,
 		FontSize: configuration.fontSize,
@@ -417,6 +438,8 @@ func startSession(parent context.Context, configuration config, resolved resolve
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				fmt.Fprintf(output, "Session duration expired [%s]; shutting down.\n", resolved.label)
 			}
+		case requestedAt := <-app.CloseRequested():
+			requestUserClose(resolved.label, requestedAt)
 		case <-remoteDone:
 			if ctx.Err() == nil {
 				result = errors.New("SSH connection closed unexpectedly")
@@ -902,18 +925,17 @@ func formatSessionOptions(options sessions.Options) string {
 	return strings.Join(values, " ")
 }
 
-func openBrowser(parent context.Context, address string) error {
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
+func openBrowser(address string) error {
 	var command *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		command = exec.CommandContext(ctx, "open", address)
+		command = exec.Command("open", address)
 	case "windows":
-		command = exec.CommandContext(ctx, "cmd", "/c", "start", "", address)
+		command = exec.Command("cmd", "/c", "start", "", address)
 	default:
-		command = exec.CommandContext(ctx, "xdg-open", address)
+		command = exec.Command("xdg-open", address)
 	}
+	configureBrowserCommand(command)
 	return command.Run()
 }
 

@@ -530,6 +530,11 @@ func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 		`xhr.upload.addEventListener('progress'`,
 		`dz.addEventListener('drop'`,
 		`class="upload-hint">or drag files here</span>`,
+		`id="copy-status" class="visually-hidden" role="status" aria-live="polite"`,
+		`.copy-success::after { color: #555; content: "\2713"; }`,
+		`button.classList.add('copy-result', succeeded ? 'copy-success' : 'copy-failure')`,
+		`copyStatus.textContent = succeeded ? 'Copied to clipboard.' : 'Copy failed.'`,
+		`}, 300);`,
 		`tbody tr:hover td`,
 		`class="page-header"`,
 	} {
@@ -542,6 +547,9 @@ func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 	}
 	if strings.Contains(directoryTemplate, `border: 2px dashed #999`) {
 		t.Error("upload toolbar still contains the old always-visible drop-zone border")
+	}
+	if strings.Contains(directoryTemplate, `showCopyResult(button, 'Copied')`) {
+		t.Error("copy actions still replace icons with visible Copied text")
 	}
 }
 
@@ -646,6 +654,134 @@ func TestAccessTokenBecomesScopedCookie(t *testing.T) {
 	}
 }
 
+func TestCloseSession(t *testing.T) {
+	root := createFixture(t)
+	disabled, err := New(Options{
+		Backend: filesystem.Local{}, Root: root, SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledListing := request(disabled, http.MethodGet, "/", nil)
+	if strings.Contains(disabledListing.Body.String(), "btn-close-server") {
+		t.Fatal("non-closeable app rendered the close button")
+	}
+	disabledClose := httptest.NewRequest(http.MethodPost, "/close", nil)
+	disabledClose.Host = testHost
+	disabledClose.Header.Set("Origin", "http://"+testHost)
+	disabledResponse := httptest.NewRecorder()
+	disabled.ServeHTTP(disabledResponse, disabledClose)
+	if disabledResponse.Code != http.StatusNotFound {
+		t.Fatalf("disabled close status = %d, want %d", disabledResponse.Code, http.StatusNotFound)
+	}
+	select {
+	case <-disabled.CloseRequested():
+		t.Fatal("disabled close request ended the app")
+	default:
+	}
+
+	app, err := New(Options{
+		Backend: filesystem.Local{}, Root: root, SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost, Closeable: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listing := request(app, http.MethodGet, "/", nil)
+	for _, want := range []string{
+		`<form action="/close" method="post"`,
+		`onsubmit="return window.confirm('Close open-server and all sessions?');"`,
+		`name="csrf" value="` + app.csrfToken + `"`,
+		`id="btn-close-server"`,
+		`>Close open-server</button>`,
+	} {
+		if !strings.Contains(listing.Body.String(), want) {
+			t.Errorf("closeable listing is missing %q", want)
+		}
+	}
+
+	wrongMethod := request(app, http.MethodGet, "/close", nil)
+	if wrongMethod.Code != http.StatusMethodNotAllowed || wrongMethod.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("close GET = %d Allow %q", wrongMethod.Code, wrongMethod.Header().Get("Allow"))
+	}
+	missingOrigin := request(app, http.MethodPost, "/close", nil)
+	if missingOrigin.Code != http.StatusForbidden {
+		t.Fatalf("close without Origin = %d", missingOrigin.Code)
+	}
+	badOrigin := httptest.NewRequest(http.MethodPost, "/close", nil)
+	badOrigin.Host = testHost
+	badOrigin.Header.Set("Origin", "http://attacker.example")
+	badOriginResponse := httptest.NewRecorder()
+	app.ServeHTTP(badOriginResponse, badOrigin)
+	if badOriginResponse.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin close = %d", badOriginResponse.Code)
+	}
+	select {
+	case <-app.CloseRequested():
+		t.Fatal("rejected close request ended the app")
+	default:
+	}
+
+	closeRequest := httptest.NewRequest(http.MethodPost, "/close", nil)
+	closeRequest.Host = testHost
+	closeRequest.Header.Set("Origin", "http://"+testHost)
+	closeResponse := httptest.NewRecorder()
+	app.ServeHTTP(closeResponse, closeRequest)
+	if closeResponse.Code != http.StatusOK {
+		t.Fatalf("close response = %d %s", closeResponse.Code, closeResponse.Body.String())
+	}
+	if contentType := closeResponse.Header().Get("Content-Type"); contentType != "text/html; charset=utf-8" {
+		t.Fatalf("close Content-Type = %q", contentType)
+	}
+	for _, want := range []string{"open-server is closing", "Exit reason: user close", "Exit time:", "press Ctrl-C to close it manually", "You can close this tab."} {
+		if !strings.Contains(closeResponse.Body.String(), want) {
+			t.Errorf("close response is missing %q", want)
+		}
+	}
+	var requestedAt time.Time
+	select {
+	case requestedAt = <-app.CloseRequested():
+	default:
+		t.Fatal("valid close request did not end the app")
+	}
+	if requestedAt.IsZero() || !strings.Contains(closeResponse.Body.String(), requestedAt.Format(time.RFC3339)) {
+		t.Fatalf("close response does not contain request time %s", requestedAt.Format(time.RFC3339))
+	}
+
+	repeatRequest := httptest.NewRequest(http.MethodPost, "/close", nil)
+	repeatRequest.Host = testHost
+	repeatRequest.Header.Set("Origin", "http://"+testHost)
+	repeatResponse := httptest.NewRecorder()
+	app.ServeHTTP(repeatResponse, repeatRequest)
+	if repeatResponse.Code != http.StatusOK {
+		t.Fatalf("repeated close response = %d", repeatResponse.Code)
+	}
+
+	fallbackApp, err := New(Options{
+		Backend: filesystem.Local{}, Root: root, SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost, Closeable: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallbackForm := url.Values{"csrf": {fallbackApp.csrfToken}}
+	fallbackRequest := httptest.NewRequest(http.MethodPost, "/close", strings.NewReader(fallbackForm.Encode()))
+	fallbackRequest.Host = testHost
+	fallbackRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	fallbackRequest.Header.Set("Origin", "null")
+	fallbackResponse := httptest.NewRecorder()
+	fallbackApp.ServeHTTP(fallbackResponse, fallbackRequest)
+	if fallbackResponse.Code != http.StatusOK {
+		t.Fatalf("CSRF-authenticated close with null Origin = %d %s", fallbackResponse.Code, fallbackResponse.Body.String())
+	}
+	select {
+	case <-fallbackApp.CloseRequested():
+	default:
+		t.Fatal("CSRF-authenticated close did not end the app")
+	}
+}
+
 func TestOptionalUIActions(t *testing.T) {
 	root := createFixture(t)
 	for name, contents := range map[string]string{
@@ -676,7 +812,7 @@ func TestOptionalUIActions(t *testing.T) {
 
 	listing := request(app, http.MethodGet, "/", nil)
 	body := listing.Body.String()
-	for _, want := range []string{"+ New folder", "Show hidden items", "Copy path", ">Actions</th>", "/assets/apps/tensorboard.png", `aria-label="LaTeX tools"`, `title="Launch TensorBoard"`, `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
+	for _, want := range []string{"+ New folder", "Show hidden items", "Copy path", ">Actions</th>", "/assets/apps/tensorboard.png", `aria-label="LaTeX tools"`, `id="latex-full-environment"`, `role="switch"`, `>Short</span>`, `>Full env</span>`, `data-snippet-full=`, `data-snippet-short=`, `open-server-latex-snippet-mode`, `title="Launch TensorBoard"`, `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("enhanced listing is missing %q", want)
 		}
@@ -778,7 +914,7 @@ func TestOptionalUIActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	plainBody := request(plain, http.MethodGet, "/", nil).Body.String()
-	if strings.Contains(plainBody, "LaTeX tools") || strings.Contains(plainBody, "Open live PDF preview") || strings.Contains(plainBody, "TensorBoard") {
+	if strings.Contains(plainBody, "LaTeX tools") || strings.Contains(plainBody, `id="latex-full-environment"`) || strings.Contains(plainBody, "Open live PDF preview") || strings.Contains(plainBody, "TensorBoard") {
 		t.Fatal("optional actions are visible without their flags")
 	}
 	if strings.Contains(plainBody, "token-protected plain HTTP") {
@@ -951,40 +1087,42 @@ func TestTensorBoardProxyRewritesOriginForBackend(t *testing.T) {
 }
 
 func TestLaTeXSnippets(t *testing.T) {
-	figure := "\\begin{figure}[htbp]\n" +
+	figureFull := "\\begin{figure}[htbp]\n" +
 		"  \\centering\n" +
 		"  \\includegraphics[width=1.00\\textwidth]{\\detokenize{/paper/Figure One.PNG}}\n" +
 		"  % \\caption{}\n" +
 		"  % \\label{fig:figure-one}\n" +
 		"\\end{figure}"
-	table := "\\begin{table}[htbp]\n" +
+	figureShort := "\\includegraphics[width=1.00\\textwidth]{\\detokenize{/paper/Figure One.PNG}}"
+	tableFull := "\\begin{table}[htbp]\n" +
 		"  \\centering\n" +
 		"  \\csvautotabular[separator=tab]{\\detokenize{/paper/Data Set.TSV}}\n" +
 		"  % \\caption{}\n" +
 		"  % \\label{tab:data-set}\n" +
 		"\\end{table}"
+	tableShort := "\\csvautotabular[separator=tab]{\\detokenize{/paper/Data Set.TSV}}"
 
 	gotFigure, gotTable := makeLaTeXSnippets("/paper/Figure One.PNG")
-	if gotFigure != figure || gotTable != "" {
+	if gotFigure.Full != figureFull || gotFigure.Short != figureShort || gotTable.Full != "" || gotTable.Short != "" {
 		t.Fatalf("PNG snippets = figure %q, table %q", gotFigure, gotTable)
 	}
 	gotFigure, gotTable = makeLaTeXSnippets("/paper/Data Set.TSV")
-	if gotFigure != "" || gotTable != table {
+	if gotFigure.Full != "" || gotFigure.Short != "" || gotTable.Full != tableFull || gotTable.Short != tableShort {
 		t.Fatalf("TSV snippets = figure %q, table %q", gotFigure, gotTable)
 	}
 	for _, name := range []string{"plot.jpg", "plot.jpeg", "plot.pdf"} {
 		gotFigure, gotTable = makeLaTeXSnippets(name)
-		if gotFigure == "" || gotTable != "" {
+		if gotFigure.Full == "" || gotFigure.Short == "" || gotTable.Full != "" || gotTable.Short != "" {
 			t.Errorf("%s snippets = figure %q, table %q", name, gotFigure, gotTable)
 		}
 	}
 	gotFigure, gotTable = makeLaTeXSnippets("data.csv")
-	if gotFigure != "" || !strings.Contains(gotTable, `\csvautotabular{\detokenize{data.csv}}`) || strings.Contains(gotTable, "separator=tab") {
+	if gotFigure.Full != "" || gotFigure.Short != "" || !strings.Contains(gotTable.Full, `\csvautotabular{\detokenize{data.csv}}`) || gotTable.Short != `\csvautotabular{\detokenize{data.csv}}` || strings.Contains(gotTable.Full, "separator=tab") {
 		t.Fatalf("CSV snippets = figure %q, table %q", gotFigure, gotTable)
 	}
 	for _, name := range []string{"plot.svg", "plot.eps", "plot.gif", "notes.txt", "folder"} {
 		gotFigure, gotTable = makeLaTeXSnippets(name)
-		if gotFigure != "" || gotTable != "" {
+		if gotFigure.Full != "" || gotFigure.Short != "" || gotTable.Full != "" || gotTable.Short != "" {
 			t.Errorf("unsupported %s snippets = figure %q, table %q", name, gotFigure, gotTable)
 		}
 	}

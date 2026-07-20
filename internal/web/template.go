@@ -20,6 +20,7 @@ button, input, select, textarea { font-size: inherit; }
 .breadcrumb a { color: #1a5cba; text-decoration: none; }
 .breadcrumb a:hover { text-decoration: underline; }
 .header-actions, #upload-buttons { display: flex; flex-wrap: wrap; gap: 0.4em; }
+.header-actions form { margin: 0; }
 .header-actions button, #drop-zone button { padding: 0.2em 0.65em; border: 1px solid #ccc; border-radius: 4px; background: #f7f7f7; color: #333; font: inherit; font-size: 0.85em; cursor: pointer; }
 .header-actions button:hover, #drop-zone button:hover { border-color: #aaa; background: #ececec; }
 #drop-zone { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4em; margin: 0 0 0.7em; }
@@ -38,9 +39,24 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 .latex-logo { font-family: "Times New Roman", Times, serif; font-weight: normal; white-space: nowrap; }
 .latex-logo-a { font-size: 0.72em; vertical-align: 0.32em; margin-left: -0.28em; margin-right: -0.12em; }
 .latex-logo-e { display: inline-block; font-size: 0.85em; vertical-align: -0.18em; margin-left: -0.08em; margin-right: -0.05em; }
+.latex-tools-heading { display: flex; flex-direction: column; align-items: center; gap: 0.25em; }
+.latex-env-mode { display: flex; align-items: center; gap: 0.3em; color: #666; font-size: 0.78em; font-weight: 500; letter-spacing: 0; line-height: 1; text-transform: none; cursor: pointer; }
+.latex-env-switch { position: relative; width: 2em; height: 1.1em; margin: 0; border: 1px solid #aaa; border-radius: 999px; appearance: none; -webkit-appearance: none; background: #ddd; cursor: pointer; }
+.latex-env-switch::after { position: absolute; top: 0.13em; left: 0.14em; width: 0.72em; height: 0.72em; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); content: ""; transition: transform 120ms ease; }
+.latex-env-switch:checked { border-color: #356fba; background: #4a8fe8; }
+.latex-env-switch:checked::after { transform: translateX(0.86em); }
+.latex-env-switch:focus-visible { outline: 2px solid #1a5cba; outline-offset: 2px; }
 .icon-button { padding: 0.15em; border: 1px solid transparent; border-radius: 3px; background: transparent; color: #555; cursor: pointer; }
 .icon-button:hover, .icon-button:focus { border-color: #aaa; background: #e8eaf0; color: #111; }
 .icon-button svg, .icon-button img { display: block; width: 1.3em; height: 1.3em; object-fit: contain; }
+.copy-result { position: relative; color: transparent !important; }
+.copy-result svg, .copy-result img { visibility: hidden; }
+.copy-result::after { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 700; }
+.copy-success { border-color: #a8d5b5 !important; background: #edf8f0 !important; }
+.copy-success::after { color: #555; content: "\2713"; }
+.copy-failure { border-color: #e1aaaa !important; background: #fff0f0 !important; }
+.copy-failure::after { color: #a33; content: "\00d7"; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .action-column { box-sizing: border-box; width: 2.25em; min-width: 2.25em; max-width: 2.25em; text-align: center; }
 .action-column form { margin: 0; }
 .action-column .icon-button { margin: 0 auto; }
@@ -51,6 +67,7 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 </style>
 </head>
 <body>
+<span id="copy-status" class="visually-hidden" role="status" aria-live="polite"></span>
 {{if .PlainHTTPWarning}}<div role="alert" style="margin: 0 0 0.8em 0; padding: 0.7em; border: 1px solid #a66; background: #fff3cd; color: #4d3800; font-family: sans-serif;"><strong>Security warning:</strong> This server uses token-protected plain HTTP. The token controls access, but traffic is not encrypted. Use only on a trusted network.</div>{{end}}
 <div class="page-header">
 <div class="header-path">
@@ -66,6 +83,7 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 <button id="btn-create-folder" type="button">+ New folder</button>
 <button id="btn-toggle-hidden" type="button" data-href="{{.HiddenToggleURL}}">{{.HiddenToggleLabel}}</button>
 <button type="button" class="copy-path" data-path="{{.CurrentPath}}">&#x2398; Copy path</button>
+{{if .Closeable}}<form action="/close" method="post" onsubmit="return window.confirm('Close open-server and all sessions?');"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><button id="btn-close-server" type="submit">Close open-server</button></form>{{end}}
 </div>
 </div>
 <div id="drop-zone">
@@ -128,12 +146,12 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 <div class="table-scroll" tabindex="0" aria-label="Directory listing">
 <table>
 <thead>
-{{$view := .}}<tr><th align="left"><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a></th><th align="left"><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a></th><th align="right"><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a></th><th align="right">Path</th><th align="center" colspan="{{.ActionColumnCount}}">Actions</th>{{if .LaTeXEnabled}}<th align="center" colspan="3" aria-label="LaTeX tools"><span class="latex-logo" aria-hidden="true">L<span class="latex-logo-a">A</span>T<span class="latex-logo-e">E</span>X</span></th>{{end}}</tr>
+{{$view := .}}<tr><th align="left"><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a></th><th align="left"><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a></th><th align="right"><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a></th><th align="right">Path</th><th align="center" colspan="{{.ActionColumnCount}}">Actions</th>{{if .LaTeXEnabled}}<th align="center" colspan="3" aria-label="LaTeX tools"><span class="latex-tools-heading"><span class="latex-logo" aria-hidden="true">L<span class="latex-logo-a">A</span>T<span class="latex-logo-e">E</span>X</span><label class="latex-env-mode" title="Choose complete environments or inner commands"><span>Short</span><input id="latex-full-environment" class="latex-env-switch" type="checkbox" role="switch" aria-label="Use full LaTeX figure and table environments" checked><span>Full env</span></label></span></th>{{end}}</tr>
 </thead>
 <tbody>
 {{if .HasParent}}<tr><td><a href="{{.ParentURL}}">..</a></td><td>&nbsp;</td><td align="right"> - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path icon-button" data-path="{{.ParentPath}}" aria-label="Copy path" title="Copy path"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg></button></td><td class="action-column">&nbsp;</td>{{if .JupyterEnabled}}<td class="action-column">{{if .ParentJupyter}}<button type="button" class="jupyter-launch icon-button" data-action="{{.ParentJupyter}}" aria-label="Launch JupyterLab" title="Launch JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></button>{{end}}</td>{{end}}{{if .TensorBoardEnabled}}<td class="action-column">{{if .ParentTensorBoard}}<form action="{{.ParentTensorBoard}}" method="post" target="_blank"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><button type="submit" class="icon-button" aria-label="Launch TensorBoard" title="Launch TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></button></form>{{end}}</td>{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>{{end}}
 <tr><td><a href="{{.CurrentURL}}">.</a></td><td>&nbsp;</td><td align="right"> - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path icon-button" data-path="{{.CurrentPath}}" aria-label="Copy path" title="Copy path"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg></button></td><td class="action-column">&nbsp;</td>{{if .JupyterEnabled}}<td class="action-column">{{if .CurrentJupyter}}<button type="button" class="jupyter-launch icon-button" data-action="{{.CurrentJupyter}}" aria-label="Launch JupyterLab" title="Launch JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></button>{{end}}</td>{{end}}{{if .TensorBoardEnabled}}<td class="action-column">{{if .CurrentTensorBoard}}<form action="{{.CurrentTensorBoard}}" method="post" target="_blank"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><button type="submit" class="icon-button" aria-label="Launch TensorBoard" title="Launch TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></button></form>{{end}}</td>{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>
-{{range .Entries}}<tr><td><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</td><td>&nbsp;&nbsp;{{time .ModTime}}&nbsp;&nbsp;</td><td align="right">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg></button></td><td class="action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v3h14v-3"></path></svg></button>{{end}}</td>{{if $view.JupyterEnabled}}<td class="action-column">{{if .Jupyter}}<button type="button" class="jupyter-launch icon-button" data-action="{{.Jupyter}}" aria-label="Launch JupyterLab" title="Launch JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></button>{{end}}</td>{{end}}{{if $view.TensorBoardEnabled}}<td class="action-column">{{if .TensorBoard}}<form action="{{.TensorBoard}}" method="post" target="_blank"><input type="hidden" name="csrf" value="{{$view.CSRFToken}}"><button type="submit" class="icon-button" aria-label="Launch TensorBoard" title="Launch TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></button></form>{{end}}</td>{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet="{{.TableSnippet}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet="{{.FigureSnippet}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
+{{range .Entries}}<tr><td><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</td><td>&nbsp;&nbsp;{{time .ModTime}}&nbsp;&nbsp;</td><td align="right">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg></button></td><td class="action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v3h14v-3"></path></svg></button>{{end}}</td>{{if $view.JupyterEnabled}}<td class="action-column">{{if .Jupyter}}<button type="button" class="jupyter-launch icon-button" data-action="{{.Jupyter}}" aria-label="Launch JupyterLab" title="Launch JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></button>{{end}}</td>{{end}}{{if $view.TensorBoardEnabled}}<td class="action-column">{{if .TensorBoard}}<form action="{{.TensorBoard}}" method="post" target="_blank"><input type="hidden" name="csrf" value="{{$view.CSRFToken}}"><button type="submit" class="icon-button" aria-label="Launch TensorBoard" title="Launch TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></button></form>{{end}}</td>{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet-full="{{.TableSnippet.Full}}" data-snippet-short="{{.TableSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet-full="{{.FigureSnippet.Full}}" data-snippet-short="{{.FigureSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
 {{else}}<tr><td colspan="{{.ColumnCount}}">This directory is empty.</td></tr>
 {{end}}
 </tbody>
@@ -143,6 +161,7 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 (function() {
   var dz = document.getElementById('drop-zone');
   var status = document.getElementById('upload-status');
+  var copyStatus = document.getElementById('copy-status');
   var uploadURL = {{.UploadURL}};
   var importURL = {{.ImportURL}};
   var mkdirURL = {{.MkdirURL}};
@@ -164,28 +183,47 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
     document.body.removeChild(ta);
     return ok;
   }
-  function showCopyResult(button, label) {
-    var old = button.innerHTML;
-    button.textContent = label;
-    setTimeout(function() { button.innerHTML = old; }, 900);
+  function showCopyResult(button, succeeded) {
+    clearTimeout(button.copyResultTimer);
+    button.classList.remove('copy-success', 'copy-failure');
+    button.classList.add('copy-result', succeeded ? 'copy-success' : 'copy-failure');
+    copyStatus.textContent = succeeded ? 'Copied to clipboard.' : 'Copy failed.';
+    button.copyResultTimer = setTimeout(function() {
+      button.classList.remove('copy-result', 'copy-success', 'copy-failure');
+    }, 300);
   }
   function copyText(button, attribute) {
-	var text = button.getAttribute(attribute);
+    var text = button.getAttribute(attribute);
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(function() {
-        showCopyResult(button, 'Copied');
+        showCopyResult(button, true);
       }).catch(function() {
-        showCopyResult(button, fallbackCopy(text) ? 'Copied' : 'Copy failed');
+        showCopyResult(button, fallbackCopy(text));
       });
       return;
     }
-    showCopyResult(button, fallbackCopy(text) ? 'Copied' : 'Copy failed');
+    showCopyResult(button, fallbackCopy(text));
   }
   Array.prototype.forEach.call(document.querySelectorAll('.copy-path'), function(button) {
     button.addEventListener('click', function() { copyText(button, 'data-path'); });
   });
+  var latexFullEnvironment = document.getElementById('latex-full-environment');
+  if (latexFullEnvironment) {
+    try {
+      var savedLaTeXMode = window.localStorage.getItem('open-server-latex-snippet-mode');
+      if (savedLaTeXMode === 'short') latexFullEnvironment.checked = false;
+      if (savedLaTeXMode === 'full') latexFullEnvironment.checked = true;
+    } catch (e) {}
+    latexFullEnvironment.addEventListener('change', function() {
+      try {
+        window.localStorage.setItem('open-server-latex-snippet-mode', latexFullEnvironment.checked ? 'full' : 'short');
+      } catch (e) {}
+    });
+  }
   Array.prototype.forEach.call(document.querySelectorAll('.copy-snippet'), function(button) {
-    button.addEventListener('click', function() { copyText(button, 'data-snippet'); });
+    button.addEventListener('click', function() {
+      copyText(button, latexFullEnvironment && !latexFullEnvironment.checked ? 'data-snippet-short' : 'data-snippet-full');
+    });
   });
   Array.prototype.forEach.call(document.querySelectorAll('.download-file'), function(button) {
     button.addEventListener('click', function() {
