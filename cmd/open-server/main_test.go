@@ -21,7 +21,10 @@ import (
 	"github.com/pkg/sftp"
 
 	"open-server/internal/filesystem"
+	"open-server/internal/jupyter"
 	"open-server/internal/sessions"
+	"open-server/internal/target"
+	"open-server/internal/tensorboard"
 )
 
 func TestParseFlags(t *testing.T) {
@@ -36,12 +39,22 @@ func TestParseFlags(t *testing.T) {
 	if defaults.fontSize != 14 {
 		t.Fatalf("default font size = %d, want 14", defaults.fontSize)
 	}
+	if defaults.changePort {
+		t.Fatal("port changes are allowed by default")
+	}
 
-	configuration, err := parseFlags([]string{"--port", "8123", "--duration", "90m", "--title", "Files", "lab:/tmp", "--fontsize", "18", "--tensorboard", "--jupyter", "--python-interpreter", "/env/bin/python", "--latex"}, io.Discard)
+	if defaults.reconnectGrace != defaultReconnectGrace {
+		t.Fatalf("default reconnect grace = %s, want %s", defaults.reconnectGrace, defaultReconnectGrace)
+	}
+	if defaults.noReconnect {
+		t.Fatal("reconnect is enabled by default")
+	}
+
+	configuration, err := parseFlags([]string{"--port", "8123", "--allow-port-change", "--duration", "90m", "--title", "Files", "lab:/tmp", "--fontsize", "18", "--tensorboard", "--jupyter", "--python-interpreter", "/env/bin/python", "--latex", "--no-reconnect", "--reconnect-grace", "45m"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configuration.port != 8123 || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.fontSize != 18 || len(configuration.targets) != 1 || configuration.targets[0] != "lab:/tmp" || !configuration.tensorBoard || !configuration.jupyter || configuration.python != "/env/bin/python" || !configuration.latex {
+	if configuration.port != 8123 || !configuration.changePort || configuration.duration != 90*time.Minute || configuration.title != "Files" || configuration.fontSize != 18 || len(configuration.targets) != 1 || configuration.targets[0] != "lab:/tmp" || !configuration.tensorBoard || !configuration.jupyter || configuration.python != "/env/bin/python" || !configuration.latex || !configuration.noReconnect || configuration.reconnectGrace != 45*time.Minute {
 		t.Fatalf("configuration = %#v", configuration)
 	}
 	for _, value := range []string{"8", "72"} {
@@ -81,6 +94,7 @@ func TestParseFlags(t *testing.T) {
 	}
 	for _, arguments := range [][]string{
 		{}, {"--port", "70000", "lab:/tmp"}, {"--duration", "-1s", "lab:/tmp"},
+		{"--reconnect-grace", "-1s", "lab:/tmp"},
 		{"lab:/tmp", "--fontsize", "7"}, {"lab:/tmp", "--fontsize", "73"}, {"lab:/tmp", "--fontsize", "-1"},
 		{"--add", "work"}, {"--add", "work", "lab:/one", "lab:/two"}, {"--list", "lab:/tmp"},
 		{"--delete", "work", "lab:/tmp"}, {"--add", "work", "--list", "lab:/tmp"},
@@ -102,13 +116,13 @@ func TestSavedSessionCommands(t *testing.T) {
 	t.Setenv("HOME", configHome)
 
 	var addOutput bytes.Buffer
-	if err := run([]string{"--add", "work", "lab:/srv/work", "--tensorboard", "--jupyter", "-py", "/env/bin/python", "--latex", "--title", "Dashboards", "--fontsize", "18"}, &addOutput); err != nil {
+	if err := run([]string{"--add", "work", "lab:/srv/work", "--tensorboard", "--jupyter", "-py", "/env/bin/python", "--latex", "--title", "Dashboards", "--fontsize", "18", "--no-reconnect", "--reconnect-grace", "45m"}, &addOutput); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(addOutput.String(), `Saved session "work" -> lab:/srv/work`) {
 		t.Fatalf("add output = %q", addOutput.String())
 	}
-	if !strings.Contains(addOutput.String(), "-port=61000") || !strings.Contains(addOutput.String(), "-fontsize=18") || !strings.Contains(addOutput.String(), "-tensorboard=true") || !strings.Contains(addOutput.String(), "-jupyter=true") || !strings.Contains(addOutput.String(), `-python-interpreter="/env/bin/python"`) || !strings.Contains(addOutput.String(), "-latex=true") {
+	if !strings.Contains(addOutput.String(), "-port=61000") || !strings.Contains(addOutput.String(), "-fontsize=18") || !strings.Contains(addOutput.String(), "-tensorboard=true") || !strings.Contains(addOutput.String(), "-jupyter=true") || !strings.Contains(addOutput.String(), `-python-interpreter="/env/bin/python"`) || !strings.Contains(addOutput.String(), "-latex=true") || !strings.Contains(addOutput.String(), "-no-reconnect=true") || !strings.Contains(addOutput.String(), "-reconnect-grace=45m0s") {
 		t.Fatalf("add output does not show saved options: %q", addOutput.String())
 	}
 
@@ -124,7 +138,7 @@ func TestSavedSessionCommands(t *testing.T) {
 	if err != nil || resolved.Host != "lab" || resolved.Path != "/srv/work" {
 		t.Fatalf("resolveRemoteTarget(work) = %#v, %v", resolved, err)
 	}
-	if options.Port == nil || *options.Port != savedSessionPortStart || options.FontSize == nil || *options.FontSize != 18 || options.TensorBoard == nil || !*options.TensorBoard || options.Jupyter == nil || !*options.Jupyter || options.Python == nil || *options.Python != "/env/bin/python" || options.LaTeX == nil || !*options.LaTeX || options.Title == nil || *options.Title != "Dashboards" {
+	if options.Port == nil || *options.Port != savedSessionPortStart || options.FontSize == nil || *options.FontSize != 18 || options.TensorBoard == nil || !*options.TensorBoard || options.Jupyter == nil || !*options.Jupyter || options.Python == nil || *options.Python != "/env/bin/python" || options.LaTeX == nil || !*options.LaTeX || options.Title == nil || *options.Title != "Dashboards" || options.NoReconnect == nil || !*options.NoReconnect || options.ReconnectGrace == nil || *options.ReconnectGrace != "45m0s" {
 		t.Fatalf("saved options = %#v", options)
 	}
 	invocation, err := parseFlags([]string{"work", "--tensorboard=false", "--jupyter=false", "--latex=false"}, io.Discard)
@@ -134,8 +148,18 @@ func TestSavedSessionCommands(t *testing.T) {
 	if err := applySavedSessionOptions(&invocation, options); err != nil {
 		t.Fatal(err)
 	}
-	if invocation.tensorBoard || invocation.jupyter || invocation.python != "/env/bin/python" || invocation.latex || invocation.title != "Dashboards" || invocation.fontSize != 18 {
+	if invocation.tensorBoard || invocation.jupyter || invocation.python != "/env/bin/python" || invocation.latex || invocation.title != "Dashboards" || invocation.fontSize != 18 || !invocation.noReconnect || invocation.reconnectGrace != 45*time.Minute {
 		t.Fatalf("merged saved options = %#v", invocation)
+	}
+	explicitReconnect, err := parseFlags([]string{"work", "--no-reconnect=false", "--reconnect-grace", "10m"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applySavedSessionOptions(&explicitReconnect, options); err != nil {
+		t.Fatal(err)
+	}
+	if explicitReconnect.noReconnect || explicitReconnect.reconnectGrace != 10*time.Minute {
+		t.Fatalf("explicit reconnect override = %#v", explicitReconnect)
 	}
 	override, err := parseFlags([]string{"work", "--fontsize", "20"}, io.Discard)
 	if err != nil {
@@ -270,7 +294,7 @@ func TestJupyterFlagAndPythonHelp(t *testing.T) {
 		t.Fatalf("--help error = %v, want flag.ErrHelp", err)
 	}
 	help := output.String()
-	for _, want := range []string{"-jupyter", "Python interpreter containing TensorBoard and JupyterLab", "-fontsize", "file browser font size in pixels (8-72)"} {
+	for _, want := range []string{"-jupyter", "Python interpreter containing TensorBoard and JupyterLab", "-fontsize", "file browser font size in pixels (8-72)", "-allow-port-change", "choose and remember another port", "-no-reconnect", "automatically reconnect after a dropped SSH connection", "-reconnect-grace", "how long remote TensorBoard/Jupyter services survive"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help output does not contain %q: %s", want, help)
 		}
@@ -333,6 +357,54 @@ func TestLocalTargetResolutionAndDefaults(t *testing.T) {
 	effective, err = effectiveSessionConfig(explicit, resolvedTarget{kind: localTarget})
 	if err != nil || effective.latex {
 		t.Fatalf("explicit local LaTeX override = %#v, %v", effective, err)
+	}
+}
+
+func TestDefaultPageTitle(t *testing.T) {
+	tests := []struct {
+		name     string
+		resolved resolvedTarget
+		root     string
+		want     string
+	}{
+		{
+			name:     "saved remote session",
+			resolved: resolvedTarget{savedName: "work", kind: remoteTarget, remote: target.Target{Host: "lab"}},
+			root:     "/srv/projects/results",
+			want:     "work",
+		},
+		{
+			name:     "saved local session",
+			resolved: resolvedTarget{savedName: "paper", kind: localTarget},
+			root:     "/home/user/paper",
+			want:     "paper",
+		},
+		{
+			name:     "direct remote folder",
+			resolved: resolvedTarget{kind: remoteTarget, remote: target.Target{Host: "lab"}},
+			root:     "/srv/projects/results",
+			want:     "lab:.../results/",
+		},
+		{
+			name:     "direct remote root",
+			resolved: resolvedTarget{kind: remoteTarget, remote: target.Target{Host: "lab"}},
+			root:     "/",
+			want:     "lab:/",
+		},
+		{
+			name:     "direct local folder",
+			resolved: resolvedTarget{kind: localTarget},
+			root:     "/home/user/paper",
+			want:     "Local files — /home/user/paper",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := defaultPageTitle(test.resolved, test.root); got != test.want {
+				t.Fatalf("defaultPageTitle() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -464,10 +536,13 @@ func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	launch := func() int {
+	launch := func(extraArguments ...string) int {
 		t.Helper()
 		var output bytes.Buffer
-		if err := run([]string{"--duration", "100ms", "--no-open", "remember-port"}, &output); err != nil {
+		arguments := []string{"--duration", "100ms", "--no-open"}
+		arguments = append(arguments, extraArguments...)
+		arguments = append(arguments, "remember-port")
+		if err := run(arguments, &output); err != nil {
 			t.Fatal(err)
 		}
 		match := regexp.MustCompile(`http://127\.0\.0\.1:(\d+)/`).FindStringSubmatch(output.String())
@@ -497,27 +572,49 @@ func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
 		t.Fatalf("reused saved-session port = %d, want %d", secondPort, firstPort)
 	}
 
-	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer occupied.Close()
-	occupiedPort := occupied.Addr().(*net.TCPAddr).Port
-	if err := store.UpdatePort("remember-port", occupiedPort); err != nil {
-		t.Fatal(err)
-	}
 	reserved, err := store.Resolve("reserved-port")
 	if err != nil || reserved.Options.Port == nil {
 		t.Fatalf("reserved session = %#v, %v", reserved, err)
 	}
 	reservedPort := *reserved.Options.Port
+	occupied, occupiedPort, err := listenLoopbackFrom(reservedPort + 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	if err := store.UpdatePort("remember-port", occupiedPort); err != nil {
+		t.Fatal(err)
+	}
 	startBlocker, startBlockerErr := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(savedSessionPortStart)))
 	if startBlockerErr == nil {
 		defer startBlocker.Close()
 	} else if !errors.Is(startBlockerErr, syscall.EADDRINUSE) {
 		t.Fatal(startBlockerErr)
 	}
-	fallbackPort := launch()
+	var conflictOutput bytes.Buffer
+	err = run([]string{"--duration", "100ms", "--no-open", "remember-port"}, &conflictOutput)
+	if err == nil {
+		t.Fatal("saved session used another port by default")
+	}
+	for _, want := range []string{
+		strconv.Itoa(occupiedPort),
+		"another open-server session may already be running",
+		"--allow-port-change",
+		"open-server --edit",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("port conflict error does not contain %q: %v", want, err)
+		}
+	}
+	if strings.Contains(conflictOutput.String(), "Open this local URL") {
+		t.Fatalf("failed session printed a local URL: %s", conflictOutput.String())
+	}
+	saved, err = store.Resolve("remember-port")
+	if err != nil || saved.Options.Port == nil || *saved.Options.Port != occupiedPort {
+		t.Fatalf("saved port after conflict = %#v, %v; want unchanged %d", saved.Options.Port, err, occupiedPort)
+	}
+
+	fallbackPort := launch("--allow-port-change")
 	if fallbackPort == occupiedPort || fallbackPort == reservedPort || fallbackPort <= reservedPort {
 		t.Fatalf("fallback saved-session port = %d with occupied preference %d and reserved port %d; want a later unreserved port", fallbackPort, occupiedPort, reservedPort)
 	}
@@ -551,8 +648,8 @@ func TestHelpIsRecognized(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	if version != "0.2.1" {
-		t.Fatalf("version = %q, want 0.2.1", version)
+	if version != "0.2.2" {
+		t.Fatalf("version = %q, want 0.2.2", version)
 	}
 	for _, argument := range []string{"-version", "-v"} {
 		var output bytes.Buffer
@@ -695,16 +792,89 @@ func TestRunSignalCleansUp(t *testing.T) {
 	}
 }
 
-func TestRunReportsUnexpectedSSHExit(t *testing.T) {
+func TestRunReconnectsAfterUnexpectedSSHExit(t *testing.T) {
+	// Reconnect is on by default: an unexpected SSH exit should trigger a
+	// reconnect rather than shutting the session down. The wrapper serves
+	// briefly then exits, so open-server keeps re-establishing the session
+	// until we interrupt it.
+	output := newNotifyWriter("Reconnected")
+	result := make(chan error, 1)
+	wrapper := cliWrapper(t, true)
+	go func() { result <- run([]string{"--rsh", wrapper, "--no-open", "test-host:."}, output) }()
+	select {
+	case <-output.ready:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("session did not reconnect: %s", output.String())
+	}
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("run after reconnect = %v, output = %q", err, output.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("interrupt did not shut down the reconnecting session")
+	}
+	if !strings.Contains(output.String(), "Connection lost [test-host:.].") {
+		t.Fatalf("output missing reconnect notice: %q", output.String())
+	}
+}
+
+func TestRunNoReconnectReportsUnexpectedSSHExit(t *testing.T) {
 	var output bytes.Buffer
 	started := time.Now()
-	err := run([]string{"--rsh", cliWrapper(t, true), "--no-open", "test-host:."}, &output)
+	err := run([]string{"--rsh", cliWrapper(t, true), "--no-open", "--no-reconnect", "test-host:."}, &output)
 	if err == nil || !strings.Contains(err.Error(), "SSH connection closed unexpectedly") {
 		t.Fatalf("run error = %v, output = %q", err, output.String())
 	}
 	if time.Since(started) > 5*time.Second {
 		t.Fatal("unexpected SSH exit was not handled promptly")
 	}
+}
+
+// reattachingTensorBoardLauncher and reattachingJupyterLauncher are minimal
+// stubs satisfying tensorboard.Launcher and jupyter.Launcher (each only a
+// single-method Start interface) plus the unexported Reattach(context.Context)
+// method that reattachLaunchers looks for through a type assertion.
+type reattachingTensorBoardLauncher struct{ calls int }
+
+func (s *reattachingTensorBoardLauncher) Start(string, string) (*tensorboard.Instance, error) {
+	return nil, nil
+}
+
+func (s *reattachingTensorBoardLauncher) Reattach(context.Context) { s.calls++ }
+
+type reattachingJupyterLauncher struct{ calls int }
+
+func (s *reattachingJupyterLauncher) Start(string, string, string) (*jupyter.Instance, error) {
+	return nil, nil
+}
+
+func (s *reattachingJupyterLauncher) Reattach(context.Context) { s.calls++ }
+
+func TestReattachLaunchersCallsReattachOnBoth(t *testing.T) {
+	tensorBoard := &reattachingTensorBoardLauncher{}
+	jup := &reattachingJupyterLauncher{}
+	reattachLaunchers(context.Background(), tensorBoard, jup)
+	if tensorBoard.calls != 1 {
+		t.Fatalf("tensorboard Reattach calls = %d, want 1", tensorBoard.calls)
+	}
+	if jup.calls != 1 {
+		t.Fatalf("jupyter Reattach calls = %d, want 1", jup.calls)
+	}
+}
+
+func TestReattachLaunchersIgnoresNilLaunchers(t *testing.T) {
+	// Disabled TensorBoard/JupyterLab (-tensorboard/-jupyter omitted) leave
+	// these as nil interfaces; the type assertion must fail harmlessly rather
+	// than panic.
+	reattachLaunchers(context.Background(), nil, nil)
 }
 
 func TestCLIHelperProcess(t *testing.T) {

@@ -29,19 +29,21 @@ func TestStoreAddResolveListAndDelete(t *testing.T) {
 	python := "/env/bin/python"
 	title := "Project dashboard"
 	fontSize := 18
-	if err := store.Add("production", "prod:/srv/new-app", Options{TensorBoard: &tensorBoard, Jupyter: &jupyter, Python: &python, LaTeX: &latex, Title: &title, FontSize: &fontSize}); err != nil {
+	noReconnect := true
+	reconnectGrace := "45m"
+	if err := store.Add("production", "prod:/srv/new-app", Options{TensorBoard: &tensorBoard, Jupyter: &jupyter, Python: &python, LaTeX: &latex, Title: &title, FontSize: &fontSize, NoReconnect: &noReconnect, ReconnectGrace: &reconnectGrace}); err != nil {
 		t.Fatal(err)
 	}
 
 	resolved, err := store.Resolve("production")
-	if err != nil || resolved.Target != "prod:/srv/new-app" || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Jupyter == nil || !*resolved.Options.Jupyter || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title || resolved.Options.FontSize == nil || *resolved.Options.FontSize != fontSize {
+	if err != nil || resolved.Target != "prod:/srv/new-app" || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Jupyter == nil || !*resolved.Options.Jupyter || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title || resolved.Options.FontSize == nil || *resolved.Options.FontSize != fontSize || resolved.Options.NoReconnect == nil || !*resolved.Options.NoReconnect || resolved.Options.ReconnectGrace == nil || *resolved.Options.ReconnectGrace != reconnectGrace {
 		t.Fatalf("Resolve(production) = %#v, %v", resolved, err)
 	}
 	if err := store.UpdatePort("production", 61234); err != nil {
 		t.Fatal(err)
 	}
 	resolved, err = store.Resolve("production")
-	if err != nil || resolved.Options.Port == nil || *resolved.Options.Port != 61234 || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Jupyter == nil || !*resolved.Options.Jupyter || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title || resolved.Options.FontSize == nil || *resolved.Options.FontSize != fontSize {
+	if err != nil || resolved.Options.Port == nil || *resolved.Options.Port != 61234 || resolved.Options.TensorBoard == nil || !*resolved.Options.TensorBoard || resolved.Options.Jupyter == nil || !*resolved.Options.Jupyter || resolved.Options.Python == nil || *resolved.Options.Python != python || resolved.Options.LaTeX == nil || !*resolved.Options.LaTeX || resolved.Options.Title == nil || *resolved.Options.Title != title || resolved.Options.FontSize == nil || *resolved.Options.FontSize != fontSize || resolved.Options.NoReconnect == nil || !*resolved.Options.NoReconnect || resolved.Options.ReconnectGrace == nil || *resolved.Options.ReconnectGrace != reconnectGrace {
 		t.Fatalf("Resolve(production) after UpdatePort = %#v, %v", resolved, err)
 	}
 	ports, err := store.ReservedPorts("")
@@ -79,7 +81,7 @@ func TestStoreAddResolveListAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(contents)
-	if !strings.Contains(text, "version: 1") || !strings.Contains(text, "production:") || !strings.Contains(text, "target: prod:/srv/new-app") || !strings.Contains(text, "port: 61234") || !strings.Contains(text, "fontsize: 18") || !strings.Contains(text, "tensorboard: true") || !strings.Contains(text, "jupyter: true") || !strings.Contains(text, "python-interpreter: /env/bin/python") || !strings.Contains(text, "latex: true") || !strings.Contains(text, "title: Project dashboard") || strings.Contains(text, "development:") {
+	if !strings.Contains(text, "version: 1") || !strings.Contains(text, "production:") || !strings.Contains(text, "target: prod:/srv/new-app") || !strings.Contains(text, "port: 61234") || !strings.Contains(text, "fontsize: 18") || !strings.Contains(text, "tensorboard: true") || !strings.Contains(text, "jupyter: true") || !strings.Contains(text, "python-interpreter: /env/bin/python") || !strings.Contains(text, "latex: true") || !strings.Contains(text, "title: Project dashboard") || !strings.Contains(text, "no-reconnect: true") || !strings.Contains(text, "reconnect-grace: 45m") || strings.Contains(text, "development:") {
 		t.Fatalf("saved YAML = %q", text)
 	}
 	info, err := os.Stat(path)
@@ -191,6 +193,16 @@ func TestStoreRejectsOutOfRangeSavedFontSize(t *testing.T) {
 		}
 		if _, err := (Store{Path: path}).Resolve("work"); err == nil || !strings.Contains(err.Error(), "fontsize must be between 8 and 72") {
 			t.Errorf("Resolve with fontsize %s error = %v", fontSize, err)
+		}
+	}
+}
+
+func TestStoreRejectsInvalidReconnectGrace(t *testing.T) {
+	for _, grace := range []string{"-1s", "not-a-duration"} {
+		path := filepath.Join(t.TempDir(), "saved-sessions.yaml")
+		store := Store{Path: path}
+		if err := store.Add("work", "lab:/tmp", Options{ReconnectGrace: &grace}); err == nil || !strings.Contains(err.Error(), "reconnect-grace must be a valid non-negative Go duration") {
+			t.Errorf("Add with reconnect-grace %q error = %v", grace, err)
 		}
 	}
 }

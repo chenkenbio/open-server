@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestServerArguments(t *testing.T) {
@@ -71,6 +72,7 @@ func TestRemoteCommandUsesPrivateUnixSocketAndHidesLaunchSecrets(t *testing.T) {
 	socketPath := runDirectory + "/j.sock"
 	executable, arguments, err := remoteCommand(
 		"ssh-wrapper", "lab", "/opt/server env/bin/python", 60123, runDirectory, socketPath,
+		30*time.Minute, 5*time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -84,6 +86,8 @@ func TestRemoteCommandUsesPrivateUnixSocketAndHidesLaunchSecrets(t *testing.T) {
 		"lab",
 		"SessionType=default",
 		"StdinNull=no",
+		"ServerAliveInterval=15",
+		"ServerAliveCountMax=3",
 		"ServerApp.class_traits",
 		"KernelManager.transport=ipc",
 		"ServerApp.contents_manager_class",
@@ -91,8 +95,13 @@ func TestRemoteCommandUsesPrivateUnixSocketAndHidesLaunchSecrets(t *testing.T) {
 		"PYTHONPATH",
 		"IdentityProvider",
 		`setsid`,
-		`kill -TERM -"$jupyter_pid"`,
-		`cat <&3 >/dev/null`,
+		`exec 9>"$run_dir/lease"`,
+		`flock 9 || `,
+		`printf '%s\n' "$$" > "$run_dir/watcher.pid"`,
+		`setsid sh -c `,
+		`flock -n "$run_dir/lease" true`,
+		`if [ "$line" = SHUTDOWN ]; then`,
+		`touch "$run_dir/shutdown"`,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("remote arguments do not contain %q:\n%s", want, joined)
@@ -125,6 +134,11 @@ func TestRemoteCommandUsesPrivateUnixSocketAndHidesLaunchSecrets(t *testing.T) {
 		`"--KernelManager.transport=ipc"`
 	if !strings.Contains(remoteScript, serviceCommand) {
 		t.Fatalf("socket and IPC settings are not command-line overrides:\n%s", remoteScript)
+	}
+	leaseIndex := strings.Index(remoteScript, `flock 9 || `)
+	watcherIndex := strings.Index(remoteScript, `printf '%s\n' "$$" > "$run_dir/watcher.pid"`)
+	if leaseIndex < 0 || watcherIndex < 0 || watcherIndex < leaseIndex {
+		t.Fatalf("attach script does not record the watcher pid after taking the lease:\n%s", remoteScript)
 	}
 	if strings.Contains(joined, "127.0.0.1:51234") {
 		t.Fatalf("remote arguments retain a TCP backend: %q", joined)
@@ -162,6 +176,31 @@ func TestRemoteCommandUsesPrivateUnixSocketAndHidesLaunchSecrets(t *testing.T) {
 	}
 	if decoded != configuration {
 		t.Fatalf("decoded frame = %#v, want %#v", decoded, configuration)
+	}
+}
+
+func TestReattachScriptEvictsStaleLeaseHolder(t *testing.T) {
+	runDirectory := "/tmp/osj-0123456789abcdef0123456789abcdef"
+	socketPath := runDirectory + "/j.sock"
+	script := reattachScript(runDirectory, socketPath)
+	for _, want := range []string{
+		"umask 077",
+		`if ! flock -n 9; then`,
+		`pid=$(cat "$run_dir/watcher.pid" 2>/dev/null)`,
+		`kill -TERM "$pid"`,
+		`flock -w 5 9 || { echo "open-server: JupyterLab is still held by another session" >&2; exit 1; }`,
+		`printf '%s\n' "$$" > "$run_dir/watcher.pid"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("re-attach script does not contain %q:\n%s", want, script)
+		}
+	}
+	evictIndex := strings.Index(script, `kill -TERM "$pid"`)
+	fallbackIndex := strings.Index(script, `flock -w 5 9 || `)
+	recordIndex := strings.Index(script, `printf '%s\n' "$$" > "$run_dir/watcher.pid"`)
+	if evictIndex < 0 || fallbackIndex < 0 || recordIndex < 0 ||
+		!(evictIndex < fallbackIndex && fallbackIndex < recordIndex) {
+		t.Fatalf("re-attach script does not evict, wait, then record in order:\n%s", script)
 	}
 }
 

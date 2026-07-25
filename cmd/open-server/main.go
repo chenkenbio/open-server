@@ -30,7 +30,7 @@ import (
 	appweb "open-server/internal/web"
 )
 
-const version = "0.2.1"
+const version = "0.2.2"
 
 const automaticPortStart = 60000
 
@@ -41,27 +41,30 @@ const defaultSessionDuration = 7 * 24 * time.Hour
 var errSessionEndedDuringStartup = errors.New("session ended during startup")
 
 type config struct {
-	port        int
-	rsh         string
-	duration    time.Duration
-	title       string
-	fontSize    int
-	noOpen      bool
-	local       bool
-	serve       bool
-	address     string
-	token       string
-	tensorBoard bool
-	jupyter     bool
-	python      string
-	latex       bool
-	version     bool
-	addName     string
-	delete      string
-	list        bool
-	edit        bool
-	targets     []string
-	explicit    map[string]bool
+	port           int
+	changePort     bool
+	rsh            string
+	duration       time.Duration
+	title          string
+	fontSize       int
+	noOpen         bool
+	local          bool
+	serve          bool
+	address        string
+	token          string
+	tensorBoard    bool
+	jupyter        bool
+	python         string
+	latex          bool
+	noReconnect    bool
+	reconnectGrace time.Duration
+	version        bool
+	addName        string
+	delete         string
+	list           bool
+	edit           bool
+	targets        []string
+	explicit       map[string]bool
 }
 
 type targetKind uint8
@@ -368,9 +371,6 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 		if err != nil || host == "" {
 			host = "localhost"
 		}
-		if configuration.title == "" {
-			configuration.title = "Local files — " + root
-		}
 		tensorBoardLauncher, closeTensorBoard = localTensorBoardLauncher(configuration, output)
 		jupyterLauncher, closeJupyter = localJupyterLauncher(configuration, output)
 		if configuration.tensorBoard || configuration.jupyter {
@@ -408,6 +408,9 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 		tensorBoardLauncher, closeTensorBoard = remoteTensorBoardLauncher(configuration, host, output)
 		jupyterLauncher, closeJupyter = remoteJupyterLauncher(configuration, host, output)
 	}
+	if configuration.title == "" {
+		configuration.title = defaultPageTitle(resolved, root)
+	}
 
 	app, err := appweb.New(appweb.Options{
 		Backend: backend, Root: root, SSHHost: host,
@@ -433,20 +436,56 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 	running := &runningSession{label: resolved.label, done: done, cancel: cancel}
 	go func() {
 		var result error
-		select {
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				fmt.Fprintf(output, "Session duration expired [%s]; shutting down.\n", resolved.label)
-			}
-		case requestedAt := <-app.CloseRequested():
-			requestUserClose(resolved.label, requestedAt)
-		case <-remoteDone:
-			if ctx.Err() == nil {
-				result = errors.New("SSH connection closed unexpectedly")
-			}
-		case serveErr := <-serveResult:
-			if !errors.Is(serveErr, http.ErrServerClosed) {
-				result = fmt.Errorf("local HTTP server stopped: %w", serveErr)
+		currentDone := remoteDone
+		currentClose := closeBackend
+		reconnectEnabled := resolved.kind == remoteTarget && !configuration.noReconnect
+		sshOptions := sshsession.Options{Executable: configuration.rsh, Host: resolved.remote.Host, Stderr: output}
+		policy := defaultReconnectPolicy()
+	supervise:
+		for {
+			select {
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					fmt.Fprintf(output, "Session duration expired [%s]; shutting down.\n", resolved.label)
+				}
+				break supervise
+			case requestedAt := <-app.CloseRequested():
+				requestUserClose(resolved.label, requestedAt)
+				break supervise
+			case <-currentDone:
+				if ctx.Err() != nil {
+					break supervise
+				}
+				if !reconnectEnabled {
+					result = errors.New("SSH connection closed unexpectedly")
+					break supervise
+				}
+				fmt.Fprintf(output, "Connection lost [%s].\n", resolved.label)
+				app.SetDisconnected()
+				_ = currentClose()
+				reconnected := reconnectSSH(ctx, sshOptions, policy, root, app.CloseRequested(), resolved.label, output)
+				switch reconnected.outcome {
+				case reconnectConnected:
+					app.SetBackend(filesystem.SFTP{Client: reconnected.session.Client})
+					currentDone = reconnected.session.Done()
+					currentClose = reconnected.session.Close
+					fmt.Fprintf(output, "Reconnected [%s].\n", resolved.label)
+					reattachLaunchers(ctx, tensorBoardLauncher, jupyterLauncher)
+					continue
+				case reconnectUserClose:
+					requestUserClose(resolved.label, reconnected.requestedAt)
+					break supervise
+				case reconnectCtxDone:
+					break supervise
+				default:
+					result = errors.New("SSH reconnect attempts exhausted; shutting down")
+					break supervise
+				}
+			case serveErr := <-serveResult:
+				if !errors.Is(serveErr, http.ErrServerClosed) {
+					result = fmt.Errorf("local HTTP server stopped: %w", serveErr)
+				}
+				break supervise
 			}
 		}
 		cancel()
@@ -457,7 +496,7 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 		shutdownCancel()
 		closeJupyter()
 		closeTensorBoard()
-		_ = closeBackend()
+		_ = currentClose()
 		_ = listener.Close()
 		done <- result
 	}()
@@ -465,11 +504,38 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 	return running, serveStartURL(app.URL(), initialPath), nil
 }
 
+// defaultPageTitle returns a compact browser-tab title for a session target.
+func defaultPageTitle(resolved resolvedTarget, root string) string {
+	if resolved.savedName != "" {
+		return resolved.savedName
+	}
+	if resolved.kind == remoteTarget {
+		if root == "/" {
+			return resolved.remote.Host + ":/"
+		}
+		return resolved.remote.Host + ":.../" + path.Base(root) + "/"
+	}
+	return "Local files — " + root
+}
+
+// reattachLaunchers re-establishes SSH tunnels for any remote TensorBoard or
+// JupyterLab services that survived a dropped SSH connection within their
+// grace window. Local launchers and disabled (nil) launchers are no-ops.
+func reattachLaunchers(ctx context.Context, tensorBoardLauncher tensorboard.Launcher, jupyterLauncher jupyter.Launcher) {
+	if r, ok := tensorBoardLauncher.(interface{ Reattach(context.Context) }); ok {
+		r.Reattach(ctx)
+	}
+	if r, ok := jupyterLauncher.(interface{ Reattach(context.Context) }); ok {
+		r.Reattach(ctx)
+	}
+}
+
 func remoteTensorBoardLauncher(configuration config, host string, output io.Writer) (tensorboard.Launcher, func()) {
 	if !configuration.tensorBoard {
 		return nil, func() {}
 	}
 	launcher := tensorboard.NewRemote(configuration.rsh, host, configuration.python, output)
+	launcher.SetGrace(configuration.reconnectGrace)
 	return launcher, launcher.Close
 }
 
@@ -486,6 +552,7 @@ func remoteJupyterLauncher(configuration config, host string, output io.Writer) 
 		return nil, func() {}
 	}
 	launcher := jupyter.NewRemote(configuration.rsh, host, configuration.python, output)
+	launcher.SetGrace(configuration.reconnectGrace)
 	return launcher, launcher.Close
 }
 
@@ -511,6 +578,7 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	flags := flag.NewFlagSet("open-server", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.IntVar(&configuration.port, "port", 0, "starting HTTP port (direct targets default to 60000; saved sessions remember theirs)")
+	flags.BoolVar(&configuration.changePort, "allow-port-change", false, "allow a saved session to choose and remember another port when its configured port is unavailable")
 	flags.StringVar(&configuration.rsh, "rsh", "ssh", "OpenSSH executable or compatible wrapper")
 	flags.DurationVar(&configuration.duration, "duration", defaultSessionDuration, "session duration (default 7d; for example 2h)")
 	flags.StringVar(&configuration.title, "title", "", "browser page title")
@@ -525,6 +593,8 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	flags.StringVar(&configuration.python, "python-interpreter", "", "Python interpreter containing TensorBoard and JupyterLab")
 	flags.StringVar(&configuration.python, "py", "", "Python interpreter containing TensorBoard and JupyterLab (shorthand)")
 	flags.BoolVar(&configuration.latex, "latex", false, "show LaTeX table, figure, and live-PDF actions (default for local targets)")
+	flags.BoolVar(&configuration.noReconnect, "no-reconnect", false, "do not automatically reconnect after a dropped SSH connection")
+	flags.DurationVar(&configuration.reconnectGrace, "reconnect-grace", defaultReconnectGrace, "how long remote TensorBoard/Jupyter services survive while awaiting reconnection (for example 30m)")
 	flags.StringVar(&configuration.addName, "add", "", "save or update a named session")
 	flags.StringVar(&configuration.delete, "delete", "", "delete a named session")
 	flags.BoolVar(&configuration.list, "list", false, "list saved sessions")
@@ -611,6 +681,9 @@ func parseFlags(arguments []string, stderr io.Writer) (config, error) {
 	}
 	if configuration.duration < 0 {
 		return config{}, errors.New("duration cannot be negative")
+	}
+	if configuration.reconnectGrace < 0 {
+		return config{}, errors.New("reconnect-grace cannot be negative")
 	}
 	if configuration.fontSize < appweb.MinFontSize || configuration.fontSize > appweb.MaxFontSize {
 		return config{}, fmt.Errorf("fontsize must be between %d and %d", appweb.MinFontSize, appweb.MaxFontSize)
@@ -739,6 +812,7 @@ func normalizeFlagOrder(arguments []string) []string {
 		"-port": true, "--port": true, "-rsh": true, "--rsh": true,
 		"-duration": true, "--duration": true, "-title": true, "--title": true,
 		"-fontsize": true, "--fontsize": true,
+		"-reconnect-grace": true, "--reconnect-grace": true,
 		"-address": true, "--address": true, "-token": true, "--token": true,
 		"-add": true, "--add": true, "-delete": true, "--delete": true,
 		"-python-interpreter": true, "--python-interpreter": true, "-py": true,
@@ -814,6 +888,14 @@ func savedSessionOptions(configuration config) sessions.Options {
 		value := configuration.latex
 		options.LaTeX = &value
 	}
+	if configuration.explicit["no-reconnect"] {
+		value := configuration.noReconnect
+		options.NoReconnect = &value
+	}
+	if configuration.explicit["reconnect-grace"] {
+		value := configuration.reconnectGrace.String()
+		options.ReconnectGrace = &value
+	}
 	return options
 }
 
@@ -887,6 +969,16 @@ func applySavedSessionOptions(configuration *config, options sessions.Options) e
 	if options.LaTeX != nil && !configuration.explicit["latex"] {
 		configuration.latex = *options.LaTeX
 	}
+	if options.NoReconnect != nil && !configuration.explicit["no-reconnect"] {
+		configuration.noReconnect = *options.NoReconnect
+	}
+	if options.ReconnectGrace != nil && !configuration.explicit["reconnect-grace"] {
+		grace, err := time.ParseDuration(*options.ReconnectGrace)
+		if err != nil {
+			return fmt.Errorf("invalid reconnect-grace in saved session: %w", err)
+		}
+		configuration.reconnectGrace = grace
+	}
 	return nil
 }
 
@@ -922,6 +1014,12 @@ func formatSessionOptions(options sessions.Options) string {
 	if options.LaTeX != nil {
 		values = append(values, "-latex="+strconv.FormatBool(*options.LaTeX))
 	}
+	if options.NoReconnect != nil {
+		values = append(values, "-no-reconnect="+strconv.FormatBool(*options.NoReconnect))
+	}
+	if options.ReconnectGrace != nil {
+		values = append(values, "-reconnect-grace="+*options.ReconnectGrace)
+	}
 	return strings.Join(values, " ")
 }
 
@@ -951,6 +1049,9 @@ func listenLoopback(port int) (net.Listener, error) {
 func listenSessionLoopback(invocation, effective config, resolved resolvedTarget, nextPort int, reserved map[int]struct{}) (net.Listener, int, error) {
 	if resolved.savedName != "" && !invocation.explicit["port"] {
 		if resolved.options.Port != nil && *resolved.options.Port > 0 {
+			if !invocation.changePort {
+				return listenSavedSessionPort(resolved.savedName, *resolved.options.Port, reserved)
+			}
 			return listenLoopbackPreferred(*resolved.options.Port, savedSessionPortStart, reserved)
 		}
 		start := savedSessionPortStart
@@ -967,6 +1068,20 @@ func listenSessionLoopback(invocation, effective config, resolved resolvedTarget
 		start = nextPort
 	}
 	return listenLoopbackFrom(start)
+}
+
+func listenSavedSessionPort(name string, port int, reserved map[int]struct{}) (net.Listener, int, error) {
+	if _, otherSessionOwnsPort := reserved[port]; otherSessionOwnsPort {
+		return nil, 0, fmt.Errorf("configured port %d for saved session %q is also assigned to another saved session; use --allow-port-change to choose and remember another available port, or run open-server --edit to assign a different port", port, name)
+	}
+	listener, err := listenLoopbackPort(port)
+	if err == nil {
+		return listener, port, nil
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return nil, 0, fmt.Errorf("configured port %d for saved session %q is already in use; another open-server session may already be running; use --allow-port-change to choose and remember another available port, or run open-server --edit to assign a different port: %w", port, name, err)
+	}
+	return nil, 0, err
 }
 
 func listenLoopbackPreferred(preferred, fallbackStart int, reserved map[int]struct{}) (net.Listener, int, error) {

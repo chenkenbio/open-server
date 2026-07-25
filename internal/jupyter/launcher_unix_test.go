@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -372,12 +374,43 @@ func TestProcessLauncherUsesWorkingDirectoryTrashWithRealJupyter(t *testing.T) {
 	}
 }
 
-func TestRemoteJupyterScriptStopsOnStdinEOF(t *testing.T) {
-	script := supervisedRemoteScript(
-		[]string{`IFS= read -r _ || exit 1`},
-		"sleep 30",
-		nil,
-	)
+// requireProcessTools skips a test when the shell utilities the remote scripts
+// depend on are unavailable on the host running the unit tests.
+func requireProcessTools(t *testing.T) {
+	t.Helper()
+	for _, tool := range []string{"flock", "setsid"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not installed", tool)
+		}
+	}
+}
+
+// makeRemoteRunDir creates a private run directory whose path matches the
+// /tmp/osj-* guard so the keeper is allowed to remove it.
+func makeRemoteRunDir(t *testing.T) string {
+	t.Helper()
+	runDir, _, err := newRemoteRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runDir) })
+	return runDir
+}
+
+// startSupervisedFakeService runs the supervised remote script locally with a
+// sleep-based fake service that records its own process-group id. The returned
+// process wraps the attached shell; writer is its SHUTDOWN control pipe.
+func startSupervisedFakeService(
+	t *testing.T, runDir string, grace, check time.Duration,
+) (*runningProcess, *os.File, int) {
+	t.Helper()
+	pidFile := filepath.Join(runDir, "service.pid")
+	innerService := `echo $$ > ` + shellQuote(pidFile) + `; exec sleep 300`
+	serviceCommand := `sh -c ` + shellQuote(innerService)
+	script := supervisedRemoteScript([]string{"runtime_created=1"}, serviceCommand, runDir, grace, check)
 	command := exec.Command("sh", "-c", script)
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -391,16 +424,322 @@ func TestRemoteJupyterScriptStopsOnStdinEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = reader.Close()
-	if _, err := writer.WriteString("lease\n"); err != nil {
+	process := newRunningProcess(command, writer, nil)
+	pgid := waitForServicePGID(t, pidFile)
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = writer.Close()
+		select {
+		case <-process.done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+	return process, writer, pgid
+}
+
+func waitForServicePGID(t *testing.T, pidFile string) int {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(pidFile); err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("fake service did not report its process group")
+	return 0
+}
+
+func processGroupAlive(pgid int) bool {
+	return syscall.Kill(-pgid, 0) == nil
+}
+
+func leaseHeld(t *testing.T, leasePath string) bool {
+	t.Helper()
+	file, err := os.OpenFile(leasePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open lease: %v", err)
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		return false
+	}
+	return true
+}
+
+func waitForServiceStopped(t *testing.T, pgid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processGroupAlive(pgid) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("service process group %d survived", pgid)
+}
+
+func waitForRunDirRemoved(t *testing.T, runDir string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(runDir); errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("run directory %s survived", runDir)
+}
+
+// TestRemoteScriptSurvivesUncleanDisconnect covers the core reconnect goal: an
+// EOF with no SHUTDOWN (a dropped tunnel) must leave the service running and
+// the run directory intact for the grace window.
+func TestRemoteScriptSurvivesUncleanDisconnect(t *testing.T) {
+	requireProcessTools(t)
+	runDir := makeRemoteRunDir(t)
+	process, writer, pgid := startSupervisedFakeService(t, runDir, 30*time.Second, 200*time.Millisecond)
+
+	if err := writer.Close(); err != nil { // unclean drop: EOF, no SHUTDOWN
 		t.Fatal(err)
 	}
-	process := newRunningProcess(command, writer, nil)
-	assertProcessRunning(t, process)
+	select {
+	case <-process.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attached shell did not exit on stdin EOF")
+	}
+
+	time.Sleep(800 * time.Millisecond) // several keeper probes at 200ms
+	if !processGroupAlive(pgid) {
+		t.Fatal("service was killed after an unclean disconnect within the grace window")
+	}
+	if _, err := os.Stat(runDir); err != nil {
+		t.Fatalf("run directory removed after an unclean disconnect: %v", err)
+	}
+}
+
+// TestRemoteScriptShutdownStopsServiceImmediately covers the explicit-close
+// path: runningProcess.stop writes SHUTDOWN, so even with a long grace window
+// the keeper stops the service and removes the run directory at once.
+func TestRemoteScriptShutdownStopsServiceImmediately(t *testing.T) {
+	requireProcessTools(t)
+	runDir := makeRemoteRunDir(t)
+	process, _, pgid := startSupervisedFakeService(t, runDir, 30*time.Second, 200*time.Millisecond)
 
 	started := time.Now()
 	process.stop()
 	if elapsed := time.Since(started); elapsed >= 2*time.Second {
-		t.Fatalf("control-pipe shutdown took %s; remote wrapper did not exit promptly", elapsed)
+		t.Fatalf("SHUTDOWN close took %s; attached shell did not exit promptly", elapsed)
+	}
+	waitForServiceStopped(t, pgid, 3*time.Second)
+	waitForRunDirRemoved(t, runDir, 3*time.Second)
+}
+
+// TestRemoteScriptGraceExpiryStopsService covers the timeout path: after an
+// unclean drop the keeper stops the service and removes the run directory once
+// the grace window of free-lease probes elapses.
+func TestRemoteScriptGraceExpiryStopsService(t *testing.T) {
+	requireProcessTools(t)
+	runDir := makeRemoteRunDir(t)
+	process, writer, pgid := startSupervisedFakeService(t, runDir, 400*time.Millisecond, 200*time.Millisecond)
+
+	if err := writer.Close(); err != nil { // unclean drop opens the grace window
+		t.Fatal(err)
+	}
+	select {
+	case <-process.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attached shell did not exit on stdin EOF")
+	}
+	waitForServiceStopped(t, pgid, 3*time.Second)
+	waitForRunDirRemoved(t, runDir, 3*time.Second)
+}
+
+// TestReattachScriptHoldsLeaseWhenSocketPresent verifies the re-attach script
+// re-acquires the lease when the Unix socket still exists and then blocks
+// watching stdin, stopping only on an explicit SHUTDOWN.
+func TestReattachScriptHoldsLeaseWhenSocketPresent(t *testing.T) {
+	requireProcessTools(t)
+	runDir := makeRemoteRunDir(t)
+	socketPath := filepath.Join(runDir, "j.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	command := exec.Command("sh", "-c", reattachScript(runDir, socketPath))
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stdin = reader
+	configureCommand(command)
+	if err := command.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	_ = reader.Close()
+	process := newRunningProcess(command, writer, nil)
+	t.Cleanup(func() {
+		_ = writer.Close()
+		select {
+		case <-process.done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+
+	assertProcessRunning(t, process)
+	if !leaseHeld(t, filepath.Join(runDir, "lease")) {
+		t.Fatal("re-attach did not hold the lease while the socket was present")
+	}
+
+	if _, err := io.WriteString(writer, "SHUTDOWN\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-process.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-attach did not exit on SHUTDOWN")
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "shutdown")); err != nil {
+		t.Fatalf("re-attach did not create the shutdown marker: %v", err)
+	}
+}
+
+// TestReattachScriptFailsWhenSocketMissing verifies the re-attach script exits
+// nonzero when the JupyterLab Unix socket is gone, so the caller leaves the
+// instance dead instead of forwarding to nothing.
+func TestReattachScriptFailsWhenSocketMissing(t *testing.T) {
+	requireProcessTools(t)
+	runDir := makeRemoteRunDir(t)
+	socketPath := filepath.Join(runDir, "j.sock") // never created
+
+	command := exec.Command("sh", "-c", reattachScript(runDir, socketPath))
+	err := command.Run()
+	if err == nil {
+		t.Fatal("re-attach succeeded without a live Unix socket")
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("re-attach failed with an unexpected error: %v", err)
+	}
+}
+
+// waitForWatcherPID polls watcher.pid until it records wantPid or the timeout
+// elapses, so eviction tests can synchronize on the recorded lease holder.
+func waitForWatcherPID(t *testing.T, watcherPath string, wantPid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(watcherPath); err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid == wantPid {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("watcher.pid did not record %d within %s", wantPid, timeout)
+}
+
+// TestReattachScriptEvictsStaleWatcher covers the reconnect defect: after a
+// network drop the old attached shell can survive behind a dead TCP peer and
+// keep holding the lease. Re-attach must evict that stale watcher (recorded in
+// watcher.pid) so a fresh attachment always wins the lease instead of 502ing.
+func TestReattachScriptEvictsStaleWatcher(t *testing.T) {
+	requireProcessTools(t)
+	runDir := makeRemoteRunDir(t)
+	socketPath := filepath.Join(runDir, "j.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	leasePath := filepath.Join(runDir, "lease")
+	watcherPath := filepath.Join(runDir, "watcher.pid")
+	// A stale watcher mimicking the dead-peer attached shell: it grabs the
+	// lease on fd 9, records its pid, then sleeps far longer than the test.
+	stale := `exec 9>` + shellQuote(leasePath) + `
+flock 9
+printf '%s\n' "$$" > ` + shellQuote(watcherPath) + `
+exec sleep 300`
+	staleCommand := exec.Command("sh", "-c", stale)
+	configureCommand(staleCommand)
+	if err := staleCommand.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stalePid := staleCommand.Process.Pid
+	staleDone := make(chan error, 1)
+	go func() { staleDone <- staleCommand.Wait() }()
+	t.Cleanup(func() { _ = syscall.Kill(stalePid, syscall.SIGKILL) })
+
+	waitForWatcherPID(t, watcherPath, stalePid, 3*time.Second)
+	if !leaseHeld(t, leasePath) {
+		t.Fatal("stale watcher did not take the lease")
+	}
+
+	command := exec.Command("sh", "-c", reattachScript(runDir, socketPath))
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stdin = reader
+	configureCommand(command)
+	if err := command.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	_ = reader.Close()
+	process := newRunningProcess(command, writer, nil)
+	t.Cleanup(func() {
+		_ = writer.Close()
+		select {
+		case <-process.done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+
+	// (b) the stale holder is killed, which is the only way it releases the
+	// lease it would otherwise sleep on for 300s.
+	select {
+	case werr := <-staleDone:
+		var staleExit *exec.ExitError
+		if !errors.As(werr, &staleExit) {
+			t.Fatalf("stale watcher exited without an error status: %v", werr)
+		}
+		status, ok := staleExit.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() {
+			t.Fatalf("stale watcher was not terminated by a signal: %v", werr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("re-attach did not evict the stale watcher")
+	}
+
+	// (c) watcher.pid now records the re-attach shell, written only after its
+	// flock succeeds, so this also proves (a) it holds the lease.
+	waitForWatcherPID(t, watcherPath, command.Process.Pid, 3*time.Second)
+	assertProcessRunning(t, process)
+	if !leaseHeld(t, leasePath) {
+		t.Fatal("re-attach did not hold the lease after evicting the stale watcher")
+	}
+
+	// The success path ends cleanly on an explicit shutdown, exactly like the
+	// attached launch shell.
+	if _, err := io.WriteString(writer, "SHUTDOWN\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-process.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("re-attach did not exit on SHUTDOWN")
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "shutdown")); err != nil {
+		t.Fatalf("re-attach did not create the shutdown marker: %v", err)
 	}
 }
 

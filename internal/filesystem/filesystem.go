@@ -15,6 +15,7 @@ var (
 	ErrTraversal                = errors.New("path contains a parent traversal")
 	ErrAtomicCreateUnsupported  = errors.New("server cannot safely create a new file without overwrite")
 	ErrAtomicReplaceUnsupported = errors.New("server cannot safely replace an existing file")
+	ErrDisconnected             = errors.New("filesystem backend disconnected")
 )
 
 // ReadSeekCloser is the file shape required by http.ServeContent.
@@ -72,6 +73,45 @@ type Backend interface {
 	Upload(context.Context, string, io.Reader, bool) (int64, error)
 	Readlink(context.Context, string) (string, error)
 	RealPath(context.Context, string) (string, error)
+}
+
+// Disconnected stands in for Backend while the SSH session behind it is
+// unavailable. Every method fails with ErrDisconnected so callers can detect
+// and report the outage instead of operating on a stale connection.
+type Disconnected struct{}
+
+var _ Backend = Disconnected{}
+
+func (Disconnected) Stat(context.Context, string) (fs.FileInfo, error) {
+	return nil, ErrDisconnected
+}
+
+func (Disconnected) Lstat(context.Context, string) (fs.FileInfo, error) {
+	return nil, ErrDisconnected
+}
+
+func (Disconnected) ReadDir(context.Context, string) ([]Entry, error) {
+	return nil, ErrDisconnected
+}
+
+func (Disconnected) Open(context.Context, string) (ReadSeekCloser, error) {
+	return nil, ErrDisconnected
+}
+
+func (Disconnected) Mkdir(context.Context, string) error {
+	return ErrDisconnected
+}
+
+func (Disconnected) Upload(context.Context, string, io.Reader, bool) (int64, error) {
+	return 0, ErrDisconnected
+}
+
+func (Disconnected) Readlink(context.Context, string) (string, error) {
+	return "", ErrDisconnected
+}
+
+func (Disconnected) RealPath(context.Context, string) (string, error) {
+	return "", ErrDisconnected
 }
 
 // CleanRemotePath rejects lexical parent traversal in browser-supplied paths.

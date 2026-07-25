@@ -116,8 +116,8 @@ func TestUnifiedActionsColumn(t *testing.T) {
 	if got := strings.Count(body, `aria-label="Launch JupyterLab"`); got != 2 {
 		t.Fatalf("current and child Jupyter icon count = %d, want 2", got)
 	}
-	if got := strings.Count(body, `aria-label="Launch TensorBoard"`); got != 1 {
-		t.Fatalf("TensorBoard event-directory icon count = %d, want 1", got)
+	if got := strings.Count(body, `aria-label="Launch TensorBoard"`); got != 2 {
+		t.Fatalf("current and child TensorBoard icon count = %d, want 2", got)
 	}
 	if got := strings.Count(body, `class="open-live icon-button"`); got != 1 {
 		t.Fatalf("PDF preview icon count = %d, want 1", got)
@@ -131,8 +131,8 @@ func TestUnifiedActionsColumn(t *testing.T) {
 	if got := strings.Count(childBody, `aria-label="Launch JupyterLab"`); got != 2 {
 		t.Fatalf("current and parent Jupyter icon count = %d, want 2", got)
 	}
-	if got := strings.Count(childBody, `aria-label="Launch TensorBoard"`); got != 1 {
-		t.Fatalf("current-directory TensorBoard icon count = %d, want 1", got)
+	if got := strings.Count(childBody, `aria-label="Launch TensorBoard"`); got != 2 {
+		t.Fatalf("current and parent TensorBoard icon count = %d, want 2", got)
 	}
 }
 

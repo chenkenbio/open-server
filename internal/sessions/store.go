@@ -33,16 +33,18 @@ type Entry struct {
 }
 
 type Options struct {
-	Port        *int    `yaml:"port,omitempty"`
-	RSH         *string `yaml:"rsh,omitempty"`
-	Duration    *string `yaml:"duration,omitempty"`
-	Title       *string `yaml:"title,omitempty"`
-	FontSize    *int    `yaml:"fontsize,omitempty"`
-	NoOpen      *bool   `yaml:"no-open,omitempty"`
-	TensorBoard *bool   `yaml:"tensorboard,omitempty"`
-	Jupyter     *bool   `yaml:"jupyter,omitempty"`
-	Python      *string `yaml:"python-interpreter,omitempty"`
-	LaTeX       *bool   `yaml:"latex,omitempty"`
+	Port           *int    `yaml:"port,omitempty"`
+	RSH            *string `yaml:"rsh,omitempty"`
+	Duration       *string `yaml:"duration,omitempty"`
+	Title          *string `yaml:"title,omitempty"`
+	FontSize       *int    `yaml:"fontsize,omitempty"`
+	NoOpen         *bool   `yaml:"no-open,omitempty"`
+	TensorBoard    *bool   `yaml:"tensorboard,omitempty"`
+	Jupyter        *bool   `yaml:"jupyter,omitempty"`
+	Python         *string `yaml:"python-interpreter,omitempty"`
+	LaTeX          *bool   `yaml:"latex,omitempty"`
+	NoReconnect    *bool   `yaml:"no-reconnect,omitempty"`
+	ReconnectGrace *string `yaml:"reconnect-grace,omitempty"`
 }
 
 type savedFile struct {
@@ -296,7 +298,7 @@ func (s savedSession) options() Options {
 }
 
 func (o Options) empty() bool {
-	return o.Port == nil && o.RSH == nil && o.Duration == nil && o.Title == nil && o.FontSize == nil && o.NoOpen == nil && o.TensorBoard == nil && o.Jupyter == nil && o.Python == nil && o.LaTeX == nil
+	return o.Port == nil && o.RSH == nil && o.Duration == nil && o.Title == nil && o.FontSize == nil && o.NoOpen == nil && o.TensorBoard == nil && o.Jupyter == nil && o.Python == nil && o.LaTeX == nil && o.NoReconnect == nil && o.ReconnectGrace == nil
 }
 
 func validateOptions(options Options) error {
@@ -316,6 +318,12 @@ func validateOptions(options Options) error {
 		duration, err := time.ParseDuration(*options.Duration)
 		if err != nil || duration < 0 {
 			return errors.New("duration must be a valid non-negative Go duration")
+		}
+	}
+	if options.ReconnectGrace != nil {
+		grace, err := time.ParseDuration(*options.ReconnectGrace)
+		if err != nil || grace < 0 {
+			return errors.New("reconnect-grace must be a valid non-negative Go duration")
 		}
 	}
 	return nil

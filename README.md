@@ -15,7 +15,7 @@ and is not installed on the remote machine.
 - Browse local paths and remote SSH/SFTP paths without installing `open-server`
   on the remote host.
 - Create directories; upload, paste, import, preview, and download files; copy
-  paths; sort directory contents; and show or hide hidden entries.
+  paths; sort and filter directory contents; and show or hide hidden entries.
 - Open several local paths, remote paths, or saved sessions in one command.
 - Launch TensorBoard for event-log directories and JupyterLab for project
   directories, including remote processes reached through SSH tunnels.
@@ -90,6 +90,11 @@ Options supplied to `--add` are saved with the target. Explicit command-line
 options override saved values. Run `./open-server -help` for the complete CLI
 reference.
 
+Saved sessions keep their configured port. If that port is already in use,
+`open-server` reports that another session may be running instead of silently
+changing the saved port. Use `--allow-port-change` to choose and remember
+another available port, or run `open-server --edit` to assign a specific port.
+
 The file browser uses a 14 px base font. Choose an integer size from 8 through
 72 with `-fontsize`; controls and dialogs scale with it, while compact table
 padding gives the text more of each row's height. The option can also be saved
@@ -100,6 +105,23 @@ with a named session:
 ./open-server --add work lab:~/projects -fontsize 18
 ```
 
+## Reconnection
+
+SSH/SFTP sessions reconnect automatically after an unexpected drop, using
+bounded retries with backoff. The local URL and port stay the same, so open
+browser tabs do not need to be reloaded: file operations return a temporary
+503 while the SSH connection is down, and normal browsing resumes once it
+reconnects. Use `-no-reconnect` to disable this and end the session
+immediately on a drop instead.
+
+Remote TensorBoard and JupyterLab processes are not stopped when the SSH
+connection drops; they keep running so a brief interruption does not lose
+in-progress work, and `open-server` re-attaches their tunnels automatically
+once reconnected. `-reconnect-grace` (default 30m) bounds how long they wait
+for that reconnection before shutting down. Closing the session explicitly,
+whether from **Close open-server** or Ctrl-C, still stops them immediately
+regardless of the grace window.
+
 ## File operations
 
 Directories can be sorted by name, modification time, or size, and hidden files
@@ -107,6 +129,14 @@ can be shown when needed. `open-server` can create directories, upload multiple
 files, save a file from the clipboard, import a file from a URL, copy full
 paths, and download original files. Existing destination files are not replaced
 without an explicit overwrite choice.
+
+Directory listings can be filtered in the browser with a regular expression
+matched against each entry's basename. Matching is case-sensitive by default;
+enable **Ignore case** when needed. While a filter is applied, an **Active**
+badge and blue highlighting on the input and match count make the filtered state
+obvious. The current valid filter is remembered separately for each folder for
+the life of the browser tab. Use the **?** button beside the filter for syntax
+notes and examples.
 
 URL imports are fetched by the personal device running `open-server`, including
 in SSH/SFTP and sharing modes.
@@ -116,14 +146,29 @@ in SSH/SFTP and sharing modes.
 Preview and download are separate operations. Preview uses a safe representation
 when possible, while download always returns the original file as an attachment.
 
-- Plain text, source code, CSV/TSV, HTML, XML, SVG, EPS/PostScript, TeX, PGF,
-  and TikZ are displayed as inert plain text. They are never interpreted or
-  compiled by `open-server`.
+- HTML, HTM, and XHTML render as static documents. Relative CSS, images, fonts,
+  and media can load from the same browsed directory; scripts, forms, frames,
+  objects, workers, and external network connections remain disabled.
+  Root-relative site paths are not remapped into the browsed directory.
+- Markdown (`.md` and `.markdown`) is rendered on the server with tables, task
+  lists, strikethrough, autolinks, and heading IDs. Relative images and links
+  use the corresponding preview routes. Raw HTML and dangerous link schemes
+  are omitted. Syntax highlighting and math rendering are not included.
+- SVG opens through an `open-server` page as an image rather than as an
+  interactive document. Scripts, event handlers, and external resources are
+  disabled; self-contained declarative animation may still run.
+- Plain text, source code, CSV/TSV, XML, JavaScript, CSS, EPS/PostScript, TeX,
+  PGF, and TikZ otherwise remain inert source previews. They are not compiled
+  or executed by `open-server`.
 - Raster images, supported audio/video, and PDFs use the browser's native
   viewer. Unknown binary formats fall back to download.
-- Source preview responses disable scripts, objects, forms, and network
-  connections, prevent MIME sniffing, and are restricted to the current
-  browser origin.
+- Preview responses are sandboxed, prevent MIME sniffing and framing, and are
+  restricted to the current browser origin.
+
+Directory listing does not open or parse preview files. HTML and SVG content is
+streamed when selected; Markdown is read and parsed only when selected. There
+is no preview-size limit, so unusually large Markdown files or pathological
+HTML/SVG graphics can still consume browser or server CPU and memory.
 
 PDF previews use Chrome's PDFium or Firefox's PDF.js inside the browser sandbox.
 The live viewer uses the bundled PDF.js runtime with embedded PDF scripting
@@ -165,12 +210,14 @@ snippets require `graphicx`; table snippets require `csvsimple`.
 ./open-server lab:/data/runs -tensorboard -py /opt/venv/bin/python
 ```
 
-A directory can launch TensorBoard when it directly contains an
-`events.out.tfevents.*` file. In SSH/SFTP mode, `open-server` starts TensorBoard
-on the remote host through SSH, creates the tunnel, and proxies it through the
-current session. This does not install `open-server` on the remote host.
-Repeated launches reuse the running process for that directory; it is stopped
-when the session ends. TensorBoard actions are unavailable with `-serve`.
+TensorBoard actions are shown for every directory without scanning its
+contents. When an action is selected, `open-server` checks that the directory
+directly contains an `events.out.tfevents.*` file before starting TensorBoard.
+In SSH/SFTP mode, it starts TensorBoard on the remote host through SSH, creates
+the tunnel, and proxies it through the current session. This does not install
+`open-server` on the remote host. Repeated launches reuse the running process
+for that directory; it is stopped when the session ends. TensorBoard actions
+are unavailable with `-serve`.
 
 Remote TensorBoard listens on a per-launch Unix socket inside a user-owned
 `0700` runtime directory. The socket is forwarded through the same SSH session
@@ -251,9 +298,11 @@ not available in this mode.
 `open-server` assumes a single trusted OS user on the personal device. In
 ordinary local and SSH/SFTP modes, the web listener is restricted to IPv4
 loopback. It validates the exact `Host` header and requires the exact local
-`Origin` for state-changing requests. Active web content such as HTML, SVG, and
-JavaScript is served only as sandboxed plain-text source, never with an
-executable browser MIME type.
+`Origin` for state-changing requests. Static HTML uses a sandboxed browser MIME
+type with scripts and active capabilities disabled. SVG is loaded only in image
+mode with a stricter resource policy, and Markdown is converted with raw HTML
+and dangerous links disabled. JavaScript and other source formats remain inert
+plain text.
 
 Local `-tensorboard` and `-jupyter` inherit that assumption. Their outer
 `open-server` proxy listens on IPv4 loopback without a token, and loopback is

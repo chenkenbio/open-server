@@ -32,6 +32,8 @@ const (
 	kernelGracePeriod     = time.Second
 	remoteNonceBytes      = 16
 	remoteRunPrefix       = "/tmp/osj-"
+	remoteDefaultGrace    = 30 * time.Minute
+	remoteKeeperCheck     = 5 * time.Second
 	contentsManagerModule = "open_server_jupyter"
 	contentsManagerClass  = contentsManagerModule + ".WorkingDirectoryContentsManager"
 )
@@ -65,6 +67,7 @@ type ProcessLauncher struct {
 	host         string
 	serverPython string
 	output       io.Writer
+	grace        time.Duration
 	mu           sync.Mutex
 	instances    []*runningInstance
 	closed       bool
@@ -83,7 +86,20 @@ func NewRemote(rsh, host, serverPython string, output io.Writer) *ProcessLaunche
 		host:         host,
 		serverPython: serverPython,
 		output:       output,
+		grace:        remoteDefaultGrace,
 	}
+}
+
+// SetGrace overrides how long a remote JupyterLab keeps running after an
+// unclean SSH disconnect before its keeper stops it. Non-positive values are
+// ignored so the default grace window is preserved.
+func (l *ProcessLauncher) SetGrace(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	l.mu.Lock()
+	l.grace = d
+	l.mu.Unlock()
 }
 
 // Start launches JupyterLab rooted at directory.
@@ -129,14 +145,19 @@ func (l *ProcessLauncher) startOnce(directory, kernelPython, pathPrefix string) 
 	var command *exec.Cmd
 	var temporaryDirectory string
 	var remoteFrame string
+	var runDirectory, socketPath string
 	var stdinReader, stdinWriter *os.File
 	if l.remote {
-		runDirectory, socketPath, pathErr := newRemoteRuntime()
+		var pathErr error
+		runDirectory, socketPath, pathErr = newRemoteRuntime()
 		if pathErr != nil {
 			return nil, pathErr
 		}
+		l.mu.Lock()
+		grace := l.grace
+		l.mu.Unlock()
 		executable, arguments, commandErr := remoteCommand(
-			l.rsh, l.host, l.serverPython, localPort, runDirectory, socketPath,
+			l.rsh, l.host, l.serverPython, localPort, runDirectory, socketPath, grace, remoteKeeperCheck,
 		)
 		if commandErr != nil {
 			return nil, commandErr
@@ -219,6 +240,10 @@ func (l *ProcessLauncher) startOnce(directory, kernelPython, pathPrefix string) 
 		token:           token,
 		pathPrefix:      pathPrefix,
 		temporaryPrefix: temporaryDirectory,
+		remote:          l.remote,
+		localPort:       localPort,
+		runDirectory:    runDirectory,
+		socketPath:      socketPath,
 	}
 
 	l.mu.Lock()
@@ -230,7 +255,9 @@ func (l *ProcessLauncher) startOnce(directory, kernelPython, pathPrefix string) 
 	l.instances = append(l.instances, running)
 	l.mu.Unlock()
 
-	if err := waitUntilReady(running, diagnostic); err != nil {
+	if err := waitUntilReady(
+		context.Background(), target, pathPrefix, token, running.process.done, diagnostic,
+	); err != nil {
 		running.stopWithoutAPI()
 		return nil, err
 	}
@@ -246,6 +273,93 @@ func (l *ProcessLauncher) Close() {
 	for _, instance := range instances {
 		instance.stop()
 	}
+}
+
+// Reattach re-establishes the SSH tunnel for every remote JupyterLab whose
+// connection died but whose service survived the grace window. It is a no-op
+// for local launchers and for instances whose process is still alive. The
+// method is deliberately not part of the Launcher interface; callers that need
+// it type-assert to *ProcessLauncher.
+func (l *ProcessLauncher) Reattach(ctx context.Context) {
+	l.mu.Lock()
+	closed := l.closed
+	remote := l.remote
+	instances := append([]*runningInstance(nil), l.instances...)
+	l.mu.Unlock()
+	if closed || !remote {
+		return
+	}
+	for _, instance := range instances {
+		if !instance.remote {
+			continue
+		}
+		l.mu.Lock()
+		process := instance.process
+		l.mu.Unlock()
+		select {
+		case <-process.done:
+		default:
+			continue
+		}
+		l.reattachInstance(ctx, instance)
+	}
+}
+
+// reattachInstance spawns a fresh re-attach SSH connection for one dead remote
+// instance, confirms readiness through the HTTP probe, and swaps in the new
+// process so Close still stops it. Failures are logged and leave the instance
+// dead so the proxy returns 502 until the user relaunches from the browser.
+func (l *ProcessLauncher) reattachInstance(ctx context.Context, instance *runningInstance) {
+	executable, arguments, err := reattachCommand(
+		l.rsh, l.host, instance.localPort, instance.runDirectory, instance.socketPath,
+	)
+	if err != nil {
+		fmt.Fprintf(l.output, "open-server: JupyterLab at %s could not be re-attached: %v\n", instance.pathPrefix, err)
+		return
+	}
+	command := exec.Command(executable, arguments...)
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintf(l.output, "open-server: JupyterLab at %s could not be re-attached: %v\n", instance.pathPrefix, err)
+		return
+	}
+	command.Stdin = stdinReader
+	configureCommand(command)
+	diagnostic := newCaptureWriter(l.output, instance.token)
+	filtered := newRemoteSocketDiagnosticFilter(diagnostic)
+	command.Stdout = filtered
+	command.Stderr = filtered
+	flush := func() {
+		filtered.Flush()
+		diagnostic.Flush()
+	}
+	if err := command.Start(); err != nil {
+		_ = stdinReader.Close()
+		_ = stdinWriter.Close()
+		fmt.Fprintf(l.output, "open-server: JupyterLab at %s could not be re-attached: %v\n", instance.pathPrefix, err)
+		return
+	}
+	_ = stdinReader.Close()
+	process := newRunningProcess(command, stdinWriter, flush)
+	if err := waitUntilReady(
+		ctx, instance.target, instance.pathPrefix, instance.token, process.done, diagnostic,
+	); err != nil {
+		process.stop()
+		fmt.Fprintf(
+			l.output,
+			"open-server: JupyterLab at %s could not be re-attached; relaunch it from the browser to restart\n",
+			instance.pathPrefix,
+		)
+		return
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		process.stop()
+		return
+	}
+	instance.process = process
+	l.mu.Unlock()
 }
 
 func validateLaunch(directory, kernelPython, pathPrefix string) error {
@@ -394,6 +508,7 @@ func setEnvironment(environment []string, name, value string) []string {
 
 func remoteCommand(
 	rsh, host, serverPython string, localPort int, runDirectory, socketPath string,
+	grace, check time.Duration,
 ) (string, []string, error) {
 	if rsh == "" {
 		rsh = "ssh"
@@ -407,8 +522,20 @@ func remoteCommand(
 	if err := validateRemoteRuntime(runDirectory, socketPath); err != nil {
 		return "", nil, err
 	}
+	arguments := append(
+		sshTunnelArguments(localPort, socketPath),
+		host,
+		remoteJupyterScript(serverPython, runDirectory, socketPath, grace, check),
+	)
+	return rsh, arguments, nil
+}
+
+// sshTunnelArguments returns the hardened SSH options and Unix-socket forward
+// shared by the initial launch and the re-attach connection. ServerAlive*
+// keepalives make the client notice a dead tunnel instead of hanging silently.
+func sshTunnelArguments(localPort int, socketPath string) []string {
 	forward := fmt.Sprintf("127.0.0.1:%d:%s", localPort, socketPath)
-	arguments := []string{
+	return []string{
 		"-T", "-x", "-a",
 		"-o", "ExitOnForwardFailure=yes",
 		"-o", "SessionType=default",
@@ -418,14 +545,37 @@ func remoteCommand(
 		"-o", "ControlPersist=no",
 		"-o", "PermitLocalCommand=no",
 		"-o", "RemoteCommand=none",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
 		"-L", forward,
-		host,
-		remoteJupyterScript(serverPython, runDirectory, socketPath),
 	}
+}
+
+// reattachCommand builds the SSH argv that re-establishes the Unix-socket
+// forward to a JupyterLab that survived an unclean disconnect. It runs no
+// bootstrap and starts no service; it only re-holds the lease and watches for
+// an explicit shutdown, so readiness is confirmed by the HTTP probe.
+func reattachCommand(
+	rsh, host string, localPort int, runDirectory, socketPath string,
+) (string, []string, error) {
+	if rsh == "" {
+		rsh = "ssh"
+	}
+	if host == "" || strings.HasPrefix(host, "-") || strings.ContainsAny(host, "\x00\r\n") {
+		return "", nil, errors.New("invalid SSH host for JupyterLab")
+	}
+	if err := validateRemoteRuntime(runDirectory, socketPath); err != nil {
+		return "", nil, err
+	}
+	arguments := append(
+		sshTunnelArguments(localPort, socketPath),
+		host,
+		reattachScript(runDirectory, socketPath),
+	)
 	return rsh, arguments, nil
 }
 
-func remoteJupyterScript(serverPython, runDirectory, socketPath string) string {
+func remoteJupyterScript(serverPython, runDirectory, socketPath string, grace, check time.Duration) string {
 	setup := []string{
 		"umask 077",
 		"runtime_created=",
@@ -460,52 +610,145 @@ func remoteJupyterScript(serverPython, runDirectory, socketPath string) string {
 		`"--ServerApp.certfile=" "--ServerApp.keyfile=" "--ServerApp.ssl_options={}" ` +
 		`"--ServerApp.contents_manager_class=` + contentsManagerClass + `" ` +
 		`"--KernelManager.transport=ipc"`
-	return supervisedRemoteScript(
-		setup,
-		serviceCommand,
-		[]string{`if [ -n "${runtime_created:-}" ]; then case ` + shellQuote(runDirectory) + ` in /tmp/osj-*) rm -rf -- ` + shellQuote(runDirectory) + ` ;; esac; fi`},
-	)
+	return supervisedRemoteScript(setup, serviceCommand, runDirectory, grace, check)
 }
 
-func supervisedRemoteScript(setup []string, serviceCommand string, extraCleanup []string) string {
-	lines := []string{
-		"jupyter_pid=",
-		"stdin_watcher_pid=",
-		"cleanup() {",
-		`  if [ -n "$stdin_watcher_pid" ]; then`,
-		`    kill "$stdin_watcher_pid" 2>/dev/null || :`,
-		`    wait "$stdin_watcher_pid" 2>/dev/null || :`,
-		"  fi",
-		`  if [ -n "$jupyter_pid" ]; then`,
-		`    kill -TERM -"$jupyter_pid" 2>/dev/null || :`,
+// supervisedRemoteScript wraps the JupyterLab service so it survives an unclean
+// SSH disconnect for a grace window yet still dies immediately on an explicit
+// close. The attached shell holds an exclusive flock lease on the run directory
+// and records its pid in watcher.pid so a later re-attach can evict it; a
+// detached keeper started after the service watches that lease and a shutdown
+// marker to decide when to stop the service and remove the runtime.
+//
+// The kernel releases the lease automatically when the attached shell dies,
+// however unclean, so a dropped tunnel opens the grace window without any
+// signal. A clean close writes a SHUTDOWN line on stdin: the attached shell
+// touches the marker and exits, and the keeper stops the service at once.
+func supervisedRemoteScript(setup []string, serviceCommand, runDirectory string, grace, check time.Duration) string {
+	probes := graceProbeCount(grace, check)
+	keeper := strings.Join([]string{
+		"service_pgid=$1",
+		"run_dir=$2",
+		"idle=0",
+		`while kill -0 -"$service_pgid" 2>/dev/null; do`,
+		`  if [ -e "$run_dir/shutdown" ]; then`,
+		`    kill -TERM -"$service_pgid" 2>/dev/null || :`,
 		"    sleep 0.5",
-		`    kill -KILL -"$jupyter_pid" 2>/dev/null || :`,
-		`    wait "$jupyter_pid" 2>/dev/null || :`,
+		`    kill -KILL -"$service_pgid" 2>/dev/null || :`,
+		"    break",
 		"  fi",
-	}
-	for _, command := range extraCleanup {
-		lines = append(lines, "  "+command)
-	}
-	lines = append(lines,
+		`  if flock -n "$run_dir/lease" true 2>/dev/null; then`,
+		"    idle=$((idle + 1))",
+		`    if [ "$idle" -ge ` + strconv.Itoa(probes) + ` ]; then`,
+		`      kill -TERM -"$service_pgid" 2>/dev/null || :`,
+		"      sleep 0.5",
+		`      kill -KILL -"$service_pgid" 2>/dev/null || :`,
+		"      break",
+		"    fi",
+		"  else",
+		"    idle=0",
+		"  fi",
+		"  sleep " + secondsArgument(check),
+		"done",
+		`case "$run_dir" in /tmp/osj-*) rm -rf -- "$run_dir" ;; esac`,
+	}, "\n")
+
+	lines := []string{
+		"run_dir=" + shellQuote(runDirectory),
+		"keeper_started=",
+		"cleanup() {",
+		`  if [ -n "${keeper_started:-}" ]; then`,
+		"    return",
+		"  fi",
+		`  if [ -n "${runtime_created:-}" ]; then`,
+		`    case "$run_dir" in /tmp/osj-*) rm -rf -- "$run_dir" ;; esac`,
+		"  fi",
 		"}",
 		"trap cleanup EXIT",
 		"trap 'exit 143' HUP INT TERM",
-	)
+	}
 	lines = append(lines, setup...)
 	lines = append(lines,
-		"exec 3<&0",
-		"setsid "+serviceCommand+" </dev/null 3<&- &",
-		"jupyter_pid=$!",
-		`(cat <&3 >/dev/null; kill -TERM "$$" 2>/dev/null || :) &`,
-		"stdin_watcher_pid=$!",
-		`wait "$jupyter_pid"`,
-		"status=$?",
-		`kill "$stdin_watcher_pid" 2>/dev/null || :`,
-		`wait "$stdin_watcher_pid" 2>/dev/null || :`,
-		"stdin_watcher_pid=",
-		`exit "$status"`,
+		`exec 9>"$run_dir/lease"`,
+		`flock 9 || { echo "open-server: cannot hold the JupyterLab session lease" >&2; exit 1; }`,
+		`printf '%s\n' "$$" > "$run_dir/watcher.pid"`,
+		"setsid "+serviceCommand+" </dev/null 9>&- &",
+		"service_pgid=$!",
+		"setsid sh -c "+shellQuote(keeper)+` osj-keeper "$service_pgid" "$run_dir" 9>&- </dev/null >/dev/null 2>&1 &`,
+		"keeper_started=1",
+		`while IFS= read -r line; do`,
+		`  if [ "$line" = SHUTDOWN ]; then`,
+		`    touch "$run_dir/shutdown" 2>/dev/null || :`,
+		"    break",
+		"  fi",
+		"done",
+		"exit 0",
 	)
 	return strings.Join(lines, "\n")
+}
+
+// reattachScript re-holds the lease for a JupyterLab that outlived its previous
+// SSH connection. It confirms the Unix socket still exists, then acquires the
+// lease, evicting any stale holder first. After a dropped tunnel the old
+// attached shell can stay alive behind a dead TCP peer that sshd only notices
+// after its multi-hour keepalive, so it keeps holding the lease. Run
+// directories are per-launch nonces, so any holder at re-attach time is our own
+// stale watcher by definition and is safe to evict: a non-blocking flock probe,
+// then a TERM to the pid recorded in watcher.pid, then a brief blocking wait
+// (the kill can race a keeper probe that momentarily holds the lock). Once the
+// lease is held it records its own pid and watches stdin for an explicit
+// shutdown exactly like the attached launch shell.
+func reattachScript(runDirectory, socketPath string) string {
+	lines := []string{
+		"umask 077",
+		"run_dir=" + shellQuote(runDirectory),
+		"socket_path=" + shellQuote(socketPath),
+		`if [ ! -S "$socket_path" ]; then`,
+		`  echo "open-server: JupyterLab socket is gone" >&2`,
+		"  exit 1",
+		"fi",
+		`exec 9>"$run_dir/lease"`,
+		`if ! flock -n 9; then`,
+		`  pid=$(cat "$run_dir/watcher.pid" 2>/dev/null)`,
+		`  [ -n "$pid" ] && { kill -TERM "$pid" 2>/dev/null || :; }`,
+		`  flock -w 5 9 || { echo "open-server: JupyterLab is still held by another session" >&2; exit 1; }`,
+		"fi",
+		`printf '%s\n' "$$" > "$run_dir/watcher.pid"`,
+		`while IFS= read -r line; do`,
+		`  if [ "$line" = SHUTDOWN ]; then`,
+		`    touch "$run_dir/shutdown" 2>/dev/null || :`,
+		"    break",
+		"  fi",
+		"done",
+		"exit 0",
+	}
+	return strings.Join(lines, "\n")
+}
+
+// graceProbeCount converts a grace window into the number of consecutive
+// free-lease probes the keeper must observe before stopping the service,
+// rounding up so the window is never shorter than requested.
+func graceProbeCount(grace, check time.Duration) int {
+	if check <= 0 {
+		check = remoteKeeperCheck
+	}
+	if grace <= 0 {
+		grace = remoteDefaultGrace
+	}
+	probes := int((grace + check - 1) / check)
+	if probes < 1 {
+		probes = 1
+	}
+	return probes
+}
+
+// secondsArgument formats a duration as a bare seconds value for sh's sleep,
+// trimming trailing zeros so tests can use sub-second intervals.
+func secondsArgument(d time.Duration) string {
+	if d <= 0 {
+		d = remoteKeeperCheck
+	}
+	return strconv.FormatFloat(d.Seconds(), 'f', -1, 64)
 }
 
 func shellQuote(value string) string {
@@ -891,16 +1134,19 @@ if __name__ == "__main__":
     main()
 `
 
-func waitUntilReady(instance *runningInstance, diagnostic *captureWriter) error {
-	statusURL := instance.target.String() + instance.pathPrefix + "api/status"
+func waitUntilReady(
+	ctx context.Context, target *url.URL, pathPrefix, token string,
+	done <-chan struct{}, diagnostic *captureWriter,
+) error {
+	statusURL := target.String() + pathPrefix + "api/status"
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	deadline := time.NewTimer(readinessTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		request, _ := http.NewRequest(http.MethodGet, statusURL, nil)
-		request.Header.Set("Authorization", "token "+instance.token)
+		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+		request.Header.Set("Authorization", "token "+token)
 		response, err := client.Do(request)
 		if err == nil {
 			_ = response.Body.Close()
@@ -909,7 +1155,9 @@ func waitUntilReady(instance *runningInstance, diagnostic *captureWriter) error 
 			}
 		}
 		select {
-		case <-instance.process.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
 			message := strings.TrimSpace(diagnostic.String())
 			if message != "" {
 				return fmt.Errorf("JupyterLab exited before becoming ready: %s", message)
@@ -956,6 +1204,10 @@ type runningInstance struct {
 	token           string
 	pathPrefix      string
 	temporaryPrefix string
+	remote          bool
+	localPort       int
+	runDirectory    string
+	socketPath      string
 	stopOnce        sync.Once
 }
 
@@ -1037,12 +1289,12 @@ func listKernels(ctx context.Context, target *url.URL, pathPrefix, token string)
 
 type runningProcess struct {
 	command  *exec.Cmd
-	stdin    io.Closer
+	stdin    io.WriteCloser
 	done     chan struct{}
 	stopOnce sync.Once
 }
 
-func newRunningProcess(command *exec.Cmd, stdin io.Closer, onDone func()) *runningProcess {
+func newRunningProcess(command *exec.Cmd, stdin io.WriteCloser, onDone func()) *runningProcess {
 	process := &runningProcess{command: command, stdin: stdin, done: make(chan struct{})}
 	go func() {
 		_ = command.Wait()
@@ -1065,6 +1317,11 @@ func (p *runningProcess) stop() {
 		default:
 		}
 		if p.stdin != nil {
+			// Remote shells watch stdin for SHUTDOWN and stop the service at
+			// once; closing the pipe alone would only look like an unclean
+			// disconnect and start the grace window. The write is best-effort:
+			// EOF from the close is the fallback path.
+			_, _ = io.WriteString(p.stdin, "SHUTDOWN\n")
 			_ = p.stdin.Close()
 			select {
 			case <-p.done:

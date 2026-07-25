@@ -2,6 +2,7 @@ package tensorboard
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,24 +33,58 @@ type Launcher interface {
 }
 
 type ProcessLauncher struct {
-	remote    bool
-	rsh       string
-	host      string
-	python    string
-	output    io.Writer
-	mu        sync.Mutex
-	processes []*runningProcess
-	closed    bool
+	remote  bool
+	rsh     string
+	host    string
+	python  string
+	output  io.Writer
+	grace   time.Duration
+	mu      sync.Mutex
+	records []*tunnelRecord
+	closed  bool
+}
+
+// tunnelRecord retains everything needed to re-attach a remote TensorBoard
+// tunnel after its SSH transport dies without restarting the remote service.
+type tunnelRecord struct {
+	localPort        int
+	runtimeDirectory string
+	remoteSocket     string
+	pathPrefix       string
+	token            string
+	process          *runningProcess
 }
 
 const remoteReadySentinel = "OPEN_SERVER_TENSORBOARD_READY\n"
+
+// remoteKeeperCheckInterval is how often the detached remote keeper loop polls
+// the lease and shutdown marker in production launches.
+const remoteKeeperCheckInterval = 5 * time.Second
+
+// remoteDefaultGrace is how long a remote TensorBoard service survives an
+// unclean SSH disconnect before the keeper reclaims it.
+const remoteDefaultGrace = 30 * time.Minute
 
 func NewLocal(pythonInterpreter string, output io.Writer) *ProcessLauncher {
 	return &ProcessLauncher{python: pythonInterpreter, output: output}
 }
 
 func NewRemote(rsh, host, pythonInterpreter string, output io.Writer) *ProcessLauncher {
-	return &ProcessLauncher{remote: true, rsh: rsh, host: host, python: pythonInterpreter, output: output}
+	return &ProcessLauncher{
+		remote: true, rsh: rsh, host: host, python: pythonInterpreter,
+		output: output, grace: remoteDefaultGrace,
+	}
+}
+
+// SetGrace overrides how long a disconnected remote service survives before the
+// keeper reclaims it. Non-positive durations are ignored.
+func (l *ProcessLauncher) SetGrace(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	l.mu.Lock()
+	l.grace = d
+	l.mu.Unlock()
 }
 
 func (l *ProcessLauncher) Start(logDirectory, pathPrefix string) (*Instance, error) {
@@ -78,6 +114,7 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 
 	var command *exec.Cmd
 	var remoteFrame []byte
+	var runtimeDirectory, remoteSocket string
 	token := ""
 	if l.remote {
 		token, err = randomHex(32)
@@ -88,10 +125,14 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 		if err != nil {
 			return nil, fmt.Errorf("generate TensorBoard runtime name: %w", err)
 		}
-		runtimeDirectory := "/tmp/open-server-tb-" + nonce
-		remoteSocket := runtimeDirectory + "/tensorboard.sock"
+		runtimeDirectory = "/tmp/open-server-tb-" + nonce
+		remoteSocket = runtimeDirectory + "/tensorboard.sock"
+		l.mu.Lock()
+		grace := l.grace
+		l.mu.Unlock()
 		executable, arguments, err := remoteCommand(
 			l.rsh, l.host, l.python, localPort, runtimeDirectory, remoteSocket,
+			grace, remoteKeeperCheckInterval,
 		)
 		if err != nil {
 			return nil, err
@@ -142,19 +183,34 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 	if stdinReader != nil {
 		_ = stdinReader.Close()
 	}
-	process := newRunningProcess(command, stdinWriter, func() {
+	// Only remote launches carry an SSH control pipe. A nil *os.File must reach
+	// newRunningProcess as a genuine nil interface so stop() skips the remote
+	// SHUTDOWN handshake for local processes.
+	var stdin io.WriteCloser
+	if stdinWriter != nil {
+		stdin = stdinWriter
+	}
+	process := newRunningProcess(command, stdin, func() {
 		if readiness != nil {
 			readiness.Flush()
 		}
 		diagnostic.Flush()
 	})
+	record := &tunnelRecord{
+		localPort:        localPort,
+		runtimeDirectory: runtimeDirectory,
+		remoteSocket:     remoteSocket,
+		pathPrefix:       pathPrefix,
+		token:            token,
+		process:          process,
+	}
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
 		process.stop()
 		return nil, errors.New("TensorBoard launcher is closed")
 	}
-	l.processes = append(l.processes, process)
+	l.records = append(l.records, record)
 	l.mu.Unlock()
 	if stdinWriter != nil {
 		written, writeErr := stdinWriter.Write(remoteFrame)
@@ -167,59 +223,80 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 		}
 	}
 	if readiness != nil {
-		readyTimer := time.NewTimer(15 * time.Second)
-		defer readyTimer.Stop()
-		select {
-		case <-readiness.Ready():
-		case <-process.done:
-			message := strings.TrimSpace(diagnostic.String())
-			if message != "" {
-				return nil, fmt.Errorf("TensorBoard exited before becoming ready: %s", message)
-			}
-			return nil, errors.New("TensorBoard exited before becoming ready")
-		case <-readyTimer.C:
+		if err := waitForReadySentinel(context.Background(), readiness, process.done, diagnostic); err != nil {
 			process.stop()
-			return nil, errors.New("TensorBoard did not create its private socket within 15 seconds")
+			return nil, err
 		}
 	}
 
-	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort))
-	target, _ := url.Parse("http://" + address)
-	probeURL := target.String() + pathPrefix + "/"
-	probeClient := &http.Client{Timeout: 500 * time.Millisecond}
+	target, _ := url.Parse("http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)))
+	if err := probeTensorBoardReady(context.Background(), localPort, pathPrefix, token, process.done, diagnostic); err != nil {
+		process.stop()
+		return nil, err
+	}
+	return &Instance{Target: target, Token: token}, nil
+}
+
+// waitForReadySentinel blocks until the remote helper announces readiness, the
+// SSH session exits, the deadline elapses, or the context is cancelled.
+func waitForReadySentinel(ctx context.Context, readiness *readinessWriter, done <-chan struct{}, diagnostic *captureWriter) error {
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-readiness.Ready():
+		return nil
+	case <-done:
+		return exitedBeforeReady(diagnostic)
+	case <-timer.C:
+		return errors.New("TensorBoard did not create its private socket within 15 seconds")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// probeTensorBoardReady polls the forwarded local port until TensorBoard serves
+// an authenticated response, the session exits, the attempt times out, or the
+// context is cancelled.
+func probeTensorBoardReady(ctx context.Context, localPort int, pathPrefix, token string, done <-chan struct{}, diagnostic *captureWriter) error {
+	probeURL := "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)) + pathPrefix + "/"
+	client := &http.Client{Timeout: 500 * time.Millisecond}
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		request, requestErr := http.NewRequest(http.MethodGet, probeURL, nil)
-		if requestErr != nil {
-			process.stop()
-			return nil, fmt.Errorf("create TensorBoard readiness request: %w", requestErr)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+		if err != nil {
+			return fmt.Errorf("create TensorBoard readiness request: %w", err)
 		}
 		if token != "" {
 			request.Header.Set("Authorization", "Bearer "+token)
 		}
-		response, probeErr := probeClient.Do(request)
+		response, probeErr := client.Do(request)
 		if probeErr == nil {
 			_ = response.Body.Close()
 			if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusBadRequest {
-				return &Instance{Target: target, Token: token}, nil
+				return nil
 			}
 		}
 		select {
-		case <-process.done:
-			message := strings.TrimSpace(diagnostic.String())
-			if message != "" {
-				return nil, fmt.Errorf("TensorBoard exited before becoming ready: %s", message)
-			}
-			return nil, errors.New("TensorBoard exited before becoming ready")
+		case <-done:
+			return exitedBeforeReady(diagnostic)
 		case <-deadline.C:
-			process.stop()
-			return nil, errors.New("TensorBoard did not become ready within 15 seconds")
+			return errors.New("TensorBoard did not become ready within 15 seconds")
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}
+}
+
+func exitedBeforeReady(diagnostic *captureWriter) error {
+	message := strings.TrimSpace(diagnostic.String())
+	if message != "" {
+		return fmt.Errorf("TensorBoard exited before becoming ready: %s", message)
+	}
+	return errors.New("TensorBoard exited before becoming ready")
 }
 
 func retryablePortError(err error) bool {
@@ -233,11 +310,123 @@ func retryablePortError(err error) bool {
 func (l *ProcessLauncher) Close() {
 	l.mu.Lock()
 	l.closed = true
-	processes := append([]*runningProcess(nil), l.processes...)
+	processes := make([]*runningProcess, 0, len(l.records))
+	for _, record := range l.records {
+		if record.process != nil {
+			processes = append(processes, record.process)
+		}
+	}
 	l.mu.Unlock()
 	for _, process := range processes {
 		process.stop()
 	}
+}
+
+// Reattach re-establishes SSH tunnels for remote TensorBoard services whose
+// transport died while the remote service survived under its grace window. It
+// is a no-op for local launchers and for tunnels whose SSH session is alive.
+// The caller type-asserts for this method, so it is deliberately absent from
+// the Launcher interface.
+func (l *ProcessLauncher) Reattach(ctx context.Context) {
+	if !l.remote {
+		return
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	type pending struct {
+		record  *tunnelRecord
+		process *runningProcess
+	}
+	todo := make([]pending, 0, len(l.records))
+	for _, record := range l.records {
+		todo = append(todo, pending{record, record.process})
+	}
+	l.mu.Unlock()
+	for _, item := range todo {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if item.process == nil {
+			continue
+		}
+		select {
+		case <-item.process.done:
+			l.reattachOne(ctx, item.record)
+		default:
+			// SSH session is still alive; nothing to re-attach.
+		}
+	}
+}
+
+func (l *ProcessLauncher) reattachOne(ctx context.Context, record *tunnelRecord) {
+	executable, arguments, err := remoteReattachCommand(
+		l.rsh, l.host, record.localPort, record.runtimeDirectory, record.remoteSocket,
+	)
+	if err != nil {
+		l.logReattachFailure(record.pathPrefix)
+		return
+	}
+	command := exec.Command(executable, arguments...)
+	stdinReader, stdinWriter, err := os.Pipe()
+	if err != nil {
+		l.logReattachFailure(record.pathPrefix)
+		return
+	}
+	command.Stdin = stdinReader
+	configureCommand(command)
+	diagnostic := newCaptureWriter(l.output, record.token)
+	readiness := newReadinessWriter(diagnostic, remoteReadySentinel)
+	command.Stdout = readiness
+	command.Stderr = diagnostic
+	if err := command.Start(); err != nil {
+		_ = stdinReader.Close()
+		_ = stdinWriter.Close()
+		l.logReattachFailure(record.pathPrefix)
+		return
+	}
+	_ = stdinReader.Close()
+	process := newRunningProcess(command, stdinWriter, func() {
+		readiness.Flush()
+		diagnostic.Flush()
+	})
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		process.stop()
+		return
+	}
+	record.process = process
+	l.mu.Unlock()
+
+	if err := waitForReadySentinel(ctx, readiness, process.done, diagnostic); err != nil {
+		process.stop()
+		if ctx.Err() == nil {
+			l.logReattachFailure(record.pathPrefix)
+		}
+		return
+	}
+	if err := probeTensorBoardReady(ctx, record.localPort, record.pathPrefix, record.token, process.done, diagnostic); err != nil {
+		process.stop()
+		if ctx.Err() == nil {
+			l.logReattachFailure(record.pathPrefix)
+		}
+		return
+	}
+}
+
+func (l *ProcessLauncher) logReattachFailure(pathPrefix string) {
+	if l.output == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(l.output,
+		"TensorBoard at %s could not be re-attached; relaunch it from the browser to restart\n",
+		pathPrefix,
+	)
 }
 
 func localArguments(logDirectory, pathPrefix string, port int) []string {
@@ -260,7 +449,26 @@ func tensorBoardCommand(pythonInterpreter, logDirectory, pathPrefix string, port
 	return pythonInterpreter, append([]string{"-m", "tensorboard.main"}, arguments...), nil
 }
 
-func remoteCommand(rsh, host, pythonInterpreter string, localPort int, runtimeDirectory, remoteSocket string) (string, []string, error) {
+// hardenedSSHOptions returns the fixed SSH transport flags shared by the launch
+// and re-attach commands, including tunnel keepalives that let the local side
+// notice a dead connection and trigger a re-attach.
+func hardenedSSHOptions() []string {
+	return []string{
+		"-T", "-x", "-a",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "ForkAfterAuthentication=no",
+		"-o", "ControlMaster=no",
+		"-o", "ControlPersist=no",
+		"-o", "PermitLocalCommand=no",
+		"-o", "RemoteCommand=none",
+		"-o", "SessionType=default",
+		"-o", "StdinNull=no",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=3",
+	}
+}
+
+func remoteCommand(rsh, host, pythonInterpreter string, localPort int, runtimeDirectory, remoteSocket string, grace, check time.Duration) (string, []string, error) {
 	if rsh == "" {
 		rsh = "ssh"
 	}
@@ -273,22 +481,52 @@ func remoteCommand(rsh, host, pythonInterpreter string, localPort int, runtimeDi
 	if err := validateRemoteRuntime(runtimeDirectory, remoteSocket); err != nil {
 		return "", nil, err
 	}
+	checkSeconds, idleLimit := keeperGraceParams(grace, check)
 	forward := fmt.Sprintf("127.0.0.1:%d:%s", localPort, remoteSocket)
-	arguments := []string{
-		"-T", "-x", "-a",
-		"-o", "ExitOnForwardFailure=yes",
-		"-o", "ForkAfterAuthentication=no",
-		"-o", "ControlMaster=no",
-		"-o", "ControlPersist=no",
-		"-o", "PermitLocalCommand=no",
-		"-o", "RemoteCommand=none",
-		"-o", "SessionType=default",
-		"-o", "StdinNull=no",
+	arguments := append(hardenedSSHOptions(),
 		"-L", forward,
 		host,
-		remoteTensorBoardScript(pythonInterpreter, runtimeDirectory, remoteSocket, remoteTensorBoardHelper),
-	}
+		remoteTensorBoardScript(pythonInterpreter, runtimeDirectory, remoteSocket, remoteTensorBoardHelper, checkSeconds, idleLimit),
+	)
 	return rsh, arguments, nil
+}
+
+// remoteReattachCommand builds the SSH command that re-forwards the same local
+// port to a surviving remote service without restarting it.
+func remoteReattachCommand(rsh, host string, localPort int, runtimeDirectory, remoteSocket string) (string, []string, error) {
+	if rsh == "" {
+		rsh = "ssh"
+	}
+	if host == "" || strings.HasPrefix(host, "-") || strings.ContainsAny(host, "\x00\r\n") {
+		return "", nil, errors.New("invalid SSH host for TensorBoard")
+	}
+	if err := validateRemoteRuntime(runtimeDirectory, remoteSocket); err != nil {
+		return "", nil, err
+	}
+	forward := fmt.Sprintf("127.0.0.1:%d:%s", localPort, remoteSocket)
+	arguments := append(hardenedSSHOptions(),
+		"-L", forward,
+		host,
+		remoteReattachScript(runtimeDirectory, remoteSocket),
+	)
+	return rsh, arguments, nil
+}
+
+// keeperGraceParams converts the grace and poll durations into the shell-safe
+// sleep interval and idle-iteration count baked into the keeper loop.
+func keeperGraceParams(grace, check time.Duration) (string, int) {
+	if check <= 0 {
+		check = remoteKeeperCheckInterval
+	}
+	if grace <= 0 {
+		grace = remoteDefaultGrace
+	}
+	checkSeconds := strconv.FormatFloat(check.Seconds(), 'f', -1, 64)
+	limit := int(math.Ceil(grace.Seconds() / check.Seconds()))
+	if limit < 1 {
+		limit = 1
+	}
+	return checkSeconds, limit
 }
 
 func validateRemoteRuntime(runtimeDirectory, remoteSocket string) error {
@@ -303,29 +541,40 @@ func validateRemoteRuntime(runtimeDirectory, remoteSocket string) error {
 	return nil
 }
 
-func remoteTensorBoardScript(pythonInterpreter, runtimeDirectory, remoteSocket, helperSource string) string {
+// remoteFrameReader is an unbuffered Python one-liner that reads exactly the
+// length-prefixed launch frame from stdin and copies it to a file. Reading via
+// os.read never over-consumes, so any bytes that arrive later (the SHUTDOWN
+// line) remain on stdin for the shell's watch loop.
+const remoteFrameReader = `import os,sys,struct
+def rd(n):
+    b=b""
+    while len(b)<n:
+        c=os.read(0,n-len(b))
+        if not c:
+            raise SystemExit(1)
+        b+=c
+    return b
+h=rd(4)
+s=struct.unpack("!I",h)[0]
+if s==0 or s>(1<<20):
+    raise SystemExit(1)
+os.write(1,h+rd(s))`
+
+// remoteTensorBoardScript builds the attached SSH shell. It reads the launch
+// frame sequentially, starts the setsid'd service, hands its lifetime to a
+// detached keeper, holds a flock lease that the keeper watches, records its own
+// PID in watcher.pid so a later re-attach can evict a stale holder, and finally
+// watches stdin so an explicit SHUTDOWN reclaims the service immediately while
+// an unclean disconnect merely drops the lease and starts the grace window.
+func remoteTensorBoardScript(pythonInterpreter, runtimeDirectory, remoteSocket, helperSource, checkSeconds string, idleLimit int) string {
 	helperPath := runtimeDirectory + "/helper.py"
 	lines := []string{
-		"helper_pid=",
-		"runtime_created=",
 		"runtime_dir=" + shellQuote(runtimeDirectory),
 		"socket_path=" + shellQuote(remoteSocket),
 		"helper_path=" + shellQuote(helperPath),
-		"cleanup() {",
-		"  trap - EXIT HUP INT TERM",
-		`  if [ -n "$helper_pid" ] && kill -0 -"$helper_pid" 2>/dev/null; then`,
-		`    kill -TERM -"$helper_pid" 2>/dev/null || :`,
-		"    sleep 0.5",
-		`    kill -KILL -"$helper_pid" 2>/dev/null || :`,
-		"  fi",
-		`  if [ -n "$helper_pid" ]; then wait "$helper_pid" 2>/dev/null || :; fi`,
-		`  if [ -n "$runtime_created" ]; then`,
-		`    rm -f "$socket_path" "$helper_path" 2>/dev/null || :`,
-		`    rmdir "$runtime_dir" 2>/dev/null || :`,
-		"  fi",
-		"}",
-		"trap cleanup EXIT",
-		"trap 'exit 143' HUP INT TERM",
+		`lease_path="$runtime_dir/lease"`,
+		`shutdown_path="$runtime_dir/shutdown"`,
+		`frame_path="$runtime_dir/config.frame"`,
 		"umask 077",
 	}
 	if pythonInterpreter == "" {
@@ -342,17 +591,107 @@ func remoteTensorBoardScript(pythonInterpreter, runtimeDirectory, remoteSocket, 
 	}
 	lines = append(lines,
 		`mkdir "$runtime_dir" || { echo "Could not create private TensorBoard runtime directory" >&2; exit 1; }`,
-		"runtime_created=1",
-		`printf '%s' `+shellQuote(helperSource)+` > "$helper_path" || exit 1`,
-		`chmod 600 "$helper_path" || exit 1`,
-		"exec 3<&0",
-		`setsid "$python_executable" -B "$helper_path" <&3 &`,
+		`printf '%s' `+shellQuote(helperSource)+` > "$helper_path" || { rm -rf "$runtime_dir" 2>/dev/null || :; exit 1; }`,
+		`chmod 600 "$helper_path" || { rm -rf "$runtime_dir" 2>/dev/null || :; exit 1; }`,
+		// Consume the launch frame sequentially before anything else reads stdin.
+		`"$python_executable" -B -c `+shellQuote(remoteFrameReader)+` > "$frame_path" || { echo "Could not receive TensorBoard configuration" >&2; rm -rf "$runtime_dir" 2>/dev/null || :; exit 1; }`,
+		// Hand the frame to the helper through an fd so it survives the unlink.
+		`exec 4<"$frame_path" || { rm -rf "$runtime_dir" 2>/dev/null || :; exit 1; }`,
+		`rm -f "$frame_path" 2>/dev/null || :`,
+		`setsid "$python_executable" -B "$helper_path" 0<&4 &`,
 		"helper_pid=$!",
-		"exec 3<&-",
-		`wait "$helper_pid"`,
-		"status=$?",
-		`exit "$status"`,
+		"exec 4<&-",
+		// Take the lease after the service starts so the helper never inherits fd 9.
+		`exec 9>"$lease_path" || { echo "Could not open TensorBoard lease" >&2; exit 1; }`,
+		`flock 9 || { echo "Could not acquire TensorBoard lease" >&2; exit 1; }`,
+		// Record the lease holder so a later re-attach can evict this shell if the
+		// SSH transport dies while sshd still believes it is alive (umask 077 above
+		// keeps the file 0600).
+		`printf '%s\n' "$$" > "$runtime_dir/watcher.pid"`,
+		// Detach the keeper with fd 9 closed so it cannot pin the lease open.
+		`setsid sh -c `+shellQuote(remoteKeeperScript(runtimeDirectory, checkSeconds, idleLimit))+` open-server-tb-keeper "$helper_pid" </dev/null >/dev/null 2>&1 9<&- &`,
+		`while IFS= read -r line; do`,
+		`  case "$line" in`,
+		`    SHUTDOWN) touch "$shutdown_path" 2>/dev/null || :; break ;;`,
+		`  esac`,
+		`done`,
+		`exit 0`,
 	)
+	return strings.Join(lines, "\n")
+}
+
+// remoteKeeperScript builds the detached loop that owns the service lifetime.
+// It kills the service group immediately on the shutdown marker, otherwise
+// treats a free lease as an accumulating idle interval and reclaims the service
+// once the idle count reaches the grace limit.
+func remoteKeeperScript(runtimeDirectory, checkSeconds string, idleLimit int) string {
+	lines := []string{
+		`pid=$1`,
+		"runtime_dir=" + shellQuote(runtimeDirectory),
+		`lease_path="$runtime_dir/lease"`,
+		`shutdown_path="$runtime_dir/shutdown"`,
+		`idle=0`,
+		`while kill -0 -"$pid" 2>/dev/null; do`,
+		`  if [ -e "$shutdown_path" ]; then`,
+		`    kill -TERM -"$pid" 2>/dev/null || :`,
+		`    sleep 1`,
+		`    kill -KILL -"$pid" 2>/dev/null || :`,
+		`    rm -rf "$runtime_dir" 2>/dev/null || :`,
+		`    exit 0`,
+		`  fi`,
+		`  if ( flock -n 8 ) 8>"$lease_path" 2>/dev/null; then`,
+		`    idle=$((idle + 1))`,
+		`    if [ "$idle" -ge ` + strconv.Itoa(idleLimit) + ` ]; then`,
+		`      kill -TERM -"$pid" 2>/dev/null || :`,
+		`      sleep 1`,
+		`      kill -KILL -"$pid" 2>/dev/null || :`,
+		`      rm -rf "$runtime_dir" 2>/dev/null || :`,
+		`      exit 0`,
+		`    fi`,
+		`  else`,
+		`    idle=0`,
+		`  fi`,
+		`  sleep ` + checkSeconds,
+		`done`,
+		`rm -rf "$runtime_dir" 2>/dev/null || :`,
+		`exit 0`,
+	}
+	return strings.Join(lines, "\n")
+}
+
+// remoteReattachScript re-forwards a surviving service without restarting it. It
+// verifies the socket, then acquires the lease, evicting a stale holder if one
+// remains: any lock holder in this per-launch runtime is by definition our own
+// old attach shell (its dead TCP peer may go unnoticed by sshd for ~2h), so a
+// new attachment must win. It tries flock -n first — a plain non-blocking
+// acquire that fails only when something truly holds the lock; on failure it
+// kills the recorded watcher.pid and falls back to flock -w 5, which succeeds
+// once a transient keeper probe releases (the kill then merely hit an
+// already-stale shell). After taking the lease it rewrites watcher.pid, announces
+// readiness, then watches stdin for an explicit SHUTDOWN.
+func remoteReattachScript(runtimeDirectory, remoteSocket string) string {
+	lines := []string{
+		"runtime_dir=" + shellQuote(runtimeDirectory),
+		"socket_path=" + shellQuote(remoteSocket),
+		`lease_path="$runtime_dir/lease"`,
+		`shutdown_path="$runtime_dir/shutdown"`,
+		"umask 077",
+		`[ -S "$socket_path" ] || { echo "TensorBoard service socket is gone" >&2; exit 1; }`,
+		`exec 9>"$lease_path" || { echo "Could not open TensorBoard lease" >&2; exit 1; }`,
+		`if ! flock -n 9; then`,
+		`  pid=$(cat "$runtime_dir/watcher.pid" 2>/dev/null)`,
+		`  [ -n "$pid" ] && { kill -TERM "$pid" 2>/dev/null || :; }`,
+		`  flock -w 5 9 || { echo "TensorBoard service is busy" >&2; exit 1; }`,
+		`fi`,
+		`printf '%s\n' "$$" > "$runtime_dir/watcher.pid"`,
+		`printf ` + shellQuote(strings.TrimSuffix(remoteReadySentinel, "\n")+`\n`),
+		`while IFS= read -r line; do`,
+		`  case "$line" in`,
+		`    SHUTDOWN) touch "$shutdown_path" 2>/dev/null || :; break ;;`,
+		`  esac`,
+		`done`,
+		`exit 0`,
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -582,15 +921,6 @@ def _force_private_ingestion(flags):
             raise RuntimeError("could not disable TensorBoard gRPC data provider")
 
 
-def _watch_stdin(stream, stop_event):
-    """Treat SSH stdin EOF as revocation of the helper's lifetime lease."""
-    try:
-        while stream.read(65536):
-            pass
-    finally:
-        stop_event.set()
-
-
 def _stop_server(server):
     """Stop request handling and close the Unix listener."""
     if not server.done.is_set():
@@ -599,7 +929,7 @@ def _stop_server(server):
 
 
 def _run(configuration):
-    """Configure TensorBoard and supervise it until SSH revokes the lease."""
+    """Configure TensorBoard and supervise it until a termination signal."""
     _validate_configuration(configuration)
     socket_path = configuration["socket_path"]
     token = configuration["token"]
@@ -643,13 +973,6 @@ def _run(configuration):
             raise RuntimeError("TensorBoard server stopped during startup")
         sys.stdout.write("OPEN_SERVER_TENSORBOARD_READY\n")
         sys.stdout.flush()
-        watcher = threading.Thread(
-            target=_watch_stdin,
-            args=(sys.stdin.buffer, stop_event),
-            name="open-server-lease",
-            daemon=True,
-        )
-        watcher.start()
         while not stop_event.wait(0.1):
             if server.done.is_set():
                 raise RuntimeError("TensorBoard server stopped unexpectedly")
@@ -690,12 +1013,12 @@ func pickLocalPort() (int, error) {
 
 type runningProcess struct {
 	command  *exec.Cmd
-	stdin    io.Closer
+	stdin    io.WriteCloser
 	done     chan struct{}
 	stopOnce sync.Once
 }
 
-func newRunningProcess(command *exec.Cmd, stdin io.Closer, onDone ...func()) *runningProcess {
+func newRunningProcess(command *exec.Cmd, stdin io.WriteCloser, onDone ...func()) *runningProcess {
 	process := &runningProcess{command: command, stdin: stdin, done: make(chan struct{})}
 	go func() {
 		_ = command.Wait()
@@ -718,6 +1041,11 @@ func (p *runningProcess) stop() {
 		default:
 		}
 		if p.stdin != nil {
+			// A remote process reaches its attached shell over this pipe. Send
+			// the SHUTDOWN marker request first so an explicit close reclaims
+			// the surviving service immediately, then fall through to the
+			// close/terminate/kill escalation for the local SSH process.
+			_, _ = p.stdin.Write([]byte("SHUTDOWN\n"))
 			_ = p.stdin.Close()
 			select {
 			case <-p.done:

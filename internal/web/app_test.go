@@ -159,6 +159,36 @@ func request(app *App, method, target string, body io.Reader) *httptest.Response
 	return w
 }
 
+func startTagByID(t *testing.T, body, id string) string {
+	t.Helper()
+	pattern := regexp.MustCompile(`<[^>]*\bid="` + regexp.QuoteMeta(id) + `"[^>]*>`)
+	match := pattern.FindString(body)
+	if match == "" {
+		t.Fatalf("rendered page is missing element with id %q", id)
+	}
+	return match
+}
+
+func elementBodyByID(t *testing.T, body, tag, id string) string {
+	t.Helper()
+	pattern := regexp.MustCompile(`(?s)<` + regexp.QuoteMeta(tag) + `\b[^>]*\bid="` + regexp.QuoteMeta(id) + `"[^>]*>(.*?)</` + regexp.QuoteMeta(tag) + `>`)
+	match := pattern.FindStringSubmatch(body)
+	if len(match) != 2 {
+		t.Fatalf("rendered page is missing <%s> with id %q", tag, id)
+	}
+	return match[1]
+}
+
+func directTextByID(t *testing.T, body, id string) string {
+	t.Helper()
+	pattern := regexp.MustCompile(`(?s)<[^>]*\bid="` + regexp.QuoteMeta(id) + `"[^>]*>([^<]*)</[^>]+>`)
+	match := pattern.FindStringSubmatch(body)
+	if len(match) != 2 {
+		t.Fatalf("element with id %q is missing direct text", id)
+	}
+	return strings.TrimSpace(html.UnescapeString(match[1]))
+}
+
 func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 	for _, fixture := range fixtures(t) {
 		fixture := fixture
@@ -210,7 +240,14 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 						t.Fatalf("listing is missing the link for %s", fileName)
 					}
 					linked, parseErr := url.Parse(html.UnescapeString(match[1]))
-					if parseErr != nil || linked.Path != "/preview" {
+					wantPath := "/preview"
+					if fileName == "active.html" {
+						wantPath = previewRouteURL(
+							previewContentRoutePrefix,
+							filepath.ToSlash(filepath.Join(fixture.root, fileName)),
+						)
+					}
+					if parseErr != nil || linked.Path != wantPath {
 						t.Fatalf("%s link = %q, parsed as %#v, %v", fileName, match[1], linked, parseErr)
 					}
 				}
@@ -329,16 +366,14 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 
 			t.Run("preview MIME security and streaming", func(t *testing.T) {
 				textFiles := map[string]string{
-					"alpha.txt":   "0123456789",
-					"active.html": "<script>parent.pwned=true</script>",
-					"active.js":   "parent.pwned=true",
-					"active.svg":  "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>parent.pwned=true</script></svg>",
-					"config.xml":  "<?xml version=\"1.0\"?><root>value</root>",
-					"data.csv":    "name,value\nalpha,1\n",
-					"data.tsv":    "name\tvalue\nalpha\t1\n",
-					"figure.eps":  "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\n",
-					"paper.tex":   "\\documentclass{article}\n",
-					"README":      "extensionless text\n",
+					"alpha.txt":  "0123456789",
+					"active.js":  "parent.pwned=true",
+					"config.xml": "<?xml version=\"1.0\"?><root>value</root>",
+					"data.csv":   "name,value\nalpha,1\n",
+					"data.tsv":   "name\tvalue\nalpha\t1\n",
+					"figure.eps": "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\n",
+					"paper.tex":  "\\documentclass{article}\n",
+					"README":     "extensionless text\n",
 				}
 				for fileName, contents := range textFiles {
 					fileName, contents := fileName, contents
@@ -507,6 +542,229 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 	}
 }
 
+func TestDirectoryRegexFilterRenderingAgainstLocalAndSFTP(t *testing.T) {
+	for _, fixture := range fixtures(t) {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) {
+			defer fixture.close()
+			emptyPath := filepath.ToSlash(filepath.Join(filepath.FromSlash(fixture.root), `empty filter <&" 日本語`))
+			if err := os.Mkdir(filepath.FromSlash(emptyPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			rootEntries, err := os.ReadDir(filepath.FromSlash(fixture.root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			app := newTestApp(t, fixture, nil)
+
+			response := request(app, http.MethodGet, "/?path="+url.QueryEscape(fixture.root), nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			for _, id := range []string{
+				"regex-filter-controls",
+				"regex-filter-input",
+				"regex-filter-help-toggle",
+				"regex-filter-help",
+				"regex-filter-help-close",
+				"regex-ignore-case",
+				"regex-filter-apply",
+				"regex-filter-clear",
+				"regex-filter-error",
+				"regex-filter-status",
+				"regex-filter-badge",
+				"directory-list",
+				"directory-entries",
+			} {
+				startTagByID(t, body, id)
+			}
+			controlsTag := startTagByID(t, body, "regex-filter-controls")
+			if !strings.Contains(controlsTag, fmt.Sprintf(`data-entry-count="%d"`, len(rootEntries))) {
+				t.Errorf("regex controls do not contain the correct entry count: %s", controlsTag)
+			}
+
+			inputTag := startTagByID(t, body, "regex-filter-input")
+			if !strings.Contains(body, `for="regex-filter-input"`) && !strings.Contains(inputTag, `aria-label=`) {
+				t.Error("regex input does not have an accessible label")
+			}
+			for _, id := range []string{"regex-filter-error", "regex-filter-status"} {
+				if !strings.Contains(inputTag, id) {
+					t.Errorf("regex input is not described by %q", id)
+				}
+			}
+			helpToggleTag := startTagByID(t, body, "regex-filter-help-toggle")
+			if !strings.Contains(helpToggleTag, `aria-controls="regex-filter-help"`) || !strings.Contains(helpToggleTag, `aria-expanded="false"`) {
+				t.Errorf("regex help toggle has incomplete ARIA state: %s", helpToggleTag)
+			}
+			helpTag := startTagByID(t, body, "regex-filter-help")
+			if !strings.Contains(helpTag, `role="dialog"`) || !strings.Contains(helpTag, "hidden") {
+				t.Errorf("regex help is not an initially hidden dialog: %s", helpTag)
+			}
+			helpCloseTag := startTagByID(t, body, "regex-filter-help-close")
+			if !strings.Contains(helpCloseTag, `aria-label=`) {
+				t.Errorf("regex help close button has no accessible label: %s", helpCloseTag)
+			}
+			ignoreCaseTag := startTagByID(t, body, "regex-ignore-case")
+			if !strings.Contains(ignoreCaseTag, `type="checkbox"`) || !strings.Contains(body, `for="regex-ignore-case"`) {
+				t.Errorf("ignore-case checkbox is not labelled: %s", ignoreCaseTag)
+			}
+			errorTag := startTagByID(t, body, "regex-filter-error")
+			if !strings.Contains(errorTag, `role="alert"`) {
+				t.Errorf("regex error is not announced as an alert: %s", errorTag)
+			}
+			statusTag := startTagByID(t, body, "regex-filter-status")
+			if !strings.Contains(statusTag, `role="status"`) || !strings.Contains(statusTag, `aria-live="polite"`) {
+				t.Errorf("regex match count is not a polite live status: %s", statusTag)
+			}
+			statusText := directTextByID(t, body, "regex-filter-status")
+			if !regexp.MustCompile(`[0-9]+`).MatchString(statusText) || !regexp.MustCompile(`(?i)(entry|entries|item|items|match|matches)`).MatchString(statusText) {
+				t.Errorf("initial regex status does not contain the server-rendered entry count: %q", statusText)
+			}
+
+			lowerBody := strings.ToLower(body)
+			for _, topic := range []string{"anchor", "group", "character class", "alternation", "escap"} {
+				if !strings.Contains(lowerBody, topic) {
+					t.Errorf("regex help does not explain %q", topic)
+				}
+			}
+			for _, example := range []string{`\.pdf$`, `\.(csv|tsv)$`, `^README$`} {
+				if !strings.Contains(body, example) {
+					t.Errorf("regex help is missing example %q", example)
+				}
+			}
+
+			directoryRows := elementBodyByID(t, body, "table", "directory-list")
+			currentIndex := strings.Index(directoryRows, `>.</a>`)
+			firstEntryIndex := strings.Index(directoryRows, "active.html")
+			if currentIndex == -1 || firstEntryIndex == -1 || currentIndex >= firstEntryIndex {
+				t.Fatalf("current-directory row must precede real entries: current=%d entry=%d", currentIndex, firstEntryIndex)
+			}
+			for _, want := range []string{"alpha.txt", "space 日本語 #?.txt", `weird &lt;&amp;&#34;.txt`} {
+				if !strings.Contains(directoryRows, want) {
+					t.Errorf("filterable entry rows are missing escaped name %q", want)
+				}
+			}
+			if strings.Contains(directoryRows, `weird <&".txt`) {
+				t.Fatal("filterable entry rows contain an unescaped special file name")
+			}
+			for _, forbidden := range []string{`data-entry-name=`, `class="directory-entry"`, `class="filterable-entry"`} {
+				if strings.Contains(directoryRows, forbidden) {
+					t.Errorf("directory rows contain per-entry filtering marker %q", forbidden)
+				}
+			}
+
+			nestedPath := filepath.ToSlash(filepath.Join(filepath.FromSlash(fixture.root), "folder"))
+			nestedResponse := request(app, http.MethodGet, "/?path="+url.QueryEscape(nestedPath), nil)
+			if nestedResponse.Code != http.StatusOK {
+				t.Fatalf("nested status = %d, body = %s", nestedResponse.Code, nestedResponse.Body.String())
+			}
+			nestedRows := elementBodyByID(t, nestedResponse.Body.String(), "table", "directory-list")
+			parentIndex := strings.Index(nestedRows, `>..</a>`)
+			currentIndex = strings.Index(nestedRows, `>.</a>`)
+			firstEntryIndex = strings.Index(nestedRows, "inside.txt")
+			if parentIndex == -1 || currentIndex == -1 || firstEntryIndex == -1 || !(parentIndex < currentIndex && currentIndex < firstEntryIndex) {
+				t.Fatalf("nested rows must place parent and current navigation before real entries: parent=%d current=%d entry=%d", parentIndex, currentIndex, firstEntryIndex)
+			}
+
+			emptyResponse := request(app, http.MethodGet, "/?path="+url.QueryEscape(emptyPath), nil)
+			if emptyResponse.Code != http.StatusOK {
+				t.Fatalf("empty status = %d, body = %s", emptyResponse.Code, emptyResponse.Body.String())
+			}
+			emptyBody := emptyResponse.Body.String()
+			emptyControlsTag := startTagByID(t, emptyBody, "regex-filter-controls")
+			if !strings.Contains(emptyControlsTag, `data-entry-count="0"`) || !strings.Contains(emptyControlsTag, `data-directory="`+html.EscapeString(emptyPath)+`"`) {
+				t.Errorf("empty directory filter state is incorrect or unescaped: %s", emptyControlsTag)
+			}
+			startTagByID(t, emptyBody, "directory-empty")
+			if strings.Contains(emptyBody, `id="directory-entries"`) {
+				t.Error("empty directory rendered a real-entry table body")
+			}
+			emptyRows := elementBodyByID(t, emptyBody, "table", "directory-list")
+			parentIndex = strings.Index(emptyRows, `>..</a>`)
+			currentIndex = strings.Index(emptyRows, `>.</a>`)
+			emptyIndex := strings.Index(emptyRows, "This directory is empty.")
+			if parentIndex == -1 || currentIndex == -1 || emptyIndex == -1 || !(parentIndex < currentIndex && currentIndex < emptyIndex) {
+				t.Fatalf("empty rows must place navigation before the empty message: parent=%d current=%d empty=%d", parentIndex, currentIndex, emptyIndex)
+			}
+		})
+	}
+}
+
+func TestDirectoryRegexFilterClientWorkflow(t *testing.T) {
+	for _, want := range []string{
+		`var filterTotal = parseInt(filterControls.getAttribute('data-entry-count'), 10) || 0;`,
+		`var filterStorageKey = 'open-server-regex-filter:' + filterControls.getAttribute('data-directory');`,
+		`var filterEntries = null;`,
+		`var body = document.getElementById('directory-entries');`,
+		`for (var index = 0; index < rows.length; index++) {`,
+		`var link = rows[index].cells[0] && rows[index].cells[0].querySelector('a');`,
+		`var name = link ? link.textContent : '';`,
+		`if (name.slice(-1) === '/') name = name.slice(0, -1);`,
+		`expression = new RegExp(pattern, ignoreCase ? 'i' : '');`,
+		`setFilterError(e.message || 'Invalid regular expression');`,
+		`filterStatus.textContent = matched + ' of ' + filterTotal + ' entries';`,
+		`function setFilterActive(active) {`,
+		`filterControls.classList.add('filter-active');`,
+		`setFilterActive(true);`,
+		`setFilterActive(false);`,
+		`window.sessionStorage.setItem(filterStorageKey, JSON.stringify({pattern: pattern, ignoreCase: ignoreCase}));`,
+		`window.sessionStorage.removeItem(filterStorageKey);`,
+		`var savedFilterJSON = window.sessionStorage.getItem(filterStorageKey);`,
+		`if (!applyRegexFilter(savedFilter.pattern, savedFilter.ignoreCase, false)) removeSavedFilter();`,
+		`filterControls.addEventListener('submit', function(e) {`,
+		`e.preventDefault();`,
+		`filterClear.addEventListener('click', clearRegexFilter);`,
+		`filterHelpToggle.setAttribute('aria-expanded', 'true');`,
+		`filterHelpToggle.setAttribute('aria-expanded', 'false');`,
+		`if (!filterHelp.hidden && e.target !== filterHelpToggle && !filterHelp.contains(e.target))`,
+		`if (e.key === 'Escape' && !filterHelp.hidden)`,
+	} {
+		if !strings.Contains(directoryTemplate, want) {
+			t.Errorf("regex filter workflow is missing %q", want)
+		}
+	}
+
+	applyStart := strings.Index(directoryTemplate, `function applyRegexFilter(pattern, ignoreCase, persist) {`)
+	applyEnd := strings.Index(directoryTemplate, `filterControls.addEventListener('submit'`)
+	if applyStart == -1 || applyEnd == -1 || applyStart >= applyEnd {
+		t.Fatal("could not locate the regex apply workflow")
+	}
+	applyBody := directoryTemplate[applyStart:applyEnd]
+	compileIndex := strings.Index(applyBody, `new RegExp(`)
+	rowAccessIndex := strings.Index(applyBody, `getFilterEntries()`)
+	if compileIndex == -1 || rowAccessIndex == -1 || compileIndex >= rowAccessIndex {
+		t.Fatal("regex syntax must be validated before any row visibility changes")
+	}
+	invalidIndex := strings.Index(applyBody, `return false;`)
+	persistIndex := strings.Index(applyBody, `if (persist) saveFilter(pattern, ignoreCase);`)
+	if invalidIndex == -1 || persistIndex == -1 || invalidIndex >= persistIndex {
+		t.Fatal("invalid patterns must return without replacing the saved valid filter")
+	}
+
+	clearStart := strings.Index(directoryTemplate, `function clearRegexFilter() {`)
+	clearEnd := strings.Index(directoryTemplate, `function applyRegexFilter(`)
+	if clearStart == -1 || clearEnd == -1 || clearStart >= clearEnd {
+		t.Fatal("could not locate the regex clear workflow")
+	}
+	clearBody := directoryTemplate[clearStart:clearEnd]
+	for _, want := range []string{
+		`filterInput.value = '';`,
+		`filterIgnoreCase.checked = false;`,
+		`setFilterError('');`,
+		`showAllFilterEntries();`,
+		`removeSavedFilter();`,
+	} {
+		if !strings.Contains(clearBody, want) {
+			t.Errorf("regex clear workflow is missing %q", want)
+		}
+	}
+
+	if strings.Contains(directoryTemplate, `data-entry-name=`) || strings.Contains(directoryTemplate, `class="directory-entry"`) || strings.Contains(directoryTemplate, `class="filterable-entry"`) {
+		t.Fatal("regex filtering added per-entry markup instead of lazily reading existing links")
+	}
+}
+
 func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 	pathIndex := strings.Index(directoryTemplate, `class="header-path"`)
 	uploadIndex := strings.Index(directoryTemplate, `id="drop-zone"`)
@@ -534,7 +792,7 @@ func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 		`.copy-success::after { color: #555; content: "\2713"; }`,
 		`button.classList.add('copy-result', succeeded ? 'copy-success' : 'copy-failure')`,
 		`copyStatus.textContent = succeeded ? 'Copied to clipboard.' : 'Copy failed.'`,
-		`}, 300);`,
+		`}, 100);`,
 		`tbody tr:hover td`,
 		`class="page-header"`,
 	} {
@@ -646,6 +904,23 @@ func TestAccessTokenBecomesScopedCookie(t *testing.T) {
 	app.ServeHTTP(followResponse, follow)
 	if followResponse.Code != http.StatusOK {
 		t.Fatalf("cookie-authenticated response = %d", followResponse.Code)
+	}
+	renderURL := previewRouteURL(
+		previewContentRoutePrefix,
+		filepath.ToSlash(filepath.Join(filepath.FromSlash(root), "active.html")),
+	)
+	renderRequest := httptest.NewRequest(http.MethodGet, renderURL, nil)
+	renderRequest.Host = testHost
+	renderRequest.AddCookie(cookies[0])
+	renderResponse := httptest.NewRecorder()
+	app.ServeHTTP(renderResponse, renderRequest)
+	if renderResponse.Code != http.StatusOK ||
+		renderResponse.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf(
+			"cookie-authenticated rendered preview = %d headers %#v",
+			renderResponse.Code,
+			renderResponse.Header(),
+		)
 	}
 	for _, warning := range []string{"Security warning:", "token-protected plain HTTP", "traffic is not encrypted"} {
 		if !strings.Contains(followResponse.Body.String(), warning) {
@@ -779,6 +1054,48 @@ func TestCloseSession(t *testing.T) {
 	case <-fallbackApp.CloseRequested():
 	default:
 		t.Fatal("CSRF-authenticated close did not end the app")
+	}
+}
+
+func TestBackendHotSwap(t *testing.T) {
+	root := createFixture(t)
+	backend := filesystem.Local{}
+	app, err := New(Options{
+		Backend: backend, Root: root, SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost, Closeable: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listingTarget := "/?path=" + url.QueryEscape(root)
+
+	app.SetDisconnected()
+	disconnected := request(app, http.MethodGet, listingTarget, nil)
+	if disconnected.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disconnected listing status = %d, want %d", disconnected.Code, http.StatusServiceUnavailable)
+	}
+	if got := disconnected.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("disconnected Retry-After = %q, want %q", got, "5")
+	}
+
+	closeRequest := httptest.NewRequest(http.MethodPost, "/close", nil)
+	closeRequest.Host = testHost
+	closeRequest.Header.Set("Origin", "http://"+testHost)
+	closeResponse := httptest.NewRecorder()
+	app.ServeHTTP(closeResponse, closeRequest)
+	if closeResponse.Code != http.StatusOK {
+		t.Fatalf("close while disconnected = %d %s", closeResponse.Code, closeResponse.Body.String())
+	}
+	select {
+	case <-app.CloseRequested():
+	default:
+		t.Fatal("close while disconnected did not end the app")
+	}
+
+	app.SetBackend(backend)
+	reconnected := request(app, http.MethodGet, listingTarget, nil)
+	if reconnected.Code != http.StatusOK {
+		t.Fatalf("reconnected listing status = %d, body = %s", reconnected.Code, reconnected.Body.String())
 	}
 }
 
@@ -954,8 +1271,12 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	launcher := &recordingTensorBoardLauncher{handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})}
+	backend := &recordingReadDirBackend{Backend: filesystem.Local{}}
+	rootPath := filepath.ToSlash(root)
+	logsPath := filepath.ToSlash(logs)
+	emptyPath := filepath.ToSlash(empty)
 	app, err := New(Options{
-		Backend: filesystem.Local{}, Root: filepath.ToSlash(root), SSHHost: "lab",
+		Backend: backend, Root: rootPath, SSHHost: "lab",
 		Title: "Files", AllowedHost: testHost, TensorBoard: launcher,
 	})
 	if err != nil {
@@ -963,14 +1284,17 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	}
 
 	listing := request(app, http.MethodGet, "/", nil)
-	if got := strings.Count(listing.Body.String(), `aria-label="Launch TensorBoard"`); got != 1 {
-		t.Fatalf("TensorBoard icon count = %d, want 1; body = %s", got, listing.Body.String())
+	if got := strings.Count(listing.Body.String(), `aria-label="Launch TensorBoard"`); got != 3 {
+		t.Fatalf("current and child TensorBoard icon count = %d, want 3; body = %s", got, listing.Body.String())
+	}
+	if len(backend.readDirs) != 1 || backend.readDirs[0] != rootPath {
+		t.Fatalf("directory listing eagerly probed TensorBoard folders: ReadDir calls = %#v", backend.readDirs)
 	}
 	if strings.Contains(listing.Body.String(), ">Launch</button>") || strings.Contains(listing.Body.String(), ">TensorBoard</button>") {
 		t.Fatal("legacy visible launcher button label is still present")
 	}
 
-	emptyRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(empty)), nil)
+	emptyRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(emptyPath), nil)
 	emptyRequest.Host = testHost
 	emptyRequest.Header.Set("Origin", "http://"+testHost)
 	emptyResponse := httptest.NewRecorder()
@@ -978,8 +1302,11 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	if emptyResponse.Code != http.StatusBadRequest || !strings.Contains(emptyResponse.Body.String(), "event files were not found") {
 		t.Fatalf("non-event directory launch = %d %q", emptyResponse.Code, emptyResponse.Body.String())
 	}
+	if len(backend.readDirs) != 2 || backend.readDirs[1] != emptyPath {
+		t.Fatalf("TensorBoard click did not lazily inspect the selected folder: ReadDir calls = %#v", backend.readDirs)
+	}
 
-	wrongToken := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(logs)), strings.NewReader("csrf=wrong"))
+	wrongToken := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(logsPath), strings.NewReader("csrf=wrong"))
 	wrongToken.Host = testHost
 	wrongToken.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	wrongTokenResponse := httptest.NewRecorder()
@@ -989,7 +1316,7 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	}
 
 	form := url.Values{"csrf": {app.csrfToken}}
-	launchRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(logs)), strings.NewReader(form.Encode()))
+	launchRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(logsPath), strings.NewReader(form.Encode()))
 	launchRequest.Host = testHost
 	launchRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	launchResponse := httptest.NewRecorder()
@@ -997,10 +1324,10 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	if launchResponse.Code != http.StatusSeeOther || !strings.HasPrefix(launchResponse.Header().Get("Location"), "/tensorboard/") || !strings.HasSuffix(launchResponse.Header().Get("Location"), "/#scalars") {
 		t.Fatalf("token-authenticated launch = %d Location %q body %q", launchResponse.Code, launchResponse.Header().Get("Location"), launchResponse.Body.String())
 	}
-	if len(launcher.starts) != 1 || launcher.starts[0].directory != filepath.ToSlash(logs) {
+	if len(launcher.starts) != 1 || launcher.starts[0].directory != logsPath {
 		t.Fatalf("TensorBoard launches = %#v", launcher.starts)
 	}
-	repeatRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(filepath.ToSlash(logs)), nil)
+	repeatRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(logsPath), nil)
 	repeatRequest.Host = testHost
 	repeatRequest.Header.Set("Origin", "http://"+testHost)
 	repeatResponse := httptest.NewRecorder()
@@ -1550,6 +1877,16 @@ type tensorBoardStart struct {
 type recordingTensorBoardLauncher struct {
 	handler http.Handler
 	starts  []tensorBoardStart
+}
+
+type recordingReadDirBackend struct {
+	filesystem.Backend
+	readDirs []string
+}
+
+func (b *recordingReadDirBackend) ReadDir(ctx context.Context, name string) ([]filesystem.Entry, error) {
+	b.readDirs = append(b.readDirs, name)
+	return b.Backend.ReadDir(ctx, name)
 }
 
 type blockingTensorBoardLauncher struct {

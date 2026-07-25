@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLocalArguments(t *testing.T) {
@@ -19,7 +20,7 @@ func TestLocalArguments(t *testing.T) {
 func TestRemoteCommandUsesPrivateUnixSocketAndHardenedSSH(t *testing.T) {
 	runtimeDirectory := "/tmp/open-server-tb-0123456789abcdef0123456789abcdef"
 	remoteSocket := runtimeDirectory + "/tensorboard.sock"
-	executable, arguments, err := remoteCommand("ssh-wrapper", "lab", "", 60123, runtimeDirectory, remoteSocket)
+	executable, arguments, err := remoteCommand("ssh-wrapper", "lab", "", 60123, runtimeDirectory, remoteSocket, 30*time.Minute, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,9 +31,11 @@ func TestRemoteCommandUsesPrivateUnixSocketAndHardenedSSH(t *testing.T) {
 		"ExitOnForwardFailure=yes",
 		"SessionType=default",
 		"StdinNull=no",
-		"trap cleanup EXIT",
+		"ServerAliveInterval=15",
+		"ServerAliveCountMax=3",
 		"chmod 600",
 		"setsid",
+		"flock 9",
 		"command -v tensorboard",
 	} {
 		if !strings.Contains(joined, want) {
@@ -49,6 +52,41 @@ func TestRemoteCommandUsesPrivateUnixSocketAndHardenedSSH(t *testing.T) {
 	}
 }
 
+func TestRemoteScriptsRecordAndEvictLeaseHolder(t *testing.T) {
+	runtimeDirectory := "/tmp/open-server-tb-0123456789abcdef0123456789abcdef"
+	remoteSocket := runtimeDirectory + "/tensorboard.sock"
+
+	attach := remoteTensorBoardScript("/opt/venv/bin/python", runtimeDirectory, remoteSocket, remoteTensorBoardHelper, "5", 360)
+	leaseIndex := strings.Index(attach, `flock 9 || { echo "Could not acquire TensorBoard lease"`)
+	watcherWrite := `printf '%s\n' "$$" > "$runtime_dir/watcher.pid"`
+	watcherIndex := strings.Index(attach, watcherWrite)
+	if leaseIndex < 0 || watcherIndex < 0 {
+		t.Fatalf("attach script missing lease acquisition or watcher.pid write:\n%s", attach)
+	}
+	if watcherIndex < leaseIndex {
+		t.Fatalf("attach script records watcher.pid before taking the lease:\n%s", attach)
+	}
+
+	reattach := remoteReattachScript(runtimeDirectory, remoteSocket)
+	for _, want := range []string{
+		"umask 077",
+		"if ! flock -n 9; then",
+		`pid=$(cat "$runtime_dir/watcher.pid" 2>/dev/null)`,
+		`kill -TERM "$pid"`,
+		`flock -w 5 9 || { echo "TensorBoard service is busy" >&2; exit 1; }`,
+		watcherWrite,
+	} {
+		if !strings.Contains(reattach, want) {
+			t.Errorf("re-attach script does not contain %q:\n%s", want, reattach)
+		}
+	}
+	// The evict-or-acquire block must precede the watcher.pid rewrite so a new
+	// attachment records itself only after winning the lease.
+	if strings.Index(reattach, "if ! flock -n 9; then") > strings.Index(reattach, watcherWrite) {
+		t.Fatalf("re-attach records watcher.pid before acquiring the lease:\n%s", reattach)
+	}
+}
+
 func TestPythonInterpreterCommand(t *testing.T) {
 	executable, arguments, err := tensorBoardCommand("/opt/venv/bin/python", "/data/run", "/tensorboard/abc", 51234)
 	if err != nil {
@@ -61,6 +99,7 @@ func TestPythonInterpreterCommand(t *testing.T) {
 	_, remoteArguments, err := remoteCommand(
 		"ssh", "lab", "/opt/venv/bin/python", 60123,
 		runtimeDirectory, runtimeDirectory+"/tensorboard.sock",
+		30*time.Minute, 5*time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +114,7 @@ func TestRemoteCommandRejectsOptionLikePython(t *testing.T) {
 	_, _, err := remoteCommand(
 		"ssh", "lab", "-malicious", 60123,
 		runtimeDirectory, runtimeDirectory+"/tensorboard.sock",
+		30*time.Minute, 5*time.Second,
 	)
 	if err == nil {
 		t.Fatal("option-like Python interpreter was accepted")
@@ -151,6 +191,25 @@ func TestReadinessWriterSuppressesSplitSentinel(t *testing.T) {
 	for _, want := range []string{"meaningful diagnostic", "after readiness"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("diagnostics %q do not contain %q", output.String(), want)
+		}
+	}
+}
+
+func TestKeeperGraceParams(t *testing.T) {
+	for _, testCase := range []struct {
+		grace, check time.Duration
+		wantSeconds  string
+		wantLimit    int
+	}{
+		{30 * time.Minute, 5 * time.Second, "5", 360},
+		{7 * time.Second, 5 * time.Second, "5", 2},
+		{200 * time.Millisecond, 200 * time.Millisecond, "0.2", 1},
+		{0, 0, "5", 360},
+	} {
+		gotSeconds, gotLimit := keeperGraceParams(testCase.grace, testCase.check)
+		if gotSeconds != testCase.wantSeconds || gotLimit != testCase.wantLimit {
+			t.Errorf("keeperGraceParams(%s, %s) = %q, %d; want %q, %d",
+				testCase.grace, testCase.check, gotSeconds, gotLimit, testCase.wantSeconds, testCase.wantLimit)
 		}
 	}
 }

@@ -69,6 +69,7 @@ type jupyterLaunch struct {
 
 type App struct {
 	backend       filesystem.Backend
+	backendMu     sync.RWMutex
 	root          string
 	sshHost       string
 	title         string
@@ -164,6 +165,28 @@ func New(options Options) (*App, error) {
 	}, nil
 }
 
+// currentBackend returns the backend in use for this request. It may be
+// swapped out concurrently by SetBackend or SetDisconnected.
+func (a *App) currentBackend() filesystem.Backend {
+	a.backendMu.RLock()
+	defer a.backendMu.RUnlock()
+	return a.backend
+}
+
+// SetBackend replaces the backend used to serve requests, for example after
+// an SSH reconnect re-establishes the remote filesystem.
+func (a *App) SetBackend(b filesystem.Backend) {
+	a.backendMu.Lock()
+	a.backend = b
+	a.backendMu.Unlock()
+}
+
+// SetDisconnected switches to a backend that fails every request with
+// filesystem.ErrDisconnected, for use while the SSH session is down.
+func (a *App) SetDisconnected() {
+	a.SetBackend(filesystem.Disconnected{})
+}
+
 func (a *App) URL() string {
 	address := "http://" + a.allowedHost + "/"
 	if a.accessToken == "" {
@@ -185,6 +208,9 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.liveSecurityHeaders(w)
 		} else if route == "/preview" {
 			a.previewSecurityHeaders(w, false)
+		} else if strings.HasPrefix(route, previewRenderRoutePrefix) ||
+			strings.HasPrefix(route, previewContentRoutePrefix) {
+			a.renderedPreviewSecurityHeaders(w)
 		} else {
 			a.securityHeaders(w, false)
 		}
@@ -216,6 +242,14 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.serveLiveAsset(w, r)
 		return
 	}
+	if strings.HasPrefix(route, previewRenderRoutePrefix) {
+		a.serveRenderedPreview(w, r)
+		return
+	}
+	if strings.HasPrefix(route, previewContentRoutePrefix) {
+		a.servePreviewContent(w, r)
+		return
+	}
 
 	switch route {
 	case "", "/":
@@ -235,7 +269,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodGet, http.MethodHead)
 			return
 		}
-		a.serveFile(w, r, true)
+		a.servePreview(w, r)
 	case "/upload":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -510,21 +544,25 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		a.pathError(w, err)
 		return
 	}
-	info, err := a.backend.Stat(r.Context(), current)
+	backend := a.currentBackend()
+	info, err := backend.Stat(r.Context(), current)
 	if err != nil {
 		a.pathError(w, err)
 		return
 	}
 	if !info.IsDir() {
+		if previewURL := a.renderedPreviewURL(current); previewURL != "" {
+			http.Redirect(w, r, previewURL, http.StatusTemporaryRedirect)
+			return
+		}
 		a.serveNamedFile(w, r, current, true)
 		return
 	}
-	entries, err := a.backend.ReadDir(r.Context(), current)
+	entries, err := backend.ReadDir(r.Context(), current)
 	if err != nil {
 		a.pathError(w, err)
 		return
 	}
-	currentHasTensorBoard := a.tensorBoard != nil && hasTensorBoardEvents(entries)
 	showHidden := r.URL.Query().Get("hidden") == "1"
 	if !showHidden {
 		visible := entries[:0]
@@ -588,7 +626,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	view.ModifiedSortMarker = sortMarker(sortKey, order, "modified")
 	view.SizeSortMarker = sortMarker(sortKey, order, "size")
 	view.CurrentURL = a.appURL("/", current, sortKey, order, showHidden)
-	if currentHasTensorBoard {
+	if a.tensorBoard != nil {
 		view.CurrentTensorBoard = a.appURL("/tensorboard", current, "", "", showHidden)
 	}
 	if a.jupyter != nil {
@@ -598,7 +636,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		view.HasParent = true
 		view.ParentPath = path.Dir(current)
 		view.ParentURL = a.appURL("/", view.ParentPath, sortKey, order, showHidden)
-		if a.tensorBoard != nil && a.directoryHasTensorBoardEvents(r.Context(), view.ParentPath) {
+		if a.tensorBoard != nil {
 			view.ParentTensorBoard = a.appURL("/tensorboard", view.ParentPath, "", "", showHidden)
 		}
 		if a.jupyter != nil {
@@ -610,12 +648,12 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		if childErr != nil {
 			continue
 		}
-		entryURL := a.appURL("/preview", fullName, "", "", showHidden)
+		entryURL := a.previewURL(fullName, showHidden)
 		if entry.IsDir() {
 			entryURL = a.appURL("/", fullName, sortKey, order, showHidden)
 		}
 		tensorBoardURL := ""
-		if entry.IsDir() && a.tensorBoard != nil && a.directoryHasTensorBoardEvents(r.Context(), fullName) {
+		if entry.IsDir() && a.tensorBoard != nil {
 			tensorBoardURL = a.appURL("/tensorboard", fullName, "", "", showHidden)
 		}
 		jupyterURL := ""
@@ -707,6 +745,14 @@ func (a *App) appURL(route, name, sortKey, order string, showHidden bool) string
 		values.Set("hidden", "1")
 	}
 	return route + "?" + values.Encode()
+}
+
+// previewURL returns the direct rendered route when a file format supports it.
+func (a *App) previewURL(name string, showHidden bool) string {
+	if renderedURL := a.renderedPreviewURL(name); renderedURL != "" {
+		return renderedURL
+	}
+	return a.appURL("/preview", name, "", "", showHidden)
 }
 
 func (a *App) sortURL(name, currentKey, currentOrder, requestedKey string, showHidden bool) string {
@@ -830,7 +876,7 @@ func (a *App) mkdir(w http.ResponseWriter, r *http.Request) {
 		jsonMessage(w, http.StatusBadRequest, "folder name must be a single valid path component")
 		return
 	}
-	if err := a.backend.Mkdir(r.Context(), destination); err != nil {
+	if err := a.currentBackend().Mkdir(r.Context(), destination); err != nil {
 		a.jsonError(w, err, statusForError(err))
 		return
 	}
@@ -847,7 +893,8 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 		a.pathError(w, err)
 		return
 	}
-	info, err := a.backend.Stat(r.Context(), directory)
+	backend := a.currentBackend()
+	info, err := backend.Stat(r.Context(), directory)
 	if err != nil {
 		a.pathError(w, err)
 		return
@@ -856,7 +903,7 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "TensorBoard path must be a directory", http.StatusBadRequest)
 		return
 	}
-	entries, err := a.backend.ReadDir(r.Context(), directory)
+	entries, err := backend.ReadDir(r.Context(), directory)
 	if err != nil {
 		a.pathError(w, err)
 		return
@@ -907,7 +954,7 @@ func (a *App) startJupyter(w http.ResponseWriter, r *http.Request) {
 		a.pathError(w, err)
 		return
 	}
-	info, err := a.backend.Stat(r.Context(), directory)
+	info, err := a.currentBackend().Stat(r.Context(), directory)
 	if err != nil {
 		a.pathError(w, err)
 		return
@@ -1036,11 +1083,6 @@ func hasTensorBoardEvents(entries []filesystem.Entry) bool {
 		}
 	}
 	return false
-}
-
-func (a *App) directoryHasTensorBoardEvents(ctx context.Context, directory string) bool {
-	entries, err := a.backend.ReadDir(ctx, directory)
-	return err == nil && hasTensorBoardEvents(entries)
 }
 
 func newTensorBoardReverseProxy(target *url.URL, token string) *httputil.ReverseProxy {
@@ -1180,7 +1222,8 @@ func (a *App) pdfComplete(ctx context.Context, name string, info fs.FileInfo) (b
 	if info.Size() < int64(len(marker)) {
 		return false, nil
 	}
-	file, err := a.backend.Open(ctx, name)
+	backend := a.currentBackend()
+	file, err := backend.Open(ctx, name)
 	if err != nil {
 		return false, err
 	}
@@ -1201,7 +1244,7 @@ func (a *App) pdfComplete(ctx context.Context, name string, info fs.FileInfo) (b
 	if markerIndex < 0 || !onlyPDFWhitespace(tail[markerIndex+len(marker):]) {
 		return false, nil
 	}
-	latest, err := a.backend.Stat(ctx, name)
+	latest, err := backend.Stat(ctx, name)
 	if err != nil {
 		return false, err
 	}
@@ -1230,7 +1273,7 @@ func (a *App) livePDFInfo(r *http.Request) (string, fs.FileInfo, error) {
 	if !strings.EqualFold(path.Ext(name), ".pdf") {
 		return "", nil, fs.ErrInvalid
 	}
-	info, err := a.backend.Stat(r.Context(), name)
+	info, err := a.currentBackend().Stat(r.Context(), name)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1254,7 +1297,8 @@ func (a *App) serveFile(w http.ResponseWriter, r *http.Request, inline bool) {
 }
 
 func (a *App) serveNamedFile(w http.ResponseWriter, r *http.Request, name string, inline bool) {
-	info, err := a.backend.Stat(r.Context(), name)
+	backend := a.currentBackend()
+	info, err := backend.Stat(r.Context(), name)
 	if err != nil {
 		a.pathError(w, err)
 		return
@@ -1267,7 +1311,7 @@ func (a *App) serveNamedFile(w http.ResponseWriter, r *http.Request, name string
 		http.Error(w, "path is not a regular file", http.StatusBadRequest)
 		return
 	}
-	f, err := a.backend.Open(r.Context(), name)
+	f, err := backend.Open(r.Context(), name)
 	if err != nil {
 		a.pathError(w, err)
 		return
@@ -1400,7 +1444,7 @@ func contentType(name string) string {
 	switch strings.ToLower(path.Ext(name)) {
 	case ".txt", ".log", ".yaml", ".yml":
 		return "text/plain; charset=utf-8"
-	case ".md":
+	case ".md", ".markdown":
 		return "text/markdown; charset=utf-8"
 	case ".csv":
 		return "text/csv; charset=utf-8"
@@ -1447,7 +1491,7 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		}
 		destination, _ := filesystem.Child(directory, filename)
 		overwrite := r.URL.Query().Get("overwrite") == "1"
-		written, uploadErr := a.backend.Upload(r.Context(), destination, part, overwrite)
+		written, uploadErr := a.currentBackend().Upload(r.Context(), destination, part, overwrite)
 		_ = part.Close()
 		if errors.Is(uploadErr, filesystem.ErrExists) {
 			writeJSON(w, http.StatusConflict, map[string]any{"error": "destination already exists", "requires_confirmation": true, "path": destination})
@@ -1493,7 +1537,7 @@ func (a *App) importURL(w http.ResponseWriter, r *http.Request) {
 	}
 	destination, _ := filesystem.Child(directory, filename)
 	overwrite := r.URL.Query().Get("overwrite") == "1"
-	existing, statErr := a.backend.Lstat(r.Context(), destination)
+	existing, statErr := a.currentBackend().Lstat(r.Context(), destination)
 	if statErr == nil && existing.IsDir() {
 		a.jsonError(w, fs.ErrInvalid, http.StatusBadRequest)
 		return
@@ -1522,7 +1566,7 @@ func (a *App) importURL(w http.ResponseWriter, r *http.Request) {
 		jsonMessage(w, http.StatusBadGateway, fmt.Sprintf("URL returned HTTP %d", response.StatusCode))
 		return
 	}
-	written, err := a.backend.Upload(r.Context(), destination, response.Body, overwrite)
+	written, err := a.currentBackend().Upload(r.Context(), destination, response.Body, overwrite)
 	if errors.Is(err, filesystem.ErrExists) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "destination already exists", "requires_confirmation": true, "path": destination})
 		return
@@ -1549,15 +1593,23 @@ func safeFilename(name string) (string, error) {
 }
 
 func (a *App) pathError(w http.ResponseWriter, err error) {
+	if errors.Is(err, filesystem.ErrDisconnected) {
+		w.Header().Set("Retry-After", "5")
+	}
 	http.Error(w, publicError(err), statusForError(err))
 }
 
 func (a *App) jsonError(w http.ResponseWriter, err error, status int) {
+	if errors.Is(err, filesystem.ErrDisconnected) {
+		w.Header().Set("Retry-After", "5")
+	}
 	writeJSON(w, status, map[string]any{"error": publicError(err)})
 }
 
 func publicError(err error) string {
 	switch {
+	case errors.Is(err, filesystem.ErrDisconnected):
+		return "Connection to the remote server was lost. Reconnecting — retry in a few seconds."
 	case errors.Is(err, errOutsideRoot):
 		return "path is outside the configured root"
 	case errors.Is(err, filesystem.ErrTraversal):
@@ -1587,6 +1639,8 @@ func publicError(err error) string {
 
 func statusForError(err error) int {
 	switch {
+	case errors.Is(err, filesystem.ErrDisconnected):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, errOutsideRoot):
 		return http.StatusForbidden
 	case errors.Is(err, filesystem.ErrTraversal), errors.Is(err, fs.ErrInvalid):
