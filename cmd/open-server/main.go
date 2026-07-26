@@ -30,7 +30,7 @@ import (
 	appweb "open-server/internal/web"
 )
 
-const version = "0.2.2"
+const version = "0.2.3"
 
 const automaticPortStart = 60000
 

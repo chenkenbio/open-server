@@ -54,18 +54,40 @@ type Options struct {
 var errOutsideRoot = errors.New("path is outside the configured root")
 
 type tensorBoardLaunch struct {
-	id     string
-	prefix string
-	ready  chan struct{}
-	err    error
+	id          string
+	prefix      string
+	ready       chan struct{}
+	stopped     chan struct{}
+	stoppedOnce sync.Once
+	state       string
+	err         error
+	instance    *tensorboard.Instance
 }
 
 type jupyterLaunch struct {
-	id     string
-	prefix string
-	ready  chan struct{}
-	err    error
+	id          string
+	prefix      string
+	python      string
+	ready       chan struct{}
+	stopped     chan struct{}
+	stoppedOnce sync.Once
+	state       string
+	err         error
+	instance    *jupyter.Instance
 }
+
+const (
+	appStateStopped  = "stopped"
+	appStateStarting = "starting"
+	appStateRunning  = "running"
+	appStateStopping = "stopping"
+)
+
+var (
+	errAppStopping            = errors.New("application is stopping")
+	errJupyterPythonConflict  = errors.New("JupyterLab is already running for this directory with another Python executable")
+	errApplicationStillStarts = errors.New("application is still starting")
+)
 
 type App struct {
 	backend       filesystem.Backend
@@ -90,7 +112,7 @@ type App struct {
 	tensorByDir   map[string]*tensorBoardLaunch
 	jupyterMu     sync.RWMutex
 	jupyterProxy  map[string]http.Handler
-	jupyterByKey  map[string]*jupyterLaunch
+	jupyterByDir  map[string]*jupyterLaunch
 	template      *template.Template
 }
 
@@ -160,7 +182,7 @@ func New(options Options) (*App, error) {
 		tensorProxy:   make(map[string]http.Handler),
 		tensorByDir:   make(map[string]*tensorBoardLaunch),
 		jupyterProxy:  make(map[string]http.Handler),
-		jupyterByKey:  make(map[string]*jupyterLaunch),
+		jupyterByDir:  make(map[string]*jupyterLaunch),
 		template:      tmpl,
 	}, nil
 }
@@ -299,17 +321,27 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		a.closeSession(w)
 	case "/tensorboard":
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
-			return
+		switch r.Method {
+		case http.MethodGet:
+			a.tensorBoardStatus(w, r)
+		case http.MethodPost:
+			a.startTensorBoard(w, r)
+		case http.MethodDelete:
+			a.stopTensorBoard(w, r)
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPost, http.MethodDelete)
 		}
-		a.startTensorBoard(w, r)
 	case "/jupyter":
-		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
-			return
+		switch r.Method {
+		case http.MethodGet:
+			a.jupyterStatus(w, r)
+		case http.MethodPost:
+			a.startJupyter(w, r)
+		case http.MethodDelete:
+			a.stopJupyter(w, r)
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPost, http.MethodDelete)
 		}
-		a.startJupyter(w, r)
 	case "/live":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w, http.MethodGet, http.MethodHead)
@@ -490,7 +522,6 @@ type directoryView struct {
 	DefaultPython      string
 	CSRFToken          string
 	LaTeXEnabled       bool
-	ActionColumnCount  int
 	ColumnCount        int
 	NameSortURL        string
 	ModifiedSortURL    string
@@ -500,12 +531,12 @@ type directoryView struct {
 	SizeSortMarker     string
 	HasParent          bool
 	CurrentURL         string
-	CurrentTensorBoard string
-	CurrentJupyter     string
+	CurrentTensorBoard applicationActionView
+	CurrentJupyter     applicationActionView
 	ParentPath         string
 	ParentURL          string
-	ParentTensorBoard  string
-	ParentJupyter      string
+	ParentTensorBoard  applicationActionView
+	ParentJupyter      applicationActionView
 	Breadcrumbs        []breadcrumbView
 	Entries            []entryView
 }
@@ -520,13 +551,22 @@ type latexSnippet struct {
 	Short string
 }
 
+type applicationActionView struct {
+	App       string
+	Label     string
+	Endpoint  string
+	State     string
+	Available bool
+	OpenURL   string
+}
+
 type entryView struct {
 	Name          string
 	FullPath      string
 	URL           string
 	Download      string
-	TensorBoard   string
-	Jupyter       string
+	TensorBoard   applicationActionView
+	Jupyter       applicationActionView
 	TableSnippet  latexSnippet
 	FigureSnippet latexSnippet
 	LiveURL       string
@@ -611,14 +651,13 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	if showHidden {
 		view.HiddenToggleLabel = "Hide hidden items"
 	}
-	view.ActionColumnCount = 1
+	view.ColumnCount = 5
 	if view.JupyterEnabled {
-		view.ActionColumnCount++
+		view.ColumnCount += 2
 	}
 	if view.TensorBoardEnabled {
-		view.ActionColumnCount++
+		view.ColumnCount += 2
 	}
-	view.ColumnCount = 4 + view.ActionColumnCount
 	if view.LaTeXEnabled {
 		view.ColumnCount += 3
 	}
@@ -627,20 +666,20 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	view.SizeSortMarker = sortMarker(sortKey, order, "size")
 	view.CurrentURL = a.appURL("/", current, sortKey, order, showHidden)
 	if a.tensorBoard != nil {
-		view.CurrentTensorBoard = a.appURL("/tensorboard", current, "", "", showHidden)
+		view.CurrentTensorBoard = a.tensorBoardActionView(current, showHidden)
 	}
 	if a.jupyter != nil {
-		view.CurrentJupyter = a.appURL("/jupyter", current, "", "", showHidden)
+		view.CurrentJupyter = a.jupyterActionView(current, showHidden)
 	}
 	if current != a.root {
 		view.HasParent = true
 		view.ParentPath = path.Dir(current)
 		view.ParentURL = a.appURL("/", view.ParentPath, sortKey, order, showHidden)
 		if a.tensorBoard != nil {
-			view.ParentTensorBoard = a.appURL("/tensorboard", view.ParentPath, "", "", showHidden)
+			view.ParentTensorBoard = a.tensorBoardActionView(view.ParentPath, showHidden)
 		}
 		if a.jupyter != nil {
-			view.ParentJupyter = a.appURL("/jupyter", view.ParentPath, "", "", showHidden)
+			view.ParentJupyter = a.jupyterActionView(view.ParentPath, showHidden)
 		}
 	}
 	for _, entry := range entries {
@@ -652,13 +691,13 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 		if entry.IsDir() {
 			entryURL = a.appURL("/", fullName, sortKey, order, showHidden)
 		}
-		tensorBoardURL := ""
+		var tensorBoardAction applicationActionView
 		if entry.IsDir() && a.tensorBoard != nil {
-			tensorBoardURL = a.appURL("/tensorboard", fullName, "", "", showHidden)
+			tensorBoardAction = a.tensorBoardActionView(fullName, showHidden)
 		}
-		jupyterURL := ""
+		var jupyterAction applicationActionView
 		if entry.IsDir() && a.jupyter != nil {
-			jupyterURL = a.appURL("/jupyter", fullName, "", "", showHidden)
+			jupyterAction = a.jupyterActionView(fullName, showHidden)
 		}
 		var figureSnippet, tableSnippet latexSnippet
 		liveURL := ""
@@ -673,8 +712,8 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 			FullPath:      fullName,
 			URL:           entryURL,
 			Download:      a.appURL("/download", fullName, "", "", showHidden),
-			TensorBoard:   tensorBoardURL,
-			Jupyter:       jupyterURL,
+			TensorBoard:   tensorBoardAction,
+			Jupyter:       jupyterAction,
 			TableSnippet:  tableSnippet,
 			FigureSnippet: figureSnippet,
 			LiveURL:       liveURL,
@@ -883,6 +922,32 @@ func (a *App) mkdir(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"path": destination})
 }
 
+type applicationStatus struct {
+	State     string `json:"state"`
+	Available bool   `json:"available"`
+	OpenURL   string `json:"open_url,omitempty"`
+}
+
+func wantsJSON(r *http.Request) bool {
+	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/json")
+}
+
+func actionError(w http.ResponseWriter, r *http.Request, status int, message string) {
+	if wantsJSON(r) {
+		jsonMessage(w, status, message)
+		return
+	}
+	http.Error(w, message, status)
+}
+
+func codedActionError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	if wantsJSON(r) {
+		writeJSON(w, status, map[string]string{"code": code, "error": message})
+		return
+	}
+	http.Error(w, message, status)
+}
+
 func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 	if a.tensorBoard == nil {
 		http.NotFound(w, r)
@@ -893,6 +958,23 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 		a.pathError(w, err)
 		return
 	}
+
+	a.tensorMu.RLock()
+	existing := a.tensorByDir[directory]
+	existingState := appStateStopped
+	if existing != nil {
+		existingState = existing.state
+	}
+	a.tensorMu.RUnlock()
+	if existing != nil {
+		if existingState == appStateStopping {
+			actionError(w, r, http.StatusConflict, errAppStopping.Error())
+			return
+		}
+		a.respondTensorBoardLaunch(w, r, existing, false)
+		return
+	}
+
 	backend := a.currentBackend()
 	info, err := backend.Stat(r.Context(), directory)
 	if err != nil {
@@ -900,7 +982,7 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !info.IsDir() {
-		http.Error(w, "TensorBoard path must be a directory", http.StatusBadRequest)
+		actionError(w, r, http.StatusBadRequest, "TensorBoard path must be a directory")
 		return
 	}
 	entries, err := backend.ReadDir(r.Context(), directory)
@@ -909,12 +991,22 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !hasTensorBoardEvents(entries) {
-		http.Error(w, "TensorBoard event files were not found in this directory", http.StatusBadRequest)
+		codedActionError(
+			w,
+			r,
+			http.StatusBadRequest,
+			"not_tensorboard_folder",
+			"This is not a TensorBoard log folder. Choose a folder that directly contains an events.out.tfevents.* file.",
+		)
 		return
 	}
 	launch, owner, err := a.acquireTensorBoardLaunch(directory)
+	if errors.Is(err, errAppStopping) {
+		actionError(w, r, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
-		http.Error(w, "could not create TensorBoard session", http.StatusInternalServerError)
+		actionError(w, r, http.StatusInternalServerError, "could not create TensorBoard session")
 		return
 	}
 	if owner {
@@ -934,9 +1026,9 @@ func (a *App) startTensorBoard(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		a.completeTensorBoardLaunch(directory, launch, handler, startErr)
+		a.completeTensorBoardLaunch(directory, launch, instance, handler, startErr)
 	}
-	a.respondTensorBoardLaunch(w, r, launch)
+	a.respondTensorBoardLaunch(w, r, launch, owner)
 }
 
 func (a *App) startJupyter(w http.ResponseWriter, r *http.Request) {
@@ -946,7 +1038,7 @@ func (a *App) startJupyter(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid Jupyter launch request", http.StatusBadRequest)
+		actionError(w, r, http.StatusBadRequest, "invalid Jupyter launch request")
 		return
 	}
 	directory, err := a.requestPath(r)
@@ -960,17 +1052,20 @@ func (a *App) startJupyter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !info.IsDir() {
-		http.Error(w, "Jupyter path must be a directory", http.StatusBadRequest)
+		actionError(w, r, http.StatusBadRequest, "Jupyter path must be a directory")
 		return
 	}
 	kernelPython := strings.TrimSpace(r.Form.Get("python"))
 	if kernelPython == "" {
 		kernelPython = a.defaultPython
 	}
-	key := directory + "\x00" + kernelPython
-	launch, owner, err := a.acquireJupyterLaunch(key)
-	if err != nil {
-		http.Error(w, "could not create Jupyter session", http.StatusInternalServerError)
+	launch, owner, err := a.acquireJupyterLaunch(directory, kernelPython)
+	switch {
+	case errors.Is(err, errAppStopping), errors.Is(err, errJupyterPythonConflict):
+		actionError(w, r, http.StatusConflict, err.Error())
+		return
+	case err != nil:
+		actionError(w, r, http.StatusInternalServerError, "could not create Jupyter session")
 		return
 	}
 	if owner {
@@ -987,15 +1082,21 @@ func (a *App) startJupyter(w http.ResponseWriter, r *http.Request) {
 				handler = proxy
 			}
 		}
-		a.completeJupyterLaunch(key, launch, handler, startErr)
+		a.completeJupyterLaunch(directory, launch, instance, handler, startErr)
 	}
-	a.respondJupyterLaunch(w, r, launch)
+	a.respondJupyterLaunch(w, r, launch, owner)
 }
 
-func (a *App) acquireJupyterLaunch(key string) (*jupyterLaunch, bool, error) {
+func (a *App) acquireJupyterLaunch(directory, python string) (*jupyterLaunch, bool, error) {
 	a.jupyterMu.Lock()
 	defer a.jupyterMu.Unlock()
-	if existing := a.jupyterByKey[key]; existing != nil {
+	if existing := a.jupyterByDir[directory]; existing != nil {
+		if existing.state == appStateStopping {
+			return nil, false, errAppStopping
+		}
+		if existing.python != python {
+			return nil, false, errJupyterPythonConflict
+		}
 		return existing, false, nil
 	}
 	var randomID [8]byte
@@ -1003,40 +1104,67 @@ func (a *App) acquireJupyterLaunch(key string) (*jupyterLaunch, bool, error) {
 		return nil, false, err
 	}
 	id := hex.EncodeToString(randomID[:])
-	launch := &jupyterLaunch{id: id, prefix: "/jupyter/" + id, ready: make(chan struct{})}
-	a.jupyterByKey[key] = launch
+	launch := &jupyterLaunch{
+		id: id, prefix: "/jupyter/" + id, python: python,
+		ready: make(chan struct{}), stopped: make(chan struct{}), state: appStateStarting,
+	}
+	a.jupyterByDir[directory] = launch
 	return launch, true, nil
 }
 
-func (a *App) completeJupyterLaunch(key string, launch *jupyterLaunch, handler http.Handler, err error) {
+func (a *App) completeJupyterLaunch(directory string, launch *jupyterLaunch, instance *jupyter.Instance, handler http.Handler, err error) {
 	a.jupyterMu.Lock()
 	launch.err = err
 	if err == nil {
+		launch.instance = instance
+		launch.state = appStateRunning
 		a.jupyterProxy[launch.id] = handler
-	} else if a.jupyterByKey[key] == launch {
-		delete(a.jupyterByKey, key)
+	} else {
+		a.finishJupyterLaunchLocked(directory, launch)
 	}
 	close(launch.ready)
 	a.jupyterMu.Unlock()
+	if err == nil && instance != nil && instance.Done() != nil {
+		go a.watchJupyterLaunch(directory, launch, instance.Done())
+	}
 }
 
-func (a *App) respondJupyterLaunch(w http.ResponseWriter, r *http.Request, launch *jupyterLaunch) {
+func (a *App) respondJupyterLaunch(w http.ResponseWriter, r *http.Request, launch *jupyterLaunch, created bool) {
 	select {
 	case <-launch.ready:
 	case <-r.Context().Done():
 		return
 	}
-	if launch.err != nil {
-		http.Error(w, "could not start Jupyter: "+launch.err.Error(), http.StatusBadGateway)
+	a.jupyterMu.RLock()
+	err := launch.err
+	status := a.jupyterStatusLocked(launch)
+	a.jupyterMu.RUnlock()
+	if err != nil {
+		actionError(w, r, http.StatusBadGateway, "could not start Jupyter: "+err.Error())
 		return
 	}
-	http.Redirect(w, r, launch.prefix+"/lab", http.StatusSeeOther)
+	if status.State != appStateRunning || status.OpenURL == "" {
+		actionError(w, r, http.StatusBadGateway, "Jupyter stopped before it could be opened")
+		return
+	}
+	if wantsJSON(r) {
+		code := http.StatusOK
+		if created {
+			code = http.StatusCreated
+		}
+		writeJSON(w, code, status)
+		return
+	}
+	http.Redirect(w, r, status.OpenURL, http.StatusSeeOther)
 }
 
 func (a *App) acquireTensorBoardLaunch(directory string) (*tensorBoardLaunch, bool, error) {
 	a.tensorMu.Lock()
 	defer a.tensorMu.Unlock()
 	if existing := a.tensorByDir[directory]; existing != nil {
+		if existing.state == appStateStopping {
+			return nil, false, errAppStopping
+		}
 		return existing, false, nil
 	}
 	var randomID [8]byte
@@ -1044,34 +1172,270 @@ func (a *App) acquireTensorBoardLaunch(directory string) (*tensorBoardLaunch, bo
 		return nil, false, err
 	}
 	id := hex.EncodeToString(randomID[:])
-	launch := &tensorBoardLaunch{id: id, prefix: "/tensorboard/" + id, ready: make(chan struct{})}
+	launch := &tensorBoardLaunch{
+		id: id, prefix: "/tensorboard/" + id,
+		ready: make(chan struct{}), stopped: make(chan struct{}), state: appStateStarting,
+	}
 	a.tensorByDir[directory] = launch
 	return launch, true, nil
 }
 
-func (a *App) completeTensorBoardLaunch(directory string, launch *tensorBoardLaunch, handler http.Handler, err error) {
+func (a *App) completeTensorBoardLaunch(directory string, launch *tensorBoardLaunch, instance *tensorboard.Instance, handler http.Handler, err error) {
 	a.tensorMu.Lock()
 	launch.err = err
 	if err == nil {
+		launch.instance = instance
+		launch.state = appStateRunning
 		a.tensorProxy[launch.id] = handler
-	} else if a.tensorByDir[directory] == launch {
-		delete(a.tensorByDir, directory)
+	} else {
+		a.finishTensorBoardLaunchLocked(directory, launch)
 	}
 	close(launch.ready)
 	a.tensorMu.Unlock()
+	if err == nil && instance != nil && instance.Done() != nil {
+		go a.watchTensorBoardLaunch(directory, launch, instance.Done())
+	}
 }
 
-func (a *App) respondTensorBoardLaunch(w http.ResponseWriter, r *http.Request, launch *tensorBoardLaunch) {
+func (a *App) respondTensorBoardLaunch(w http.ResponseWriter, r *http.Request, launch *tensorBoardLaunch, created bool) {
 	select {
 	case <-launch.ready:
 	case <-r.Context().Done():
 		return
 	}
-	if launch.err != nil {
-		http.Error(w, "could not start TensorBoard: "+launch.err.Error(), http.StatusBadGateway)
+	a.tensorMu.RLock()
+	err := launch.err
+	status := a.tensorBoardStatusLocked(launch)
+	a.tensorMu.RUnlock()
+	if err != nil {
+		actionError(w, r, http.StatusBadGateway, "could not start TensorBoard: "+err.Error())
 		return
 	}
-	http.Redirect(w, r, launch.prefix+"/#scalars", http.StatusSeeOther)
+	if status.State != appStateRunning || status.OpenURL == "" {
+		actionError(w, r, http.StatusBadGateway, "TensorBoard stopped before it could be opened")
+		return
+	}
+	if wantsJSON(r) {
+		code := http.StatusOK
+		if created {
+			code = http.StatusCreated
+		}
+		writeJSON(w, code, status)
+		return
+	}
+	http.Redirect(w, r, status.OpenURL, http.StatusSeeOther)
+}
+
+func (a *App) jupyterStatus(w http.ResponseWriter, r *http.Request) {
+	if a.jupyter == nil {
+		http.NotFound(w, r)
+		return
+	}
+	directory, err := a.requestPath(r)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	a.jupyterMu.RLock()
+	status := a.jupyterStatusLocked(a.jupyterByDir[directory])
+	a.jupyterMu.RUnlock()
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (a *App) tensorBoardStatus(w http.ResponseWriter, r *http.Request) {
+	if a.tensorBoard == nil {
+		http.NotFound(w, r)
+		return
+	}
+	directory, err := a.requestPath(r)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	a.tensorMu.RLock()
+	status := a.tensorBoardStatusLocked(a.tensorByDir[directory])
+	a.tensorMu.RUnlock()
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (a *App) stopJupyter(w http.ResponseWriter, r *http.Request) {
+	if a.jupyter == nil {
+		http.NotFound(w, r)
+		return
+	}
+	directory, err := a.requestPath(r)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	a.jupyterMu.Lock()
+	launch := a.jupyterByDir[directory]
+	if launch == nil {
+		a.jupyterMu.Unlock()
+		writeJSON(w, http.StatusOK, applicationStatus{State: appStateStopped})
+		return
+	}
+	if launch.state == appStateStarting {
+		a.jupyterMu.Unlock()
+		jsonMessage(w, http.StatusConflict, errApplicationStillStarts.Error())
+		return
+	}
+	if launch.state == appStateStopping {
+		stopped := launch.stopped
+		a.jupyterMu.Unlock()
+		select {
+		case <-stopped:
+			writeJSON(w, http.StatusOK, applicationStatus{State: appStateStopped})
+		case <-r.Context().Done():
+		}
+		return
+	}
+	launch.state = appStateStopping
+	instance := launch.instance
+	delete(a.jupyterProxy, launch.id)
+	a.jupyterMu.Unlock()
+
+	stopErr := a.jupyter.Stop(instance)
+	a.jupyterMu.Lock()
+	a.finishJupyterLaunchLocked(directory, launch)
+	a.jupyterMu.Unlock()
+	if stopErr != nil {
+		jsonMessage(w, http.StatusBadGateway, "could not stop Jupyter: "+stopErr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, applicationStatus{State: appStateStopped})
+}
+
+func (a *App) stopTensorBoard(w http.ResponseWriter, r *http.Request) {
+	if a.tensorBoard == nil {
+		http.NotFound(w, r)
+		return
+	}
+	directory, err := a.requestPath(r)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	a.tensorMu.Lock()
+	launch := a.tensorByDir[directory]
+	if launch == nil {
+		a.tensorMu.Unlock()
+		writeJSON(w, http.StatusOK, applicationStatus{State: appStateStopped})
+		return
+	}
+	if launch.state == appStateStarting {
+		a.tensorMu.Unlock()
+		jsonMessage(w, http.StatusConflict, errApplicationStillStarts.Error())
+		return
+	}
+	if launch.state == appStateStopping {
+		stopped := launch.stopped
+		a.tensorMu.Unlock()
+		select {
+		case <-stopped:
+			writeJSON(w, http.StatusOK, applicationStatus{State: appStateStopped})
+		case <-r.Context().Done():
+		}
+		return
+	}
+	launch.state = appStateStopping
+	instance := launch.instance
+	delete(a.tensorProxy, launch.id)
+	a.tensorMu.Unlock()
+
+	stopErr := a.tensorBoard.Stop(instance)
+	a.tensorMu.Lock()
+	a.finishTensorBoardLaunchLocked(directory, launch)
+	a.tensorMu.Unlock()
+	if stopErr != nil {
+		jsonMessage(w, http.StatusBadGateway, "could not stop TensorBoard: "+stopErr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, applicationStatus{State: appStateStopped})
+}
+
+func (a *App) jupyterStatusLocked(launch *jupyterLaunch) applicationStatus {
+	if launch == nil {
+		return applicationStatus{State: appStateStopped}
+	}
+	status := applicationStatus{State: launch.state}
+	if launch.state == appStateRunning && launch.instance != nil {
+		status.Available = launch.instance.Available()
+		status.OpenURL = launch.prefix + "/lab"
+	}
+	return status
+}
+
+func (a *App) tensorBoardStatusLocked(launch *tensorBoardLaunch) applicationStatus {
+	if launch == nil {
+		return applicationStatus{State: appStateStopped}
+	}
+	status := applicationStatus{State: launch.state}
+	if launch.state == appStateRunning && launch.instance != nil {
+		status.Available = launch.instance.Available()
+		status.OpenURL = launch.prefix + "/#scalars"
+	}
+	return status
+}
+
+func (a *App) jupyterActionView(directory string, showHidden bool) applicationActionView {
+	a.jupyterMu.RLock()
+	status := a.jupyterStatusLocked(a.jupyterByDir[directory])
+	a.jupyterMu.RUnlock()
+	return applicationActionView{
+		App:       "jupyter",
+		Label:     "JupyterLab",
+		Endpoint:  a.appURL("/jupyter", directory, "", "", showHidden),
+		State:     status.State,
+		Available: status.Available,
+		OpenURL:   status.OpenURL,
+	}
+}
+
+func (a *App) tensorBoardActionView(directory string, showHidden bool) applicationActionView {
+	a.tensorMu.RLock()
+	status := a.tensorBoardStatusLocked(a.tensorByDir[directory])
+	a.tensorMu.RUnlock()
+	return applicationActionView{
+		App:       "tensorboard",
+		Label:     "TensorBoard",
+		Endpoint:  a.appURL("/tensorboard", directory, "", "", showHidden),
+		State:     status.State,
+		Available: status.Available,
+		OpenURL:   status.OpenURL,
+	}
+}
+
+func (a *App) watchJupyterLaunch(directory string, launch *jupyterLaunch, done <-chan struct{}) {
+	<-done
+	a.jupyterMu.Lock()
+	a.finishJupyterLaunchLocked(directory, launch)
+	a.jupyterMu.Unlock()
+}
+
+func (a *App) watchTensorBoardLaunch(directory string, launch *tensorBoardLaunch, done <-chan struct{}) {
+	<-done
+	a.tensorMu.Lock()
+	a.finishTensorBoardLaunchLocked(directory, launch)
+	a.tensorMu.Unlock()
+}
+
+func (a *App) finishJupyterLaunchLocked(directory string, launch *jupyterLaunch) {
+	if a.jupyterByDir[directory] == launch {
+		delete(a.jupyterByDir, directory)
+	}
+	delete(a.jupyterProxy, launch.id)
+	launch.state = appStateStopped
+	launch.stoppedOnce.Do(func() { close(launch.stopped) })
+}
+
+func (a *App) finishTensorBoardLaunchLocked(directory string, launch *tensorBoardLaunch) {
+	if a.tensorByDir[directory] == launch {
+		delete(a.tensorByDir, directory)
+	}
+	delete(a.tensorProxy, launch.id)
+	launch.state = appStateStopped
+	launch.stoppedOnce.Do(func() { close(launch.stopped) })
 }
 
 const tensorBoardEventPrefix = "events.out.tfevents."

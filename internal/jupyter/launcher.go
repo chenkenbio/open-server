@@ -53,11 +53,32 @@ type remoteLaunchConfig struct {
 type Instance struct {
 	Target *url.URL
 	Token  string
+	record *runningInstance
 }
 
-// Launcher starts JupyterLab instances.
+// Done closes when the managed JupyterLab instance has ended permanently.
+// A temporary SSH transport loss does not close this channel.
+func (i *Instance) Done() <-chan struct{} {
+	if i == nil || i.record == nil {
+		return nil
+	}
+	return i.record.lifecycle.done
+}
+
+// Available reports whether the JupyterLab proxy currently has a live local
+// process or SSH tunnel. A remote service can remain managed while unavailable
+// during the reconnect grace window.
+func (i *Instance) Available() bool {
+	if i == nil || i.record == nil {
+		return true
+	}
+	return i.record.lifecycle.isAvailable()
+}
+
+// Launcher starts and stops JupyterLab instances.
 type Launcher interface {
 	Start(directory, kernelPython, pathPrefix string) (*Instance, error)
+	Stop(*Instance) error
 }
 
 // ProcessLauncher starts local or SSH-hosted JupyterLab processes.
@@ -224,10 +245,19 @@ func (l *ProcessLauncher) startOnce(directory, kernelPython, pathPrefix string) 
 	if stdinReader != nil {
 		_ = stdinReader.Close()
 	}
-	process := newRunningProcess(command, stdinWriter, flushOutput)
+	lifecycle := newInstanceLifecycle(true)
+	process := newRunningProcess(command, stdinWriter, func() {
+		flushOutput()
+		if l.remote {
+			lifecycle.setAvailable(false)
+		} else {
+			lifecycle.finish()
+		}
+	})
 	if stdinWriter != nil {
 		if _, err := io.WriteString(stdinWriter, remoteFrame); err != nil {
 			process.stop()
+			lifecycle.finish()
 			_ = os.RemoveAll(temporaryDirectory)
 			return nil, fmt.Errorf("send remote Jupyter configuration through SSH: %w", err)
 		}
@@ -244,6 +274,7 @@ func (l *ProcessLauncher) startOnce(directory, kernelPython, pathPrefix string) 
 		localPort:       localPort,
 		runDirectory:    runDirectory,
 		socketPath:      socketPath,
+		lifecycle:       lifecycle,
 	}
 
 	l.mu.Lock()
@@ -259,9 +290,31 @@ func (l *ProcessLauncher) startOnce(directory, kernelPython, pathPrefix string) 
 		context.Background(), target, pathPrefix, token, running.process.done, diagnostic,
 	); err != nil {
 		running.stopWithoutAPI()
+		l.removeInstance(running)
 		return nil, err
 	}
-	return &Instance{Target: target, Token: token}, nil
+	return &Instance{Target: target, Token: token, record: running}, nil
+}
+
+// Stop terminates one managed JupyterLab instance. It is idempotent. The
+// record is retired under the launcher lock before process shutdown so a
+// concurrent or later Reattach cannot revive an explicitly stopped instance.
+func (l *ProcessLauncher) Stop(instance *Instance) error {
+	if instance == nil || instance.record == nil {
+		return nil
+	}
+	running := instance.record
+	l.mu.Lock()
+	if running.retired {
+		l.mu.Unlock()
+		return nil
+	}
+	running.retired = true
+	process := running.process
+	l.removeInstanceLocked(running)
+	l.mu.Unlock()
+	running.stop(process, true)
+	return nil
 }
 
 // Close stops all kernels and JupyterLab processes and waits for their exit.
@@ -269,9 +322,15 @@ func (l *ProcessLauncher) Close() {
 	l.mu.Lock()
 	l.closed = true
 	instances := append([]*runningInstance(nil), l.instances...)
+	l.instances = nil
+	processes := make([]*runningProcess, len(instances))
+	for index, instance := range instances {
+		instance.retired = true
+		processes[index] = instance.process
+	}
 	l.mu.Unlock()
-	for _, instance := range instances {
-		instance.stop()
+	for index, instance := range instances {
+		instance.stop(processes[index], true)
 	}
 }
 
@@ -295,13 +354,17 @@ func (l *ProcessLauncher) Reattach(ctx context.Context) {
 		}
 		l.mu.Lock()
 		process := instance.process
+		retired := instance.retired
 		l.mu.Unlock()
+		if retired || process == nil {
+			continue
+		}
 		select {
 		case <-process.done:
 		default:
 			continue
 		}
-		l.reattachInstance(ctx, instance)
+		l.reattachInstance(ctx, instance, process)
 	}
 }
 
@@ -309,7 +372,7 @@ func (l *ProcessLauncher) Reattach(ctx context.Context) {
 // instance, confirms readiness through the HTTP probe, and swaps in the new
 // process so Close still stops it. Failures are logged and leave the instance
 // dead so the proxy returns 502 until the user relaunches from the browser.
-func (l *ProcessLauncher) reattachInstance(ctx context.Context, instance *runningInstance) {
+func (l *ProcessLauncher) reattachInstance(ctx context.Context, instance *runningInstance, previous *runningProcess) {
 	executable, arguments, err := reattachCommand(
 		l.rsh, l.host, instance.localPort, instance.runDirectory, instance.socketPath,
 	)
@@ -340,7 +403,18 @@ func (l *ProcessLauncher) reattachInstance(ctx context.Context, instance *runnin
 		return
 	}
 	_ = stdinReader.Close()
-	process := newRunningProcess(command, stdinWriter, flush)
+	process := newRunningProcess(command, stdinWriter, func() {
+		flush()
+		instance.lifecycle.setAvailable(false)
+	})
+	l.mu.Lock()
+	if l.closed || instance.retired || instance.process != previous {
+		l.mu.Unlock()
+		process.stop()
+		return
+	}
+	instance.process = process
+	l.mu.Unlock()
 	if err := waitUntilReady(
 		ctx, instance.target, instance.pathPrefix, instance.token, process.done, diagnostic,
 	); err != nil {
@@ -353,13 +427,31 @@ func (l *ProcessLauncher) reattachInstance(ctx context.Context, instance *runnin
 		return
 	}
 	l.mu.Lock()
-	if l.closed {
+	if l.closed || instance.retired || instance.process != process {
 		l.mu.Unlock()
 		process.stop()
 		return
 	}
-	instance.process = process
+	instance.lifecycle.setAvailable(true)
 	l.mu.Unlock()
+}
+
+func (l *ProcessLauncher) removeInstance(instance *runningInstance) {
+	l.mu.Lock()
+	l.removeInstanceLocked(instance)
+	l.mu.Unlock()
+}
+
+func (l *ProcessLauncher) removeInstanceLocked(instance *runningInstance) {
+	for index, candidate := range l.instances {
+		if candidate != instance {
+			continue
+		}
+		copy(l.instances[index:], l.instances[index+1:])
+		l.instances[len(l.instances)-1] = nil
+		l.instances = l.instances[:len(l.instances)-1]
+		return
+	}
 }
 
 func validateLaunch(directory, kernelPython, pathPrefix string) error {
@@ -1208,21 +1300,55 @@ type runningInstance struct {
 	localPort       int
 	runDirectory    string
 	socketPath      string
+	lifecycle       *instanceLifecycle
+	retired         bool
 	stopOnce        sync.Once
 }
 
-func (i *runningInstance) stop() {
+func (i *runningInstance) stop(process *runningProcess, shutdownAPI bool) {
 	i.stopOnce.Do(func() {
-		shutdownKernels(i.target, i.pathPrefix, i.token)
-		i.process.stop()
+		if shutdownAPI {
+			shutdownKernels(i.target, i.pathPrefix, i.token)
+		}
+		if process != nil {
+			process.stop()
+		}
 		_ = os.RemoveAll(i.temporaryPrefix)
+		i.lifecycle.finish()
 	})
 }
 
 func (i *runningInstance) stopWithoutAPI() {
-	i.stopOnce.Do(func() {
-		i.process.stop()
-		_ = os.RemoveAll(i.temporaryPrefix)
+	i.stop(i.process, false)
+}
+
+type instanceLifecycle struct {
+	mu        sync.RWMutex
+	available bool
+	done      chan struct{}
+	doneOnce  sync.Once
+}
+
+func newInstanceLifecycle(available bool) *instanceLifecycle {
+	return &instanceLifecycle{available: available, done: make(chan struct{})}
+}
+
+func (l *instanceLifecycle) isAvailable() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.available
+}
+
+func (l *instanceLifecycle) setAvailable(available bool) {
+	l.mu.Lock()
+	l.available = available
+	l.mu.Unlock()
+}
+
+func (l *instanceLifecycle) finish() {
+	l.doneOnce.Do(func() {
+		l.setAvailable(false)
+		close(l.done)
 	})
 }
 

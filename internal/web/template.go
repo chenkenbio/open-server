@@ -1,6 +1,15 @@
 package web
 
-const directoryTemplate = `<!DOCTYPE html>
+const directoryTemplate = `{{define "app-start-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.25"></circle><path d="m9.75 8.25 6.5 3.75-6.5 3.75z" fill="currentColor" stroke="none"></path></svg>{{end}}{{define "app-stop-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.25"></circle><rect x="8.5" y="8.5" width="7" height="7" rx="1" fill="currentColor" stroke="none"></rect></svg>{{end}}{{define "app-loading-icon"}}<svg class="app-loading-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9" opacity="0.25"></circle><path d="M21 12a9 9 0 0 0-9-9"></path></svg>{{end}}{{define "copy-path-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>{{end}}{{define "download-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v3h14v-3"></path></svg>{{end}}{{define "app-controls"}}{{if .Endpoint}}<td class="action-column app-primary-column" data-app-control data-app="{{.App}}" data-label="{{.Label}}" data-endpoint="{{.Endpoint}}" data-state="{{.State}}">
+<button type="button" class="app-start icon-button" aria-label="Start {{.Label}}" title="Start {{.Label}}" {{if ne .State "stopped"}}hidden{{end}}>{{template "app-start-icon"}}</button>
+<button type="button" class="app-starting icon-button" aria-label="{{.Label}} is starting" title="{{.Label}} is starting" disabled aria-busy="true" {{if ne .State "starting"}}hidden{{end}}>{{if eq .App "jupyter"}}{{template "app-loading-icon"}}{{else}}{{template "app-start-icon"}}{{end}}</button>
+<a class="app-open icon-button" href="{{if .OpenURL}}{{.OpenURL}}{{else}}#{{end}}" target="_blank" rel="noopener" aria-label="Open {{.Label}} in a new tab" title="Open {{.Label}} in a new tab" {{if not (and (eq .State "running") .Available)}}hidden{{end}}><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5h5v5"></path><path d="m10 14 9-9"></path><path d="M19 13v6H5V5h6"></path></svg></a>
+<button type="button" class="app-unavailable icon-button" aria-label="{{.Label}} is reconnecting or unavailable" title="{{.Label}} is reconnecting or unavailable" disabled {{if or (ne .State "running") .Available}}hidden{{end}}><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5h5v5"></path><path d="m10 14 9-9"></path><path d="M19 13v6H5V5h6"></path></svg></button>
+<button type="button" class="app-stopping-primary icon-button" aria-label="{{.Label}} is stopping" title="{{.Label}} is stopping" disabled aria-busy="true" {{if ne .State "stopping"}}hidden{{end}}>{{template "app-stop-icon"}}</button>
+</td><td class="action-column app-stop-column">
+<button type="button" class="app-stop icon-button" data-app="{{.App}}" data-label="{{.Label}}" data-endpoint="{{.Endpoint}}" aria-label="Stop {{.Label}}" title="Stop {{.Label}}" {{if ne .State "running"}}hidden{{end}}>{{template "app-stop-icon"}}</button>
+<button type="button" class="app-stopping icon-button" aria-label="{{.Label}} is stopping" title="{{.Label}} is stopping" disabled aria-busy="true" {{if ne .State "stopping"}}hidden{{end}}>{{template "app-stop-icon"}}</button>
+</td>{{else}}<td class="action-column app-primary-column">&nbsp;</td><td class="action-column app-stop-column">&nbsp;</td>{{end}}{{end}}<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -52,13 +61,45 @@ button, input, select, textarea { font-size: inherit; }
 #regex-filter-help ul { margin: 0.45em 0; padding-left: 1.5em; }
 #regex-filter-help code { font-family: ui-monospace, monospace; }
 #regex-filter-help-close { position: absolute; top: 0.45em; right: 0.45em; }
-.table-scroll { width: 100%; overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: 0.95em; }
-th { padding: 0.23em 0.5em; border-bottom: 2px solid #e0e0e0; color: #666; font-size: 0.82em; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; white-space: nowrap; }
+.table-scroll { width: 100%; max-width: 100%; overflow-x: auto; }
+table {
+  --column-name-width: 28em;
+  --column-modified-width: 12.5em;
+  --column-size-width: 6.5em;
+  --jupyter-columns-width: 0px;
+  --tensorboard-columns-width: 0px;
+  --latex-columns-width: 0px;
+  width: calc(var(--column-name-width) + var(--column-modified-width) + var(--column-size-width) + 4.7em + var(--jupyter-columns-width) + var(--tensorboard-columns-width) + var(--latex-columns-width));
+  max-width: none;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+table.has-jupyter { --jupyter-columns-width: 6em; }
+table.has-tensorboard { --tensorboard-columns-width: 6em; }
+table.has-latex { --latex-columns-width: 6.75em; }
+col.column-name { width: var(--column-name-width); }
+col.column-modified { width: var(--column-modified-width); }
+col.column-size { width: var(--column-size-width); }
+col.column-file-action { width: 2.35em; }
+col.column-app-action { width: 3em; }
+col.column-latex-action { width: 2.25em; }
+th { position: relative; padding: 0.23em 0.5em; border-bottom: 2px solid #e0e0e0; color: #666; font-size: 0.82em; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; white-space: nowrap; }
 th a { color: inherit; text-decoration: none; }
 th a:hover { color: #333; text-decoration: underline; }
 td { padding: 0.21em 0.5em; border-bottom: 1px solid #f0f0f0; vertical-align: middle; white-space: nowrap; }
 tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
+.name-cell-content, .modified-cell-content, .size-cell-content { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.column-resizer { position: absolute; top: 0; right: -0.3em; z-index: 3; width: 0.6em; height: 100%; cursor: col-resize; touch-action: none; }
+.column-resizer::after { position: absolute; top: 8%; bottom: 8%; left: calc(50% - 0.5px); width: 1px; background: #c8ccd2; content: ""; }
+.column-resizer:hover::after, .column-resizer:focus-visible::after, .column-resizer.resizing::after { left: calc(50% - 1px); width: 2px; background: #4a8fe8; }
+.column-resizer:focus-visible { outline: 2px solid #1a5cba; outline-offset: -2px; }
+.app-group-heading { border-bottom: 0; }
+.app-group-heading img { display: block; width: 1.3em; height: 1.3em; margin: 0 auto; object-fit: contain; }
+.app-subheading { padding-right: 0.4em; padding-left: 0.4em; font-size: 0.78em; font-weight: 500; letter-spacing: 0; line-height: 1; text-align: center; text-transform: none; }
+#app-action-status { min-height: 1.2em; margin: -0.25em 0 0.35em; color: #555; font-size: 0.82em; }
+#app-action-status:empty { display: none; }
+#app-action-status[data-kind="error"] { color: #a33; }
 .latex-logo { font-family: "Times New Roman", Times, serif; font-weight: normal; white-space: nowrap; }
 .latex-logo-a { font-size: 0.72em; vertical-align: 0.32em; margin-left: -0.28em; margin-right: -0.12em; }
 .latex-logo-e { display: inline-block; font-size: 0.85em; vertical-align: -0.18em; margin-left: -0.08em; margin-right: -0.05em; }
@@ -72,6 +113,8 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 .icon-button { padding: 0.15em; border: 1px solid transparent; border-radius: 3px; background: transparent; color: #555; cursor: pointer; }
 .icon-button:hover, .icon-button:focus { border-color: #aaa; background: #e8eaf0; color: #111; }
 .icon-button svg, .icon-button img { display: block; width: 1.3em; height: 1.3em; object-fit: contain; }
+.app-loading-icon { transform-origin: center; animation: app-icon-spin 0.8s linear infinite; }
+@keyframes app-icon-spin { to { transform: rotate(360deg); } }
 .copy-result { position: relative; color: transparent !important; }
 .copy-result svg, .copy-result img { visibility: hidden; }
 .copy-result::after { position: absolute; inset: 0; display: grid; place-items: center; font-weight: 700; }
@@ -80,14 +123,22 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 .copy-failure { border-color: #e1aaaa !important; background: #fff0f0 !important; }
 .copy-failure::after { color: #a33; content: "\00d7"; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-.action-column { box-sizing: border-box; width: 2.25em; min-width: 2.25em; max-width: 2.25em; text-align: center; }
+.file-action-column { padding-right: 0.2em; padding-left: 0.2em; text-align: left; }
+.action-column { box-sizing: border-box; width: 2.25em; min-width: 2.25em; max-width: 2.25em; padding-right: 0.2em; padding-left: 0.2em; text-align: center; }
+.action-column.app-primary-column, .action-column.app-stop-column { width: 2.5em; min-width: 2.5em; max-width: 2.5em; }
 .action-column form { margin: 0; }
 .action-column .icon-button { margin: 0 auto; }
+.file-action-column .icon-button { margin: 0; }
+.icon-button[hidden] { display: none; }
+a.icon-button { display: inline-block; }
 @media (max-width: 50rem) {
   body { padding-right: 0.7em; padding-left: 0.7em; }
   #upload-status { flex-basis: 100%; margin-left: 0; }
   #regex-filter-input { flex: 1 1 14em; max-width: 100%; }
   #regex-filter-status { flex-basis: 100%; margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-loading-icon { animation: none; }
 }
 </style>
 </head>
@@ -182,26 +233,48 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
 </div>
 </div>
 {{if .JupyterEnabled}}<div id="jupyter-modal" role="dialog" aria-modal="true" aria-labelledby="jupyter-prompt" style="display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.25); z-index: 1000; font-family: sans-serif;">
-<form id="jupyter-form" method="post" target="_blank" style="background: #fff; color: #000; border: 1px solid #777; border-radius: 6px; max-width: 30em; margin: 15vh auto 0 auto; padding: 1em;">
+<form id="jupyter-form" method="post" style="background: #fff; color: #000; border: 1px solid #777; border-radius: 6px; max-width: 30em; margin: 15vh auto 0 auto; padding: 1em;">
 <p id="jupyter-prompt" style="margin: 0 0 0.8em 0;">Select a Python kernel</p>
 <label for="jupyter-python" style="display: block; margin: 0 0 0.35em 0;">Python executable</label>
 <input id="jupyter-python" name="python" type="text" value="{{.DefaultPython}}" placeholder="/opt/conda/envs/myenv/bin/python" style="width: 100%; box-sizing: border-box; margin: 0 0 0.45em 0;">
 <p style="margin: 0 0 1em 0; font-size: 0.9em; color: #555;">Leave blank to use the configured or environment default.</p>
 <input type="hidden" name="csrf" value="{{.CSRFToken}}">
-<div style="text-align: right;"><button id="jupyter-cancel" type="button">Cancel</button> <button type="submit">Open</button></div>
+<div style="text-align: right;"><button id="jupyter-cancel" type="button">Cancel</button> <button type="submit">Start</button></div>
 </form>
 </div>{{end}}
+<div id="app-action-status" role="status" aria-live="polite"></div>
 <div class="table-scroll" tabindex="0" aria-label="Directory listing">
-<table id="directory-list">
+<table id="directory-list" class="{{if .JupyterEnabled}}has-jupyter {{end}}{{if .TensorBoardEnabled}}has-tensorboard {{end}}{{if .LaTeXEnabled}}has-latex{{end}}">
+<colgroup>
+<col class="column-name" data-column="name">
+<col class="column-modified" data-column="modified">
+<col class="column-size" data-column="size">
+</colgroup>
+<colgroup><col class="column-file-action"><col class="column-file-action"></colgroup>
+{{if .JupyterEnabled}}<colgroup><col class="column-app-action"><col class="column-app-action"></colgroup>{{end}}
+{{if .TensorBoardEnabled}}<colgroup><col class="column-app-action"><col class="column-app-action"></colgroup>{{end}}
+{{if .LaTeXEnabled}}<colgroup><col class="column-latex-action"><col class="column-latex-action"><col class="column-latex-action"></colgroup>{{end}}
 <thead>
-{{$view := .}}<tr><th align="left"><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a></th><th align="left"><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a></th><th align="right"><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a></th><th align="right">Path</th><th align="center" colspan="{{.ActionColumnCount}}">Actions</th>{{if .LaTeXEnabled}}<th align="center" colspan="3" aria-label="LaTeX tools"><span class="latex-tools-heading"><span class="latex-logo" aria-hidden="true">L<span class="latex-logo-a">A</span>T<span class="latex-logo-e">E</span>X</span><label class="latex-env-mode" title="Choose complete environments or inner commands"><span>Short</span><input id="latex-full-environment" class="latex-env-switch" type="checkbox" role="switch" aria-label="Use full LaTeX figure and table environments" checked><span>Full env</span></label></span></th>{{end}}</tr>
+{{$view := .}}<tr>
+<th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Name column" tabindex="0" data-resize-column="name"></span></th>
+<th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Last modified column" tabindex="0" data-resize-column="modified"></span></th>
+<th scope="col" align="right"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Size column" tabindex="0" data-resize-column="size"></span></th>
+<th scope="colgroup" align="left" colspan="2"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}>Actions</th>
+{{if .JupyterEnabled}}<th scope="colgroup" align="center" colspan="2" class="app-group-heading" aria-label="JupyterLab" title="JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></th>{{end}}
+{{if .TensorBoardEnabled}}<th scope="colgroup" align="center" colspan="2" class="app-group-heading" aria-label="TensorBoard" title="TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></th>{{end}}
+{{if .LaTeXEnabled}}<th align="center" colspan="3"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}} aria-label="LaTeX tools"><span class="latex-tools-heading"><span class="latex-logo" aria-hidden="true">L<span class="latex-logo-a">A</span>T<span class="latex-logo-e">E</span>X</span><label class="latex-env-mode" title="Choose complete environments or inner commands"><span>Short</span><input id="latex-full-environment" class="latex-env-switch" type="checkbox" role="switch" aria-label="Use full LaTeX figure and table environments" checked><span>Full env</span></label></span></th>{{end}}
+</tr>
+{{if or .JupyterEnabled .TensorBoardEnabled}}<tr>
+{{if .JupyterEnabled}}<th scope="col" class="app-subheading">Start</th><th scope="col" class="app-subheading">Stop</th>{{end}}
+{{if .TensorBoardEnabled}}<th scope="col" class="app-subheading">Start</th><th scope="col" class="app-subheading">Stop</th>{{end}}
+</tr>{{end}}
 </thead>
 <tbody>
-{{if .HasParent}}<tr><td><a href="{{.ParentURL}}">..</a></td><td>&nbsp;</td><td align="right"> - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path icon-button" data-path="{{.ParentPath}}" aria-label="Copy path" title="Copy path"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg></button></td><td class="action-column">&nbsp;</td>{{if .JupyterEnabled}}<td class="action-column">{{if .ParentJupyter}}<button type="button" class="jupyter-launch icon-button" data-action="{{.ParentJupyter}}" aria-label="Launch JupyterLab" title="Launch JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></button>{{end}}</td>{{end}}{{if .TensorBoardEnabled}}<td class="action-column">{{if .ParentTensorBoard}}<form action="{{.ParentTensorBoard}}" method="post" target="_blank"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><button type="submit" class="icon-button" aria-label="Launch TensorBoard" title="Launch TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></button></form>{{end}}</td>{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>{{end}}
-<tr><td><a href="{{.CurrentURL}}">.</a></td><td>&nbsp;</td><td align="right"> - </td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path icon-button" data-path="{{.CurrentPath}}" aria-label="Copy path" title="Copy path"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg></button></td><td class="action-column">&nbsp;</td>{{if .JupyterEnabled}}<td class="action-column">{{if .CurrentJupyter}}<button type="button" class="jupyter-launch icon-button" data-action="{{.CurrentJupyter}}" aria-label="Launch JupyterLab" title="Launch JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></button>{{end}}</td>{{end}}{{if .TensorBoardEnabled}}<td class="action-column">{{if .CurrentTensorBoard}}<form action="{{.CurrentTensorBoard}}" method="post" target="_blank"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><button type="submit" class="icon-button" aria-label="Launch TensorBoard" title="Launch TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></button></form>{{end}}</td>{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>
+{{if .HasParent}}<tr><td><div class="name-cell-content" title=".."><a href="{{.ParentURL}}">..</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.ParentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .ParentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .ParentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>{{end}}
+<tr><td><div class="name-cell-content" title="."><a href="{{.CurrentURL}}">.</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.CurrentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .CurrentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .CurrentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>
 </tbody>
 {{if .Entries}}<tbody id="directory-entries">
-{{range .Entries}}<tr><td><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</td><td>&nbsp;&nbsp;{{time .ModTime}}&nbsp;&nbsp;</td><td align="right">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</td><td align="right">&nbsp;&nbsp;<button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg></button></td><td class="action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v3h14v-3"></path></svg></button>{{end}}</td>{{if $view.JupyterEnabled}}<td class="action-column">{{if .Jupyter}}<button type="button" class="jupyter-launch icon-button" data-action="{{.Jupyter}}" aria-label="Launch JupyterLab" title="Launch JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></button>{{end}}</td>{{end}}{{if $view.TensorBoardEnabled}}<td class="action-column">{{if .TensorBoard}}<form action="{{.TensorBoard}}" method="post" target="_blank"><input type="hidden" name="csrf" value="{{$view.CSRFToken}}"><button type="submit" class="icon-button" aria-label="Launch TensorBoard" title="Launch TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></button></form>{{end}}</td>{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet-full="{{.TableSnippet.Full}}" data-snippet-short="{{.TableSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet-full="{{.FigureSnippet.Full}}" data-snippet-short="{{.FigureSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
+{{range .Entries}}<tr><td><div class="name-cell-content" title="{{.Name}}{{if .IsDir}}/{{end}}{{if .IsLink}} → {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}"><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</div></td><td><div class="modified-cell-content" title="{{time .ModTime}}">{{time .ModTime}}</div></td><td align="right"><div class="size-cell-content" title="{{if .IsDir}}-{{else}}{{size .Size}}{{end}}">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</div></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}">{{template "download-icon"}}</button>{{else}}&nbsp;{{end}}</td>{{if $view.JupyterEnabled}}{{template "app-controls" .Jupyter}}{{end}}{{if $view.TensorBoardEnabled}}{{template "app-controls" .TensorBoard}}{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet-full="{{.TableSnippet.Full}}" data-snippet-short="{{.TableSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet-full="{{.FigureSnippet.Full}}" data-snippet-short="{{.FigureSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
 {{end}}
 </tbody>{{else}}<tbody id="directory-empty"><tr><td colspan="{{.ColumnCount}}">This directory is empty.</td></tr></tbody>{{end}}
 </table>
@@ -211,6 +284,8 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
   var dz = document.getElementById('drop-zone');
   var status = document.getElementById('upload-status');
   var copyStatus = document.getElementById('copy-status');
+  var appActionStatus = document.getElementById('app-action-status');
+  var csrfToken = {{.CSRFToken}};
   var uploadURL = {{.UploadURL}};
   var importURL = {{.ImportURL}};
   var mkdirURL = {{.MkdirURL}};
@@ -355,6 +430,97 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
     removeSavedFilter();
   }
 
+  var directoryTable = document.getElementById('directory-list');
+  var columnWidthStorageKey = 'open-server-directory-column-widths:v1';
+  var columnWidthDefaults = {name: 28, modified: 12.5, size: 6.5};
+  var columnWidthLimits = {
+    name: {min: 8, max: 60},
+    modified: {min: 8, max: 30},
+    size: {min: 4.5, max: 20}
+  };
+  var tableFontSize = parseFloat(window.getComputedStyle(directoryTable).fontSize) || 14;
+  var savedColumnWidths = {};
+  try {
+    var savedColumnWidthsJSON = window.localStorage.getItem(columnWidthStorageKey);
+    if (savedColumnWidthsJSON) savedColumnWidths = JSON.parse(savedColumnWidthsJSON) || {};
+  } catch (e) {
+    savedColumnWidths = {};
+  }
+  function columnElement(name) {
+    return directoryTable.querySelector('col[data-column="' + name + '"]');
+  }
+  function defaultColumnWidth(name) {
+    return columnWidthDefaults[name] * tableFontSize;
+  }
+  function clampColumnWidth(name, width) {
+    var limits = columnWidthLimits[name];
+    return Math.max(limits.min * tableFontSize, Math.min(limits.max * tableFontSize, width));
+  }
+  function updateResizeHandle(name, width) {
+    var handle = directoryTable.querySelector('[data-resize-column="' + name + '"]');
+    if (!handle) return;
+    handle.setAttribute('aria-valuemin', Math.round(columnWidthLimits[name].min * tableFontSize));
+    handle.setAttribute('aria-valuemax', Math.round(columnWidthLimits[name].max * tableFontSize));
+    handle.setAttribute('aria-valuenow', Math.round(width));
+    handle.setAttribute('aria-valuetext', Math.round(width) + ' pixels');
+  }
+  function setColumnWidth(name, width, persist) {
+    var column = columnElement(name);
+    if (!column) return;
+    width = clampColumnWidth(name, width);
+    directoryTable.style.setProperty('--column-' + name + '-width', width + 'px');
+    updateResizeHandle(name, width);
+    if (persist) {
+      savedColumnWidths[name] = Math.round(width);
+      try { window.localStorage.setItem(columnWidthStorageKey, JSON.stringify(savedColumnWidths)); } catch (e) {}
+    }
+  }
+  Object.keys(columnWidthDefaults).forEach(function(name) {
+    var savedWidth = Number(savedColumnWidths[name]);
+    setColumnWidth(name, Number.isFinite(savedWidth) && savedWidth > 0 ? savedWidth : defaultColumnWidth(name), false);
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.column-resizer'), function(handle) {
+    var name = handle.getAttribute('data-resize-column');
+    handle.addEventListener('pointerdown', function(e) {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var startX = e.clientX;
+      var startWidth = columnElement(name).getBoundingClientRect().width;
+      handle.classList.add('resizing');
+      handle.setPointerCapture(e.pointerId);
+      function move(event) {
+        setColumnWidth(name, startWidth + event.clientX - startX, false);
+      }
+      function finish(event) {
+        setColumnWidth(name, columnElement(name).getBoundingClientRect().width, true);
+        handle.classList.remove('resizing');
+        handle.removeEventListener('pointermove', move);
+        handle.removeEventListener('pointerup', finish);
+        handle.removeEventListener('pointercancel', finish);
+        if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      }
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', finish);
+      handle.addEventListener('pointercancel', finish);
+    });
+    handle.addEventListener('keydown', function(e) {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'Home') return;
+      e.preventDefault();
+      var width = columnElement(name).getBoundingClientRect().width;
+      if (e.key === 'Home') width = defaultColumnWidth(name);
+      else width += (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 24 : 8);
+      setColumnWidth(name, width, true);
+    });
+    handle.addEventListener('dblclick', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      delete savedColumnWidths[name];
+      setColumnWidth(name, defaultColumnWidth(name), false);
+      try { window.localStorage.setItem(columnWidthStorageKey, JSON.stringify(savedColumnWidths)); } catch (error) {}
+    });
+  });
+
   function fallbackCopy(text) {
     var ta = document.createElement('textarea');
     ta.value = text;
@@ -419,29 +585,184 @@ tbody tr:hover td, tbody tr:focus-within td { background: #f0f4ff; }
       window.open(button.getAttribute('data-href'), '_blank', 'noopener');
     });
   });
-  {{if .JupyterEnabled}}var jupyterModal = document.getElementById('jupyter-modal');
+  function setAppElementVisible(element, visible) {
+    if (element) element.hidden = !visible;
+  }
+  function updateAppControl(control, appStatus) {
+    if (!control || !appStatus) return;
+    var state = appStatus.state || 'stopped';
+    var available = !!appStatus.available;
+    control.setAttribute('data-state', state);
+    setAppElementVisible(control.querySelector('.app-start'), state === 'stopped');
+    setAppElementVisible(control.querySelector('.app-starting'), state === 'starting');
+    var open = control.querySelector('.app-open');
+    if (open && appStatus.open_url) open.setAttribute('href', appStatus.open_url);
+    setAppElementVisible(open, state === 'running' && available);
+    setAppElementVisible(control.querySelector('.app-unavailable'), state === 'running' && !available);
+    setAppElementVisible(control.querySelector('.app-stopping-primary'), state === 'stopping');
+    var stopCell = control.nextElementSibling;
+    if (stopCell) {
+      setAppElementVisible(stopCell.querySelector('.app-stop'), state === 'running');
+      setAppElementVisible(stopCell.querySelector('.app-stopping'), state === 'stopping');
+    }
+  }
+  function actionResponse(response) {
+    return response.text().then(function(text) {
+      var body = {};
+      try { body = text ? JSON.parse(text) : {}; } catch (e) {}
+      if (!response.ok) {
+        var requestError = new Error(body.error || text || response.statusText || 'request failed');
+        requestError.code = body.code || '';
+        throw requestError;
+      }
+      return body;
+    });
+  }
+  function setAppActionStatus(message, kind) {
+    appActionStatus.textContent = message;
+    if (kind) {
+      appActionStatus.setAttribute('data-kind', kind);
+    } else {
+      appActionStatus.removeAttribute('data-kind');
+    }
+  }
+  function refreshAppControl(control) {
+    return fetch(control.getAttribute('data-endpoint'), {
+      method: 'GET',
+      headers: {'Accept': 'application/json'},
+      credentials: 'same-origin'
+    }).then(actionResponse).then(function(appStatus) {
+      updateAppControl(control, appStatus);
+      return appStatus;
+    });
+  }
+  function blankApplicationTab() {
+    var opened = null;
+    try {
+      opened = window.open('about:blank', '_blank');
+      if (opened) opened.opener = null;
+    } catch (e) {}
+    return opened;
+  }
+  function startApplication(control, python) {
+    var label = control.getAttribute('data-label');
+    var opened = blankApplicationTab();
+    updateAppControl(control, {state: 'starting', available: false});
+    setAppActionStatus('Starting ' + label + '...');
+    var body = 'csrf=' + encodeURIComponent(csrfToken);
+    if (python !== null) body += '&python=' + encodeURIComponent(python);
+    fetch(control.getAttribute('data-endpoint'), {
+      method: 'POST',
+      headers: {'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded'},
+      credentials: 'same-origin',
+      body: body
+    }).then(actionResponse).then(function(appStatus) {
+      updateAppControl(control, appStatus);
+      setAppActionStatus(label + ' is running.');
+      if (opened && appStatus.open_url) {
+        opened.location.replace(appStatus.open_url);
+      } else if (!opened) {
+        setAppActionStatus(label + ' is running. Select Open to view it.');
+      }
+    }).catch(function(error) {
+      if (opened) opened.close();
+      refreshAppControl(control).catch(function() {
+        updateAppControl(control, {state: 'stopped', available: false});
+      });
+      if (error.code === 'not_tensorboard_folder') {
+        setAppActionStatus('');
+        window.alert(error.message);
+      } else {
+        setAppActionStatus('Could not start ' + label + ': ' + error.message, 'error');
+      }
+    });
+  }
+  function stopApplication(control) {
+    var label = control.getAttribute('data-label');
+    if (control.getAttribute('data-app') === 'jupyter' &&
+        !window.confirm('Stop JupyterLab and terminate all of its kernels?')) return;
+    updateAppControl(control, {state: 'stopping', available: false});
+    setAppActionStatus('Stopping ' + label + '...');
+    fetch(control.getAttribute('data-endpoint'), {
+      method: 'DELETE',
+      headers: {'Accept': 'application/json'},
+      credentials: 'same-origin'
+    }).then(actionResponse).then(function(appStatus) {
+      updateAppControl(control, appStatus);
+      setAppActionStatus(label + ' stopped.');
+    }).catch(function(error) {
+      refreshAppControl(control).catch(function() {});
+      setAppActionStatus('Could not stop ' + label + ': ' + error.message, 'error');
+    });
+  }
+
+  var openJupyterModal = null;
+  {{if .JupyterEnabled}}var pendingJupyterControl = null;
+  var jupyterModal = document.getElementById('jupyter-modal');
   var jupyterForm = document.getElementById('jupyter-form');
   var jupyterPython = document.getElementById('jupyter-python');
   var jupyterCancel = document.getElementById('jupyter-cancel');
   function closeJupyterModal() {
     jupyterModal.style.display = 'none';
   }
-  Array.prototype.forEach.call(document.querySelectorAll('.jupyter-launch'), function(button) {
-    button.addEventListener('click', function() {
-      jupyterForm.action = button.getAttribute('data-action');
-      jupyterModal.style.display = 'block';
-      jupyterPython.focus();
-      jupyterPython.select();
-    });
+  openJupyterModal = function(control) {
+    pendingJupyterControl = control;
+    jupyterModal.style.display = 'block';
+    jupyterPython.focus();
+    jupyterPython.select();
+  };
+  jupyterCancel.addEventListener('click', function() {
+    pendingJupyterControl = null;
+    closeJupyterModal();
   });
-  jupyterCancel.addEventListener('click', closeJupyterModal);
-  jupyterForm.addEventListener('submit', closeJupyterModal);
+  jupyterForm.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var control = pendingJupyterControl;
+    pendingJupyterControl = null;
+    closeJupyterModal();
+    if (control) startApplication(control, jupyterPython.value.trim());
+  });
   jupyterModal.addEventListener('click', function(e) {
-    if (e.target === jupyterModal) closeJupyterModal();
+    if (e.target === jupyterModal) {
+      pendingJupyterControl = null;
+      closeJupyterModal();
+    }
   });
   document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && jupyterModal.style.display !== 'none') closeJupyterModal();
+    if (e.key === 'Escape' && jupyterModal.style.display !== 'none') {
+      pendingJupyterControl = null;
+      closeJupyterModal();
+    }
   });{{end}}
+  Array.prototype.forEach.call(document.querySelectorAll('[data-app-control] .app-start'), function(button) {
+    button.addEventListener('click', function() {
+      var control = button.closest('[data-app-control]');
+      if (control.getAttribute('data-app') === 'jupyter' && openJupyterModal) {
+        openJupyterModal(control);
+      } else {
+        startApplication(control, null);
+      }
+    });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.app-stop'), function(button) {
+    button.addEventListener('click', function() {
+      var control = button.parentElement.previousElementSibling;
+      if (control) stopApplication(control);
+    });
+  });
+  function refreshActiveApplications() {
+    if (document.hidden) return;
+    Array.prototype.forEach.call(document.querySelectorAll('[data-app-control]'), function(control) {
+      if (control.getAttribute('data-state') !== 'stopped') {
+        refreshAppControl(control).catch(function() {});
+      }
+    });
+  }
+  window.setInterval(refreshActiveApplications, 10000);
+  window.addEventListener('focus', refreshActiveApplications);
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) refreshActiveApplications();
+  });
   document.getElementById('btn-toggle-hidden').addEventListener('click', function() {
     window.location.href = this.getAttribute('data-href');
   });

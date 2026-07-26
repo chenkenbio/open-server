@@ -525,14 +525,29 @@ func TestCloseSessionExitsAllSessions(t *testing.T) {
 }
 
 func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
+	initialProbe, initialPort, err := listenLoopbackFrom(savedSessionPortStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initialProbe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reservedProbe, reservedPort, err := listenLoopbackFrom(initialPort + 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reservedProbe.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	configHome := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configHome)
 	t.Setenv("HOME", configHome)
 	root := t.TempDir()
-	if err := run([]string{"--add", "remember-port", "--local", root}, io.Discard); err != nil {
+	if err := run([]string{"--add", "remember-port", "--port", strconv.Itoa(initialPort), "--local", root}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if err := run([]string{"--add", "reserved-port", "--local", t.TempDir()}, io.Discard); err != nil {
+	if err := run([]string{"--add", "reserved-port", "--port", strconv.Itoa(reservedPort), "--local", t.TempDir()}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 
@@ -557,8 +572,8 @@ func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
 	}
 
 	firstPort := launch()
-	if firstPort < savedSessionPortStart {
-		t.Fatalf("first saved-session port = %d, want at least %d", firstPort, savedSessionPortStart)
+	if firstPort != initialPort {
+		t.Fatalf("first saved-session port = %d, want %d", firstPort, initialPort)
 	}
 	store, err := sessions.DefaultStore()
 	if err != nil {
@@ -573,10 +588,9 @@ func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
 	}
 
 	reserved, err := store.Resolve("reserved-port")
-	if err != nil || reserved.Options.Port == nil {
+	if err != nil || reserved.Options.Port == nil || *reserved.Options.Port != reservedPort {
 		t.Fatalf("reserved session = %#v, %v", reserved, err)
 	}
-	reservedPort := *reserved.Options.Port
 	occupied, occupiedPort, err := listenLoopbackFrom(reservedPort + 1)
 	if err != nil {
 		t.Fatal(err)
@@ -590,6 +604,13 @@ func TestSavedSessionRemembersLastSuccessfulPort(t *testing.T) {
 		defer startBlocker.Close()
 	} else if !errors.Is(startBlockerErr, syscall.EADDRINUSE) {
 		t.Fatal(startBlockerErr)
+	}
+	if initialPort != savedSessionPortStart {
+		initialBlocker, initialBlockerErr := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(initialPort)))
+		if initialBlockerErr != nil {
+			t.Fatal(initialBlockerErr)
+		}
+		defer initialBlocker.Close()
 	}
 	var conflictOutput bytes.Buffer
 	err = run([]string{"--duration", "100ms", "--no-open", "remember-port"}, &conflictOutput)
@@ -648,8 +669,8 @@ func TestHelpIsRecognized(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	if version != "0.2.2" {
-		t.Fatalf("version = %q, want 0.2.2", version)
+	if version != "0.2.3" {
+		t.Fatalf("version = %q, want 0.2.3", version)
 	}
 	for _, argument := range []string{"-version", "-v"} {
 		var output bytes.Buffer
@@ -848,6 +869,8 @@ func (s *reattachingTensorBoardLauncher) Start(string, string) (*tensorboard.Ins
 	return nil, nil
 }
 
+func (s *reattachingTensorBoardLauncher) Stop(*tensorboard.Instance) error { return nil }
+
 func (s *reattachingTensorBoardLauncher) Reattach(context.Context) { s.calls++ }
 
 type reattachingJupyterLauncher struct{ calls int }
@@ -855,6 +878,8 @@ type reattachingJupyterLauncher struct{ calls int }
 func (s *reattachingJupyterLauncher) Start(string, string, string) (*jupyter.Instance, error) {
 	return nil, nil
 }
+
+func (s *reattachingJupyterLauncher) Stop(*jupyter.Instance) error { return nil }
 
 func (s *reattachingJupyterLauncher) Reattach(context.Context) { s.calls++ }
 

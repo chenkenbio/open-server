@@ -220,12 +220,12 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				if !strings.Contains(body, `class="root-path">`+fixture.root+`</span>`) {
 					t.Fatal("listing does not show the session root path")
 				}
-				for _, want := range []string{`<th align="right">Path</th>`, `class="copy-path icon-button"`, `aria-label="Copy path"`, `title="Copy path"`, `class="download-file icon-button"`, `aria-label="Download alpha.txt"`, `<svg viewBox="0 0 24 24" aria-hidden="true"`} {
+				for _, want := range []string{`>Actions</th>`, `class="column-file-action"`, `class="copy-path icon-button"`, `aria-label="Copy path"`, `title="Copy path"`, `class="download-file icon-button"`, `aria-label="Download alpha.txt"`, `<svg viewBox="0 0 24 24" aria-hidden="true"`} {
 					if !strings.Contains(body, want) {
 						t.Errorf("compact file actions are missing %q", want)
 					}
 				}
-				if strings.Contains(body, ">Path</button>") || strings.Contains(body, ">Copy path</button>") || strings.Contains(body, ">Download</button>") {
+				if strings.Contains(body, ">Path</th>") || strings.Contains(body, ">Path</button>") || strings.Contains(body, ">Copy path</button>") || strings.Contains(body, ">Download</button>") {
 					t.Fatal("listing still contains verbose row action text")
 				}
 				if !strings.Contains(body, "addEventListener(&#39;paste&#39;") && !strings.Contains(body, "addEventListener('paste'") {
@@ -768,8 +768,8 @@ func TestDirectoryRegexFilterClientWorkflow(t *testing.T) {
 func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 	pathIndex := strings.Index(directoryTemplate, `class="header-path"`)
 	uploadIndex := strings.Index(directoryTemplate, `id="drop-zone"`)
-	headerIndex := strings.Index(directoryTemplate, `<tr><th align="left"`)
-	if pathIndex == -1 || uploadIndex == -1 || headerIndex == -1 || !(pathIndex < uploadIndex && uploadIndex < headerIndex) {
+	tableIndex := strings.Index(directoryTemplate, `id="directory-list"`)
+	if pathIndex == -1 || uploadIndex == -1 || tableIndex == -1 || !(pathIndex < uploadIndex && uploadIndex < tableIndex) {
 		t.Fatal("upload frame must appear between the path line and directory table")
 	}
 	for _, want := range []string{
@@ -843,11 +843,15 @@ func TestDirectoryFontSizeAndDensity(t *testing.T) {
 		})
 	}
 	for _, want := range []string{
-		"table { width: 100%; border-collapse: collapse; font-size: 0.95em; }",
-		"th { padding: 0.23em 0.5em;",
+		"--column-name-width: 28em;",
+		"width: calc(var(--column-name-width)",
+		"col.column-name { width: var(--column-name-width); }",
+		"th { position: relative; padding: 0.23em 0.5em;",
 		"td { padding: 0.21em 0.5em;",
 		".icon-button { padding: 0.15em;",
 		"width: 1.3em; height: 1.3em;",
+		`data-resize-column="name"`,
+		"open-server-directory-column-widths:v1",
 	} {
 		if !strings.Contains(directoryTemplate, want) {
 			t.Errorf("directory template is missing compact font/height rule %q", want)
@@ -1129,7 +1133,7 @@ func TestOptionalUIActions(t *testing.T) {
 
 	listing := request(app, http.MethodGet, "/", nil)
 	body := listing.Body.String()
-	for _, want := range []string{"+ New folder", "Show hidden items", "Copy path", ">Actions</th>", "/assets/apps/tensorboard.png", `aria-label="LaTeX tools"`, `id="latex-full-environment"`, `role="switch"`, `>Short</span>`, `>Full env</span>`, `data-snippet-full=`, `data-snippet-short=`, `open-server-latex-snippet-mode`, `title="Launch TensorBoard"`, `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
+	for _, want := range []string{"+ New folder", "Show hidden items", "Copy path", ">Actions</th>", "/assets/apps/tensorboard.png", `colspan="2" class="app-group-heading"`, `aria-label="Start TensorBoard"`, `aria-label="Stop TensorBoard"`, `aria-label="LaTeX tools"`, `id="latex-full-environment"`, `role="switch"`, `>Short</span>`, `>Full env</span>`, `data-snippet-full=`, `data-snippet-short=`, `open-server-latex-snippet-mode`, `title="Start TensorBoard"`, `title="Copy LaTeX table snippet"`, `title="Copy LaTeX figure snippet"`, `title="Open live PDF preview in a new tab"`, `\csvautotabular`, `width=1.00\textwidth`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("enhanced listing is missing %q", want)
 		}
@@ -1231,7 +1235,7 @@ func TestOptionalUIActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	plainBody := request(plain, http.MethodGet, "/", nil).Body.String()
-	if strings.Contains(plainBody, "LaTeX tools") || strings.Contains(plainBody, `id="latex-full-environment"`) || strings.Contains(plainBody, "Open live PDF preview") || strings.Contains(plainBody, "TensorBoard") {
+	if strings.Contains(plainBody, "LaTeX tools") || strings.Contains(plainBody, `id="latex-full-environment"`) || strings.Contains(plainBody, "Open live PDF preview") || strings.Contains(plainBody, "TensorBoard") || strings.Contains(plainBody, `data-app="jupyter"`) {
 		t.Fatal("optional actions are visible without their flags")
 	}
 	if strings.Contains(plainBody, "token-protected plain HTTP") {
@@ -1251,8 +1255,8 @@ func TestOptionalUIActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	latexOnlyBody := request(latexOnly, http.MethodGet, "/", nil).Body.String()
-	if !strings.Contains(latexOnlyBody, `colspan="1">Actions</th>`) || !strings.Contains(latexOnlyBody, `colspan="3" aria-label="LaTeX tools"`) {
-		t.Fatal("LaTeX-only mode does not use fixed Download, Preview, Table, and Figure columns")
+	if !strings.Contains(latexOnlyBody, `>Actions</th>`) || !strings.Contains(latexOnlyBody, `colspan="3" aria-label="LaTeX tools"`) {
+		t.Fatal("LaTeX-only mode does not use fixed Copy path, Download, Preview, Table, and Figure columns")
 	}
 }
 
@@ -1284,7 +1288,7 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	}
 
 	listing := request(app, http.MethodGet, "/", nil)
-	if got := strings.Count(listing.Body.String(), `aria-label="Launch TensorBoard"`); got != 3 {
+	if got := strings.Count(listing.Body.String(), `class="app-start icon-button" aria-label="Start TensorBoard"`); got != 3 {
 		t.Fatalf("current and child TensorBoard icon count = %d, want 3; body = %s", got, listing.Body.String())
 	}
 	if len(backend.readDirs) != 1 || backend.readDirs[0] != rootPath {
@@ -1294,12 +1298,16 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 		t.Fatal("legacy visible launcher button label is still present")
 	}
 
-	emptyRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(emptyPath), nil)
+	emptyForm := url.Values{"csrf": {app.csrfToken}}
+	emptyRequest := httptest.NewRequest(http.MethodPost, "/tensorboard?path="+url.QueryEscape(emptyPath), strings.NewReader(emptyForm.Encode()))
 	emptyRequest.Host = testHost
-	emptyRequest.Header.Set("Origin", "http://"+testHost)
+	emptyRequest.Header.Set("Accept", "application/json")
+	emptyRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	emptyResponse := httptest.NewRecorder()
 	app.ServeHTTP(emptyResponse, emptyRequest)
-	if emptyResponse.Code != http.StatusBadRequest || !strings.Contains(emptyResponse.Body.String(), "event files were not found") {
+	if emptyResponse.Code != http.StatusBadRequest ||
+		!strings.Contains(emptyResponse.Body.String(), `"code":"not_tensorboard_folder"`) ||
+		!strings.Contains(emptyResponse.Body.String(), "Choose a folder that directly contains an events.out.tfevents.* file.") {
 		t.Fatalf("non-event directory launch = %d %q", emptyResponse.Code, emptyResponse.Body.String())
 	}
 	if len(backend.readDirs) != 2 || backend.readDirs[1] != emptyPath {
@@ -1337,6 +1345,51 @@ func TestTensorBoardLaunchRequiresEventFilesAndAllowsFormToken(t *testing.T) {
 	}
 	if len(launcher.starts) != 1 {
 		t.Fatalf("repeated Launch started %d TensorBoard processes, want 1", len(launcher.starts))
+	}
+
+	statusTarget := "/tensorboard?path=" + url.QueryEscape(logsPath)
+	running := request(app, http.MethodGet, statusTarget, nil)
+	if running.Code != http.StatusOK || !strings.Contains(running.Body.String(), `"state":"running"`) ||
+		!strings.Contains(running.Body.String(), `"available":true`) ||
+		!strings.Contains(running.Body.String(), `"open_url":"`+launchResponse.Header().Get("Location")+`"`) {
+		t.Fatalf("running TensorBoard status = %d %q", running.Code, running.Body.String())
+	}
+
+	stopRequest := httptest.NewRequest(http.MethodDelete, statusTarget, nil)
+	stopRequest.Host = testHost
+	stopRequest.Header.Set("Origin", "http://"+testHost)
+	stopResponse := httptest.NewRecorder()
+	app.ServeHTTP(stopResponse, stopRequest)
+	if stopResponse.Code != http.StatusOK || !strings.Contains(stopResponse.Body.String(), `"state":"stopped"`) || launcher.stops != 1 {
+		t.Fatalf("TensorBoard stop = %d body %q, stops %d", stopResponse.Code, stopResponse.Body.String(), launcher.stops)
+	}
+	stopped := request(app, http.MethodGet, statusTarget, nil)
+	if stopped.Code != http.StatusOK || !strings.Contains(stopped.Body.String(), `"state":"stopped"`) ||
+		strings.Contains(stopped.Body.String(), "open_url") {
+		t.Fatalf("stopped TensorBoard status = %d %q", stopped.Code, stopped.Body.String())
+	}
+	oldProxy := request(app, http.MethodGet, launchResponse.Header().Get("Location"), nil)
+	if oldProxy.Code != http.StatusNotFound {
+		t.Fatalf("stopped TensorBoard proxy status = %d, want %d", oldProxy.Code, http.StatusNotFound)
+	}
+
+	repeatedStop := httptest.NewRequest(http.MethodDelete, statusTarget, nil)
+	repeatedStop.Host = testHost
+	repeatedStop.Header.Set("Origin", "http://"+testHost)
+	repeatedStopResponse := httptest.NewRecorder()
+	app.ServeHTTP(repeatedStopResponse, repeatedStop)
+	if repeatedStopResponse.Code != http.StatusOK || launcher.stops != 1 {
+		t.Fatalf("repeated TensorBoard stop = %d, stops %d", repeatedStopResponse.Code, launcher.stops)
+	}
+
+	restartRequest := httptest.NewRequest(http.MethodPost, statusTarget, nil)
+	restartRequest.Host = testHost
+	restartRequest.Header.Set("Origin", "http://"+testHost)
+	restartResponse := httptest.NewRecorder()
+	app.ServeHTTP(restartResponse, restartRequest)
+	if restartResponse.Code != http.StatusSeeOther || restartResponse.Header().Get("Location") == launchResponse.Header().Get("Location") ||
+		len(launcher.starts) != 2 {
+		t.Fatalf("TensorBoard restart = %d Location %q, starts %#v", restartResponse.Code, restartResponse.Header().Get("Location"), launcher.starts)
 	}
 }
 
@@ -1389,6 +1442,85 @@ func TestConcurrentTensorBoardLaunchesReuseOneProcess(t *testing.T) {
 	}
 	if got := launcher.starts.Load(); got != 1 {
 		t.Fatalf("concurrent Launch started %d TensorBoard processes, want 1", got)
+	}
+}
+
+func TestConcurrentTensorBoardStopsShareOneShutdown(t *testing.T) {
+	root := t.TempDir()
+	logs := filepath.Join(root, "logs")
+	if err := os.Mkdir(logs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logs, "events.out.tfevents.stop"), []byte("events"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launcher := &blockingStopTensorBoardLauncher{
+		stopStarted: make(chan struct{}),
+		stopRelease: make(chan struct{}),
+		handler:     http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }),
+	}
+	app, err := New(Options{
+		Backend: filesystem.Local{}, Root: filepath.ToSlash(root), SSHHost: "lab",
+		Title: "Files", AllowedHost: testHost, TensorBoard: launcher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "/tensorboard?path=" + url.QueryEscape(filepath.ToSlash(logs))
+	startRequest := httptest.NewRequest(http.MethodPost, target, nil)
+	startRequest.Host = testHost
+	startRequest.Header.Set("Origin", "http://"+testHost)
+	startResponse := httptest.NewRecorder()
+	app.ServeHTTP(startResponse, startRequest)
+	if startResponse.Code != http.StatusSeeOther {
+		t.Fatalf("start = %d %q", startResponse.Code, startResponse.Body.String())
+	}
+
+	stop := func(results chan<- *httptest.ResponseRecorder) {
+		stopRequest := httptest.NewRequest(http.MethodDelete, target, nil)
+		stopRequest.Host = testHost
+		stopRequest.Header.Set("Origin", "http://"+testHost)
+		response := httptest.NewRecorder()
+		app.ServeHTTP(response, stopRequest)
+		results <- response
+	}
+	results := make(chan *httptest.ResponseRecorder, 2)
+	go stop(results)
+	select {
+	case <-launcher.stopStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first stop did not reach the launcher")
+	}
+
+	stopping := request(app, http.MethodGet, target, nil)
+	if stopping.Code != http.StatusOK || !strings.Contains(stopping.Body.String(), `"state":"stopping"`) {
+		t.Fatalf("status during stop = %d %q", stopping.Code, stopping.Body.String())
+	}
+	if proxied := request(app, http.MethodGet, startResponse.Header().Get("Location"), nil); proxied.Code != http.StatusNotFound {
+		t.Fatalf("proxy during stop = %d, want %d", proxied.Code, http.StatusNotFound)
+	}
+	startWhileStopping := httptest.NewRequest(http.MethodPost, target, nil)
+	startWhileStopping.Host = testHost
+	startWhileStopping.Header.Set("Origin", "http://"+testHost)
+	startWhileStoppingResponse := httptest.NewRecorder()
+	app.ServeHTTP(startWhileStoppingResponse, startWhileStopping)
+	if startWhileStoppingResponse.Code != http.StatusConflict {
+		t.Fatalf("start during stop = %d %q", startWhileStoppingResponse.Code, startWhileStoppingResponse.Body.String())
+	}
+
+	go stop(results)
+	select {
+	case response := <-results:
+		t.Fatalf("concurrent stop returned before shared shutdown completed: %d", response.Code)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(launcher.stopRelease)
+	first, second := <-results, <-results
+	if first.Code != http.StatusOK || second.Code != http.StatusOK {
+		t.Fatalf("concurrent stop responses = %d and %d", first.Code, second.Code)
+	}
+	if got := launcher.stops.Load(); got != 1 {
+		t.Fatalf("concurrent Stop called the launcher %d times, want 1", got)
 	}
 }
 
@@ -1877,6 +2009,7 @@ type tensorBoardStart struct {
 type recordingTensorBoardLauncher struct {
 	handler http.Handler
 	starts  []tensorBoardStart
+	stops   int
 }
 
 type recordingReadDirBackend struct {
@@ -1904,9 +2037,35 @@ func (l *blockingTensorBoardLauncher) Start(_, _ string) (*tensorboard.Instance,
 	return &tensorboard.Instance{Handler: l.handler}, nil
 }
 
+func (l *blockingTensorBoardLauncher) Stop(*tensorboard.Instance) error { return nil }
+
+type blockingStopTensorBoardLauncher struct {
+	stops       atomic.Int32
+	stopOnce    sync.Once
+	stopStarted chan struct{}
+	stopRelease chan struct{}
+	handler     http.Handler
+}
+
+func (l *blockingStopTensorBoardLauncher) Start(_, _ string) (*tensorboard.Instance, error) {
+	return &tensorboard.Instance{Handler: l.handler}, nil
+}
+
+func (l *blockingStopTensorBoardLauncher) Stop(*tensorboard.Instance) error {
+	l.stops.Add(1)
+	l.stopOnce.Do(func() { close(l.stopStarted) })
+	<-l.stopRelease
+	return nil
+}
+
 func (l *recordingTensorBoardLauncher) Start(directory, prefix string) (*tensorboard.Instance, error) {
 	l.starts = append(l.starts, tensorBoardStart{directory: directory, prefix: prefix})
 	return &tensorboard.Instance{Handler: l.handler}, nil
+}
+
+func (l *recordingTensorBoardLauncher) Stop(*tensorboard.Instance) error {
+	l.stops++
+	return nil
 }
 
 type statErrorBackend struct {

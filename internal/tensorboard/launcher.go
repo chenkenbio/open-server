@@ -26,10 +26,31 @@ type Instance struct {
 	Target  *url.URL
 	Handler http.Handler
 	Token   string
+	record  *tunnelRecord
+}
+
+// Done closes when the managed TensorBoard instance has ended permanently.
+// A temporary SSH transport loss does not close this channel.
+func (i *Instance) Done() <-chan struct{} {
+	if i == nil || i.record == nil {
+		return nil
+	}
+	return i.record.lifecycle.done
+}
+
+// Available reports whether the TensorBoard proxy currently has a live local
+// process or SSH tunnel. A remote service can remain managed while unavailable
+// during the reconnect grace window.
+func (i *Instance) Available() bool {
+	if i == nil || i.record == nil {
+		return true
+	}
+	return i.record.lifecycle.isAvailable()
 }
 
 type Launcher interface {
 	Start(logDirectory, pathPrefix string) (*Instance, error)
+	Stop(*Instance) error
 }
 
 type ProcessLauncher struct {
@@ -53,6 +74,9 @@ type tunnelRecord struct {
 	pathPrefix       string
 	token            string
 	process          *runningProcess
+	lifecycle        *instanceLifecycle
+	retired          bool
+	stopOnce         sync.Once
 }
 
 const remoteReadySentinel = "OPEN_SERVER_TENSORBOARD_READY\n"
@@ -190,11 +214,17 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 	if stdinWriter != nil {
 		stdin = stdinWriter
 	}
+	lifecycle := newInstanceLifecycle(true)
 	process := newRunningProcess(command, stdin, func() {
 		if readiness != nil {
 			readiness.Flush()
 		}
 		diagnostic.Flush()
+		if l.remote {
+			lifecycle.setAvailable(false)
+		} else {
+			lifecycle.finish()
+		}
 	})
 	record := &tunnelRecord{
 		localPort:        localPort,
@@ -203,11 +233,12 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 		pathPrefix:       pathPrefix,
 		token:            token,
 		process:          process,
+		lifecycle:        lifecycle,
 	}
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
-		process.stop()
+		l.stopRecord(record, process)
 		return nil, errors.New("TensorBoard launcher is closed")
 	}
 	l.records = append(l.records, record)
@@ -218,23 +249,26 @@ func (l *ProcessLauncher) startOnce(logDirectory, pathPrefix string) (*Instance,
 			writeErr = io.ErrShortWrite
 		}
 		if writeErr != nil {
-			process.stop()
+			l.stopRecord(record, process)
+			l.removeRecord(record)
 			return nil, fmt.Errorf("send TensorBoard configuration through SSH: %w", writeErr)
 		}
 	}
 	if readiness != nil {
 		if err := waitForReadySentinel(context.Background(), readiness, process.done, diagnostic); err != nil {
-			process.stop()
+			l.stopRecord(record, process)
+			l.removeRecord(record)
 			return nil, err
 		}
 	}
 
 	target, _ := url.Parse("http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort)))
 	if err := probeTensorBoardReady(context.Background(), localPort, pathPrefix, token, process.done, diagnostic); err != nil {
-		process.stop()
+		l.stopRecord(record, process)
+		l.removeRecord(record)
 		return nil, err
 	}
-	return &Instance{Target: target, Token: token}, nil
+	return &Instance{Target: target, Token: token, record: record}, nil
 }
 
 // waitForReadySentinel blocks until the remote helper announces readiness, the
@@ -307,18 +341,40 @@ func retryablePortError(err error) bool {
 		strings.Contains(message, "cannot listen to port")
 }
 
+// Stop terminates one managed TensorBoard instance. It is idempotent. The
+// record is retired under the launcher lock before process shutdown so a
+// concurrent or later Reattach cannot revive an explicitly stopped instance.
+func (l *ProcessLauncher) Stop(instance *Instance) error {
+	if instance == nil || instance.record == nil {
+		return nil
+	}
+	record := instance.record
+	l.mu.Lock()
+	if record.retired {
+		l.mu.Unlock()
+		return nil
+	}
+	record.retired = true
+	process := record.process
+	l.removeRecordLocked(record)
+	l.mu.Unlock()
+	l.stopRecord(record, process)
+	return nil
+}
+
 func (l *ProcessLauncher) Close() {
 	l.mu.Lock()
 	l.closed = true
-	processes := make([]*runningProcess, 0, len(l.records))
-	for _, record := range l.records {
-		if record.process != nil {
-			processes = append(processes, record.process)
-		}
+	records := append([]*tunnelRecord(nil), l.records...)
+	l.records = nil
+	processes := make([]*runningProcess, len(records))
+	for index, record := range records {
+		record.retired = true
+		processes[index] = record.process
 	}
 	l.mu.Unlock()
-	for _, process := range processes {
-		process.stop()
+	for index, record := range records {
+		l.stopRecord(record, processes[index])
 	}
 }
 
@@ -342,7 +398,9 @@ func (l *ProcessLauncher) Reattach(ctx context.Context) {
 	}
 	todo := make([]pending, 0, len(l.records))
 	for _, record := range l.records {
-		todo = append(todo, pending{record, record.process})
+		if !record.retired {
+			todo = append(todo, pending{record, record.process})
+		}
 	}
 	l.mu.Unlock()
 	for _, item := range todo {
@@ -356,14 +414,14 @@ func (l *ProcessLauncher) Reattach(ctx context.Context) {
 		}
 		select {
 		case <-item.process.done:
-			l.reattachOne(ctx, item.record)
+			l.reattachOne(ctx, item.record, item.process)
 		default:
 			// SSH session is still alive; nothing to re-attach.
 		}
 	}
 }
 
-func (l *ProcessLauncher) reattachOne(ctx context.Context, record *tunnelRecord) {
+func (l *ProcessLauncher) reattachOne(ctx context.Context, record *tunnelRecord, previous *runningProcess) {
 	executable, arguments, err := remoteReattachCommand(
 		l.rsh, l.host, record.localPort, record.runtimeDirectory, record.remoteSocket,
 	)
@@ -393,9 +451,10 @@ func (l *ProcessLauncher) reattachOne(ctx context.Context, record *tunnelRecord)
 	process := newRunningProcess(command, stdinWriter, func() {
 		readiness.Flush()
 		diagnostic.Flush()
+		record.lifecycle.setAvailable(false)
 	})
 	l.mu.Lock()
-	if l.closed {
+	if l.closed || record.retired || record.process != previous {
 		l.mu.Unlock()
 		process.stop()
 		return
@@ -415,6 +474,41 @@ func (l *ProcessLauncher) reattachOne(ctx context.Context, record *tunnelRecord)
 		if ctx.Err() == nil {
 			l.logReattachFailure(record.pathPrefix)
 		}
+		return
+	}
+	l.mu.Lock()
+	if l.closed || record.retired || record.process != process {
+		l.mu.Unlock()
+		process.stop()
+		return
+	}
+	record.lifecycle.setAvailable(true)
+	l.mu.Unlock()
+}
+
+func (l *ProcessLauncher) stopRecord(record *tunnelRecord, process *runningProcess) {
+	record.stopOnce.Do(func() {
+		if process != nil {
+			process.stop()
+		}
+		record.lifecycle.finish()
+	})
+}
+
+func (l *ProcessLauncher) removeRecord(record *tunnelRecord) {
+	l.mu.Lock()
+	l.removeRecordLocked(record)
+	l.mu.Unlock()
+}
+
+func (l *ProcessLauncher) removeRecordLocked(record *tunnelRecord) {
+	for index, candidate := range l.records {
+		if candidate != record {
+			continue
+		}
+		copy(l.records[index:], l.records[index+1:])
+		l.records[len(l.records)-1] = nil
+		l.records = l.records[:len(l.records)-1]
 		return
 	}
 }
@@ -1016,6 +1110,36 @@ type runningProcess struct {
 	stdin    io.WriteCloser
 	done     chan struct{}
 	stopOnce sync.Once
+}
+
+type instanceLifecycle struct {
+	mu        sync.RWMutex
+	available bool
+	done      chan struct{}
+	doneOnce  sync.Once
+}
+
+func newInstanceLifecycle(available bool) *instanceLifecycle {
+	return &instanceLifecycle{available: available, done: make(chan struct{})}
+}
+
+func (l *instanceLifecycle) isAvailable() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.available
+}
+
+func (l *instanceLifecycle) setAvailable(available bool) {
+	l.mu.Lock()
+	l.available = available
+	l.mu.Unlock()
+}
+
+func (l *instanceLifecycle) finish() {
+	l.doneOnce.Do(func() {
+		l.setAvailable(false)
+		close(l.done)
+	})
 }
 
 func newRunningProcess(command *exec.Cmd, stdin io.WriteCloser, onDone ...func()) *runningProcess {

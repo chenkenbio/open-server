@@ -2,6 +2,7 @@ package tensorboard
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -219,5 +220,37 @@ func TestRetryablePortError(t *testing.T) {
 		if !retryablePortError(errors.New(message)) {
 			t.Errorf("%q was not classified as retryable", message)
 		}
+	}
+}
+
+func TestStopRetiresOneInstanceAndCompletesItsLifecycle(t *testing.T) {
+	lifecycle := newInstanceLifecycle(true)
+	record := &tunnelRecord{lifecycle: lifecycle}
+	instance := &Instance{record: record}
+	launcher := &ProcessLauncher{remote: true, records: []*tunnelRecord{record}}
+
+	if !instance.Available() || instance.Done() == nil {
+		t.Fatalf("new instance lifecycle = available %v, done %#v", instance.Available(), instance.Done())
+	}
+	if err := launcher.Stop(instance); err != nil {
+		t.Fatal(err)
+	}
+	if instance.Available() {
+		t.Fatal("stopped instance is still available")
+	}
+	select {
+	case <-instance.Done():
+	default:
+		t.Fatal("stopped instance did not complete")
+	}
+	if !record.retired || len(launcher.records) != 0 {
+		t.Fatalf("stop did not retire and remove the record: retired %v, records %#v", record.retired, launcher.records)
+	}
+	if err := launcher.Stop(instance); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+	launcher.Reattach(context.Background())
+	if len(launcher.records) != 0 {
+		t.Fatal("Reattach revived an explicitly stopped instance")
 	}
 }

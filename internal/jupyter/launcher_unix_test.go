@@ -57,6 +57,26 @@ func TestProcessLauncherStartsAuthenticatesAndCleansUp(t *testing.T) {
 	if instance.Target == nil || len(instance.Token) != 64 {
 		t.Fatalf("instance = %#v", instance)
 	}
+	if !instance.Available() || instance.Done() == nil {
+		t.Fatalf("new instance lifecycle = available %v, done %#v", instance.Available(), instance.Done())
+	}
+	if err := launcher.Stop(instance); err != nil {
+		t.Fatal(err)
+	}
+	if instance.Available() {
+		t.Fatal("stopped instance is still available")
+	}
+	select {
+	case <-instance.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopped instance did not complete")
+	}
+	if len(launcher.instances) != 0 {
+		t.Fatalf("stopped instance remains registered: %#v", launcher.instances)
+	}
+	if err := launcher.Stop(instance); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
 	launcher.Close()
 	launcher.Close()
 

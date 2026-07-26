@@ -138,6 +138,16 @@ obvious. The current valid filter is remembered separately for each folder for
 the life of the browser tab. Use the **?** button beside the filter for syntax
 notes and examples.
 
+The compact **Actions** group has fixed copy-path and file-download subcolumns,
+so each action stays vertically aligned even when another action is unavailable.
+The table uses only the width its columns need instead of stretching across a
+full-screen window. Permanently visible separators after **Name**, **Last
+modified**, and **Size** show that those columns are adjustable. Drag a separator
+to resize its column; the browser remembers the widths across directories. The
+separators also support Left/Right Arrow (Shift for a larger step), Home to
+restore the default, and double-click to reset. Truncated values retain their
+full text as a hover tooltip.
+
 URL imports are fetched by the personal device running `open-server`, including
 in SSH/SFTP and sharing modes.
 
@@ -216,8 +226,9 @@ directly contains an `events.out.tfevents.*` file before starting TensorBoard.
 In SSH/SFTP mode, it starts TensorBoard on the remote host through SSH, creates
 the tunnel, and proxies it through the current session. This does not install
 `open-server` on the remote host. Repeated launches reuse the running process
-for that directory; it is stopped when the session ends. TensorBoard actions
-are unavailable with `-serve`.
+for that directory. Its two-column control changes from **Start** to **Open**
+when ready and reveals **Stop**, so it can be reopened or stopped without
+ending `open-server`. TensorBoard actions are unavailable with `-serve`.
 
 Remote TensorBoard listens on a per-launch Unix socket inside a user-owned
 `0700` runtime directory. The socket is forwarded through the same SSH session
@@ -249,8 +260,12 @@ remain available from JupyterLab's kernel menu.
 JupyterLab is proxied through the current browser URL. In SSH/SFTP mode,
 `open-server` launches it on the remote host through SSH and creates the tunnel
 without installing `open-server` remotely or exposing the Jupyter token in the
-browser. Repeated launches reuse the process only when both the directory and
-selected Python match.
+browser. One JupyterLab instance may run for each directory. Repeated starts
+reuse that instance; its selected Python executable remains fixed until it is
+stopped. The two-column control changes from **Start** to **Open** when ready
+and reveals **Stop**. Stopping asks for confirmation because it terminates all
+kernels owned by that JupyterLab instance; after it stops, another Python
+executable can be selected for the next start.
 
 Files deleted from JupyterLab are moved to a persistent trash directory inside
 the directory that was launched: `.Trash-<uid>/files/`. Matching recovery
@@ -270,6 +285,27 @@ terminates the complete Jupyter process group and removes the temporary kernel
 registration. `open-server` does not disable JupyterLab's built-in notebook
 autosave; the interval configured in the selected JupyterLab environment still
 applies. JupyterLab actions are unavailable with `-serve`.
+
+### Resource use
+
+The new table layout and column resizing are browser-only and add no server
+processes, dependencies, or background work. With both application flags
+disabled, there are no application controls or status requests. Enabling a flag
+but leaving every application stopped also launches no child process and
+generates no status polling. Reloading a directory obtains its current state
+while rendering the normal listing.
+
+Each running application adds one small `open-server` lifecycle record and one
+waiting Go goroutine. A visible running control polls its in-memory status once
+every 10 seconds (0.1 request/second); polling pauses while the tab is hidden.
+These controller costs are normally negligible compared with the launched
+Python application. Each directory started in TensorBoard or JupyterLab has its
+own Python service; Jupyter kernels add their own processes, and TensorBoard's
+memory use grows with event data and plugins. In SSH/SFTP mode, each application
+also has an SSH tunnel and a lightweight remote keeper during the reconnect
+grace period. Capacity should therefore be planned from the actual Jupyter
+kernels, TensorBoard logs, and number of concurrently running directories, not
+from the controls themselves.
 
 ## Sharing from a personal device
 
