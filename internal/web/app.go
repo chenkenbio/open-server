@@ -292,6 +292,12 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.servePreview(w, r)
+	case "/resolve":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		a.resolveJump(w, r)
 	case "/upload":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -651,7 +657,7 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	if showHidden {
 		view.HiddenToggleLabel = "Hide hidden items"
 	}
-	view.ColumnCount = 5
+	view.ColumnCount = 6
 	if view.JupyterEnabled {
 		view.ColumnCount += 2
 	}
@@ -771,6 +777,68 @@ func withinRoot(root, name string) bool {
 		return strings.HasPrefix(name, "/")
 	}
 	return name == root || strings.HasPrefix(name, root+"/")
+}
+
+// resolveJump translates a jump-box path into its logical in-root form. A path
+// already inside the configured root is kept as-is; otherwise both the root and
+// the path are symlink-resolved, and a path whose physical location lies inside
+// the physical root is mapped back onto the configured root spelling so the
+// displayed root never changes. Only existing directories resolve successfully.
+func (a *App) resolveJump(w http.ResponseWriter, r *http.Request) {
+	cleaned, err := filesystem.CleanRemotePath(r.URL.Query().Get("path"))
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	backend := a.currentBackend()
+	logical := cleaned
+	if !withinRoot(a.root, cleaned) {
+		if logical, err = a.logicalPathViaSymlinks(r.Context(), backend, cleaned); err != nil {
+			a.jsonError(w, err, statusForError(err))
+			return
+		}
+	}
+	info, err := backend.Stat(r.Context(), logical)
+	if err != nil {
+		a.jsonError(w, err, statusForError(err))
+		return
+	}
+	if !info.IsDir() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path is not a directory"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"path": logical})
+}
+
+// logicalPathViaSymlinks maps a path outside the configured root onto the root
+// spelling when its symlink-resolved location is inside the resolved root. An
+// unresolvable or genuinely external path reports errOutsideRoot regardless of
+// whether it exists, so nothing outside the root is disclosed.
+func (a *App) logicalPathViaSymlinks(ctx context.Context, backend filesystem.Backend, name string) (string, error) {
+	resolvedRoot, err := backend.RealPath(ctx, a.root)
+	if err != nil {
+		if errors.Is(err, filesystem.ErrDisconnected) {
+			return "", err
+		}
+		return "", errOutsideRoot
+	}
+	resolvedTarget, err := backend.RealPath(ctx, name)
+	if err != nil {
+		if errors.Is(err, filesystem.ErrDisconnected) {
+			return "", err
+		}
+		// The leaf may not exist yet; resolving the parent still lets a
+		// missing folder under a symlinked prefix surface as not-found.
+		parent, parentErr := backend.RealPath(ctx, path.Dir(name))
+		if parentErr != nil {
+			return "", errOutsideRoot
+		}
+		resolvedTarget = path.Join(parent, path.Base(name))
+	}
+	if !withinRoot(resolvedRoot, resolvedTarget) {
+		return "", errOutsideRoot
+	}
+	return path.Join(a.root, strings.TrimPrefix(path.Clean(resolvedTarget), path.Clean(resolvedRoot))), nil
 }
 
 func (a *App) appURL(route, name, sortKey, order string, showHidden bool) string {

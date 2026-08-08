@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -220,7 +221,7 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				if !strings.Contains(body, `class="root-path">`+fixture.root+`</span>`) {
 					t.Fatal("listing does not show the session root path")
 				}
-				for _, want := range []string{`>Actions</th>`, `class="column-file-action"`, `class="copy-path icon-button"`, `aria-label="Copy path"`, `title="Copy path"`, `class="download-file icon-button"`, `aria-label="Download alpha.txt"`, `<svg viewBox="0 0 24 24" aria-hidden="true"`} {
+				for _, want := range []string{`>Actions</th>`, `class="column-file-action"`, `class="open-entry icon-button"`, `target="_blank" rel="noopener"`, `aria-label="Open current directory in a new tab"`, `aria-label="Open alpha.txt in a new tab"`, `class="copy-path icon-button"`, `aria-label="Copy path"`, `title="Copy path"`, `class="download-file icon-button"`, `aria-label="Download alpha.txt"`, `<svg viewBox="0 0 24 24" aria-hidden="true"`} {
 					if !strings.Contains(body, want) {
 						t.Errorf("compact file actions are missing %q", want)
 					}
@@ -765,6 +766,183 @@ func TestDirectoryRegexFilterClientWorkflow(t *testing.T) {
 	}
 }
 
+func TestDirectoryPathJumpWorkflow(t *testing.T) {
+	pathIndex := strings.Index(directoryTemplate, `class="header-path"`)
+	jumpIndex := strings.Index(directoryTemplate, `id="path-jump"`)
+	actionsIndex := strings.Index(directoryTemplate, `class="header-actions"`)
+	if pathIndex == -1 || jumpIndex == -1 || actionsIndex == -1 || !(pathIndex < jumpIndex && jumpIndex < actionsIndex) {
+		t.Fatal("path jump form must appear between the path line and the header actions")
+	}
+
+	for _, want := range []string{
+		`var pathJumpRoot = (pathJumpForm.getAttribute('data-root') || '/').replace(/\/+$/, '') || '/';`,
+		`if (segment === '..') return null;`,
+		`pathJumpForm.addEventListener('submit', function(e) {`,
+		`setPathJumpError("'..' is not allowed");`,
+		`setPathJumpError('Path is outside the served root');`,
+		`setPathJumpError('Folder not found');`,
+		`setPathJumpError('Not a folder or invalid path');`,
+		`dest.set('path', resolved.path);`,
+	} {
+		if !strings.Contains(directoryTemplate, want) {
+			t.Errorf("path jump workflow is missing %q", want)
+		}
+	}
+
+	submitIndex := strings.Index(directoryTemplate, `pathJumpForm.addEventListener('submit'`)
+	traversalIndex := strings.Index(directoryTemplate, `setPathJumpError("'..' is not allowed");`)
+	resolveIndex := strings.Index(directoryTemplate, `fetch('/resolve?path=' + encodeURIComponent(target))`)
+	navigateIndex := strings.Index(directoryTemplate, `window.location.href = '/?' + dest.toString();`)
+	if submitIndex == -1 || traversalIndex == -1 || resolveIndex == -1 || navigateIndex == -1 ||
+		!(submitIndex < traversalIndex && traversalIndex < resolveIndex && resolveIndex < navigateIndex) {
+		t.Fatal("path jump must reject traversal, resolve the destination, then navigate with the resolved path")
+	}
+
+	for _, fixture := range fixtures(t) {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) {
+			defer fixture.close()
+			app := newTestApp(t, fixture, nil)
+			response := request(app, http.MethodGet, "/?path="+url.QueryEscape(fixture.root), nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			formTag := startTagByID(t, body, "path-jump")
+			if !strings.Contains(formTag, `data-root="`+fixture.root+`"`) {
+				t.Errorf("path jump form does not carry the served root: %s", formTag)
+			}
+			inputTag := startTagByID(t, body, "path-jump-input")
+			if !strings.Contains(body, `for="path-jump-input"`) {
+				t.Error("path jump input does not have an accessible label")
+			}
+			if !strings.Contains(inputTag, "path-jump-error") {
+				t.Errorf("path jump input is not described by its error element: %s", inputTag)
+			}
+			errorTag := startTagByID(t, body, "path-jump-error")
+			if !strings.Contains(errorTag, `role="alert"`) {
+				t.Errorf("path jump error is not announced as an alert: %s", errorTag)
+			}
+		})
+	}
+}
+
+func resolveJumpPath(t *testing.T, response *httptest.ResponseRecorder) string {
+	t.Helper()
+	var payload struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("resolve payload %q: %v", response.Body.String(), err)
+	}
+	return payload.Path
+}
+
+func TestResolveJumpEndpoint(t *testing.T) {
+	for _, fixture := range fixtures(t) {
+		fixture := fixture
+		t.Run(fixture.name, func(t *testing.T) {
+			defer fixture.close()
+			app := newTestApp(t, fixture, nil)
+			resolve := func(target string) *httptest.ResponseRecorder {
+				return request(app, http.MethodGet, "/resolve?path="+url.QueryEscape(target), nil)
+			}
+
+			inside := resolve(fixture.root + "/folder")
+			if inside.Code != http.StatusOK || resolveJumpPath(t, inside) != fixture.root+"/folder" {
+				t.Fatalf("in-root resolve = %d %s", inside.Code, inside.Body.String())
+			}
+			rootItself := resolve(fixture.root)
+			if rootItself.Code != http.StatusOK || resolveJumpPath(t, rootItself) != fixture.root {
+				t.Fatalf("root resolve = %d %s", rootItself.Code, rootItself.Body.String())
+			}
+			missing := resolve(fixture.root + "/missing-folder")
+			if missing.Code != http.StatusNotFound {
+				t.Fatalf("missing folder resolve = %d %s", missing.Code, missing.Body.String())
+			}
+			file := resolve(fixture.root + "/alpha.txt")
+			if file.Code != http.StatusBadRequest || !strings.Contains(file.Body.String(), "not a directory") {
+				t.Fatalf("file resolve = %d %s", file.Code, file.Body.String())
+			}
+			outside := filepath.ToSlash(filepath.Join(filepath.Dir(filepath.FromSlash(fixture.root)), "outside"))
+			outsideResponse := resolve(outside)
+			if outsideResponse.Code != http.StatusForbidden {
+				t.Fatalf("outside resolve = %d %s", outsideResponse.Code, outsideResponse.Body.String())
+			}
+			traversal := resolve(fixture.root + "/../outside")
+			if traversal.Code != http.StatusBadRequest {
+				t.Fatalf("traversal resolve = %d %s", traversal.Code, traversal.Body.String())
+			}
+			post := request(app, http.MethodPost, "/resolve?path="+url.QueryEscape(fixture.root), nil)
+			if post.Code == http.StatusOK {
+				t.Fatalf("POST resolve must be rejected, got %d", post.Code)
+			}
+		})
+	}
+}
+
+func TestResolveJumpTranslatesSymlinkedRoot(t *testing.T) {
+	parent := t.TempDir()
+	realRoot := filepath.Join(parent, "real-root")
+	logicalRoot := filepath.Join(parent, "logical-root")
+	if err := os.MkdirAll(filepath.Join(realRoot, "sub", "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realRoot, "sub", "file.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRoot, logicalRoot); err != nil {
+		t.Fatal(err)
+	}
+	// The temp parent may itself contain symlinked components (macOS /var).
+	physicalRoot, err := filepath.EvalSymlinks(realRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	physicalRoot = filepath.ToSlash(physicalRoot)
+	logical := filepath.ToSlash(logicalRoot)
+
+	// Root configured as the symlink: typing the physical spelling maps back
+	// onto the configured root.
+	app := newTestApp(t, backendFixture{backend: filesystem.Local{}, root: logical}, nil)
+	resolve := func(app *App, target string) *httptest.ResponseRecorder {
+		return request(app, http.MethodGet, "/resolve?path="+url.QueryEscape(target), nil)
+	}
+	physical := resolve(app, physicalRoot+"/sub")
+	if physical.Code != http.StatusOK || resolveJumpPath(t, physical) != logical+"/sub" {
+		t.Fatalf("physical spelling resolve = %d %s", physical.Code, physical.Body.String())
+	}
+	nested := resolve(app, physicalRoot+"/sub/nested")
+	if nested.Code != http.StatusOK || resolveJumpPath(t, nested) != logical+"/sub/nested" {
+		t.Fatalf("nested physical resolve = %d %s", nested.Code, nested.Body.String())
+	}
+	missing := resolve(app, physicalRoot+"/sub/missing")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing physical leaf resolve = %d %s", missing.Code, missing.Body.String())
+	}
+	file := resolve(app, physicalRoot+"/sub/file.txt")
+	if file.Code != http.StatusBadRequest || !strings.Contains(file.Body.String(), "not a directory") {
+		t.Fatalf("physical file resolve = %d %s", file.Code, file.Body.String())
+	}
+	outside := resolve(app, filepath.ToSlash(filepath.Dir(physicalRoot)))
+	if outside.Code != http.StatusForbidden {
+		t.Fatalf("physical parent resolve = %d %s", outside.Code, outside.Body.String())
+	}
+	// Navigating with the translated path keeps the configured root on the page.
+	browse := request(app, http.MethodGet, "/?path="+url.QueryEscape(logical+"/sub"), nil)
+	if browse.Code != http.StatusOK || !strings.Contains(browse.Body.String(), `data-root="`+logical+`"`) {
+		t.Fatalf("browse of translated path = %d", browse.Code)
+	}
+
+	// Vice versa: root configured as the physical directory, typing the
+	// symlinked spelling maps onto the physical root.
+	reverse := newTestApp(t, backendFixture{backend: filesystem.Local{}, root: physicalRoot}, nil)
+	aliased := resolve(reverse, logical+"/sub")
+	if aliased.Code != http.StatusOK || resolveJumpPath(t, aliased) != physicalRoot+"/sub" {
+		t.Fatalf("aliased spelling resolve = %d %s", aliased.Code, aliased.Body.String())
+	}
+}
+
 func TestDirectoryTemplateMatchesOpenServerUploadWorkflow(t *testing.T) {
 	pathIndex := strings.Index(directoryTemplate, `class="header-path"`)
 	uploadIndex := strings.Index(directoryTemplate, `id="drop-zone"`)
@@ -1256,7 +1434,7 @@ func TestOptionalUIActions(t *testing.T) {
 	}
 	latexOnlyBody := request(latexOnly, http.MethodGet, "/", nil).Body.String()
 	if !strings.Contains(latexOnlyBody, `>Actions</th>`) || !strings.Contains(latexOnlyBody, `colspan="3" aria-label="LaTeX tools"`) {
-		t.Fatal("LaTeX-only mode does not use fixed Copy path, Download, Preview, Table, and Figure columns")
+		t.Fatal("LaTeX-only mode does not use fixed Open, Copy path, Download, Preview, Table, and Figure columns")
 	}
 }
 

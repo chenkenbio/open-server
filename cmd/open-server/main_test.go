@@ -669,8 +669,8 @@ func TestHelpIsRecognized(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	if version != "0.2.3" {
-		t.Fatalf("version = %q, want 0.2.3", version)
+	if version != "0.2.4" {
+		t.Fatalf("version = %q, want 0.2.4", version)
 	}
 	for _, argument := range []string{"-version", "-v"} {
 		var output bytes.Buffer

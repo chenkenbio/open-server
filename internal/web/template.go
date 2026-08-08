@@ -1,6 +1,6 @@
 package web
 
-const directoryTemplate = `{{define "app-start-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.25"></circle><path d="m9.75 8.25 6.5 3.75-6.5 3.75z" fill="currentColor" stroke="none"></path></svg>{{end}}{{define "app-stop-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.25"></circle><rect x="8.5" y="8.5" width="7" height="7" rx="1" fill="currentColor" stroke="none"></rect></svg>{{end}}{{define "app-loading-icon"}}<svg class="app-loading-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9" opacity="0.25"></circle><path d="M21 12a9 9 0 0 0-9-9"></path></svg>{{end}}{{define "copy-path-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>{{end}}{{define "download-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v3h14v-3"></path></svg>{{end}}{{define "app-controls"}}{{if .Endpoint}}<td class="action-column app-primary-column" data-app-control data-app="{{.App}}" data-label="{{.Label}}" data-endpoint="{{.Endpoint}}" data-state="{{.State}}">
+const directoryTemplate = `{{define "app-start-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.25"></circle><path d="m9.75 8.25 6.5 3.75-6.5 3.75z" fill="currentColor" stroke="none"></path></svg>{{end}}{{define "app-stop-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.25"></circle><rect x="8.5" y="8.5" width="7" height="7" rx="1" fill="currentColor" stroke="none"></rect></svg>{{end}}{{define "app-loading-icon"}}<svg class="app-loading-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9" opacity="0.25"></circle><path d="M21 12a9 9 0 0 0-9-9"></path></svg>{{end}}{{define "open-new-tab-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5h5v5"></path><path d="m10 14 9-9"></path><path d="M19 13v6H5V5h6"></path></svg>{{end}}{{define "copy-path-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>{{end}}{{define "download-icon"}}<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10m0 0 4-4m-4 4-4-4M5 17v3h14v-3"></path></svg>{{end}}{{define "app-controls"}}{{if .Endpoint}}<td class="action-column app-primary-column" data-app-control data-app="{{.App}}" data-label="{{.Label}}" data-endpoint="{{.Endpoint}}" data-state="{{.State}}">
 <button type="button" class="app-start icon-button" aria-label="Start {{.Label}}" title="Start {{.Label}}" {{if ne .State "stopped"}}hidden{{end}}>{{template "app-start-icon"}}</button>
 <button type="button" class="app-starting icon-button" aria-label="{{.Label}} is starting" title="{{.Label}} is starting" disabled aria-busy="true" {{if ne .State "starting"}}hidden{{end}}>{{if eq .App "jupyter"}}{{template "app-loading-icon"}}{{else}}{{template "app-start-icon"}}{{end}}</button>
 <a class="app-open icon-button" href="{{if .OpenURL}}{{.OpenURL}}{{else}}#{{end}}" target="_blank" rel="noopener" aria-label="Open {{.Label}} in a new tab" title="Open {{.Label}} in a new tab" {{if not (and (eq .State "running") .Available)}}hidden{{end}}><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5h5v5"></path><path d="m10 14 9-9"></path><path d="M19 13v6H5V5h6"></path></svg></a>
@@ -61,6 +61,13 @@ button, input, select, textarea { font-size: inherit; }
 #regex-filter-help ul { margin: 0.45em 0; padding-left: 1.5em; }
 #regex-filter-help code { font-family: ui-monospace, monospace; }
 #regex-filter-help-close { position: absolute; top: 0.45em; right: 0.45em; }
+.path-jump { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4em; margin-bottom: 0.35em; }
+.path-jump label { font-size: 0.88em; font-weight: 600; }
+#path-jump-input { width: 24em; max-width: 60vw; padding: 0.2em 0.5em; border: 1px solid #ccc; border-radius: 4px; font-family: ui-monospace, monospace; }
+#path-jump-input[aria-invalid="true"] { border-color: #a33; outline-color: #a33; }
+.path-jump button { padding: 0.2em 0.65em; border: 1px solid #ccc; border-radius: 4px; background: #f7f7f7; color: #333; cursor: pointer; }
+.path-jump button:hover { border-color: #aaa; background: #ececec; }
+#path-jump-error { min-height: 1.2em; color: #a33; font-size: 0.82em; }
 .table-scroll { width: 100%; max-width: 100%; overflow-x: auto; }
 table {
   --column-name-width: 28em;
@@ -69,7 +76,7 @@ table {
   --jupyter-columns-width: 0px;
   --tensorboard-columns-width: 0px;
   --latex-columns-width: 0px;
-  width: calc(var(--column-name-width) + var(--column-modified-width) + var(--column-size-width) + 4.7em + var(--jupyter-columns-width) + var(--tensorboard-columns-width) + var(--latex-columns-width));
+  width: calc(var(--column-name-width) + var(--column-modified-width) + var(--column-size-width) + 7.05em + var(--jupyter-columns-width) + var(--tensorboard-columns-width) + var(--latex-columns-width));
   max-width: none;
   table-layout: fixed;
   border-collapse: collapse;
@@ -136,6 +143,7 @@ a.icon-button { display: inline-block; }
   #upload-status { flex-basis: 100%; margin-left: 0; }
   #regex-filter-input { flex: 1 1 14em; max-width: 100%; }
   #regex-filter-status { flex-basis: 100%; margin-left: 0; }
+  #path-jump-input { flex: 1 1 14em; max-width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   .app-loading-icon { animation: none; }
@@ -155,6 +163,12 @@ a.icon-button { display: inline-block; }
 <span class="header-separator">›</span>
 <span class="breadcrumb">{{with index .Breadcrumbs 0}}<a href="{{.URL}}" title="Session root">.</a>{{end}}{{range $i, $crumb := .Breadcrumbs}}{{if $i}} / <a href="{{$crumb.URL}}">{{$crumb.Name}}</a>{{end}}{{end}}</span>
 </div>
+<form id="path-jump" class="path-jump" data-root="{{.RootPath}}">
+<label for="path-jump-input">Jump to</label>
+<input id="path-jump-input" type="text" spellcheck="false" autocomplete="off" aria-describedby="path-jump-error" placeholder="folder/inside/root">
+<button type="submit">Go</button>
+<span id="path-jump-error" role="alert"></span>
+</form>
 <div class="header-actions">
 <button id="btn-create-folder" type="button">+ New folder</button>
 <button id="btn-toggle-hidden" type="button" data-href="{{.HiddenToggleURL}}">{{.HiddenToggleLabel}}</button>
@@ -250,7 +264,7 @@ a.icon-button { display: inline-block; }
 <col class="column-modified" data-column="modified">
 <col class="column-size" data-column="size">
 </colgroup>
-<colgroup><col class="column-file-action"><col class="column-file-action"></colgroup>
+<colgroup><col class="column-file-action"><col class="column-file-action"><col class="column-file-action"></colgroup>
 {{if .JupyterEnabled}}<colgroup><col class="column-app-action"><col class="column-app-action"></colgroup>{{end}}
 {{if .TensorBoardEnabled}}<colgroup><col class="column-app-action"><col class="column-app-action"></colgroup>{{end}}
 {{if .LaTeXEnabled}}<colgroup><col class="column-latex-action"><col class="column-latex-action"><col class="column-latex-action"></colgroup>{{end}}
@@ -259,7 +273,7 @@ a.icon-button { display: inline-block; }
 <th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Name column" tabindex="0" data-resize-column="name"></span></th>
 <th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Last modified column" tabindex="0" data-resize-column="modified"></span></th>
 <th scope="col" align="right"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Size column" tabindex="0" data-resize-column="size"></span></th>
-<th scope="colgroup" align="left" colspan="2"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}>Actions</th>
+<th scope="colgroup" align="left" colspan="3"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}>Actions</th>
 {{if .JupyterEnabled}}<th scope="colgroup" align="center" colspan="2" class="app-group-heading" aria-label="JupyterLab" title="JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></th>{{end}}
 {{if .TensorBoardEnabled}}<th scope="colgroup" align="center" colspan="2" class="app-group-heading" aria-label="TensorBoard" title="TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></th>{{end}}
 {{if .LaTeXEnabled}}<th align="center" colspan="3"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}} aria-label="LaTeX tools"><span class="latex-tools-heading"><span class="latex-logo" aria-hidden="true">L<span class="latex-logo-a">A</span>T<span class="latex-logo-e">E</span>X</span><label class="latex-env-mode" title="Choose complete environments or inner commands"><span>Short</span><input id="latex-full-environment" class="latex-env-switch" type="checkbox" role="switch" aria-label="Use full LaTeX figure and table environments" checked><span>Full env</span></label></span></th>{{end}}
@@ -270,11 +284,11 @@ a.icon-button { display: inline-block; }
 </tr>{{end}}
 </thead>
 <tbody>
-{{if .HasParent}}<tr><td><div class="name-cell-content" title=".."><a href="{{.ParentURL}}">..</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.ParentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .ParentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .ParentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>{{end}}
-<tr><td><div class="name-cell-content" title="."><a href="{{.CurrentURL}}">.</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.CurrentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .CurrentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .CurrentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>
+{{if .HasParent}}<tr><td><div class="name-cell-content" title=".."><a href="{{.ParentURL}}">..</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><a class="open-entry icon-button" href="{{.ParentURL}}" target="_blank" rel="noopener" aria-label="Open parent directory in a new tab" title="Open parent directory in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.ParentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .ParentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .ParentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>{{end}}
+<tr><td><div class="name-cell-content" title="."><a href="{{.CurrentURL}}">.</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><a class="open-entry icon-button" href="{{.CurrentURL}}" target="_blank" rel="noopener" aria-label="Open current directory in a new tab" title="Open current directory in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.CurrentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .CurrentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .CurrentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>
 </tbody>
 {{if .Entries}}<tbody id="directory-entries">
-{{range .Entries}}<tr><td><div class="name-cell-content" title="{{.Name}}{{if .IsDir}}/{{end}}{{if .IsLink}} → {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}"><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</div></td><td><div class="modified-cell-content" title="{{time .ModTime}}">{{time .ModTime}}</div></td><td align="right"><div class="size-cell-content" title="{{if .IsDir}}-{{else}}{{size .Size}}{{end}}">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</div></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}">{{template "download-icon"}}</button>{{else}}&nbsp;{{end}}</td>{{if $view.JupyterEnabled}}{{template "app-controls" .Jupyter}}{{end}}{{if $view.TensorBoardEnabled}}{{template "app-controls" .TensorBoard}}{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet-full="{{.TableSnippet.Full}}" data-snippet-short="{{.TableSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet-full="{{.FigureSnippet.Full}}" data-snippet-short="{{.FigureSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
+{{range .Entries}}<tr><td><div class="name-cell-content" title="{{.Name}}{{if .IsDir}}/{{end}}{{if .IsLink}} → {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}"><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</div></td><td><div class="modified-cell-content" title="{{time .ModTime}}">{{time .ModTime}}</div></td><td align="right"><div class="size-cell-content" title="{{if .IsDir}}-{{else}}{{size .Size}}{{end}}">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</div></td><td class="file-action-column"><a class="open-entry icon-button" href="{{.URL}}" target="_blank" rel="noopener" aria-label="Open {{.Name}} in a new tab" title="Open {{.Name}} in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}">{{template "download-icon"}}</button>{{else}}&nbsp;{{end}}</td>{{if $view.JupyterEnabled}}{{template "app-controls" .Jupyter}}{{end}}{{if $view.TensorBoardEnabled}}{{template "app-controls" .TensorBoard}}{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet-full="{{.TableSnippet.Full}}" data-snippet-short="{{.TableSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet-full="{{.FigureSnippet.Full}}" data-snippet-short="{{.FigureSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
 {{end}}
 </tbody>{{else}}<tbody id="directory-empty"><tr><td colspan="{{.ColumnCount}}">This directory is empty.</td></tr></tbody>{{end}}
 </table>
@@ -429,6 +443,76 @@ a.icon-button { display: inline-block; }
   } catch (e) {
     removeSavedFilter();
   }
+
+  var pathJumpForm = document.getElementById('path-jump');
+  var pathJumpInput = document.getElementById('path-jump-input');
+  var pathJumpError = document.getElementById('path-jump-error');
+  var pathJumpRoot = (pathJumpForm.getAttribute('data-root') || '/').replace(/\/+$/, '') || '/';
+
+  function setPathJumpError(message) {
+    pathJumpError.textContent = message;
+    pathJumpInput.setAttribute('aria-invalid', message ? 'true' : 'false');
+  }
+  function resolveJumpTarget(input) {
+    var normalized = input.replace(/\\/g, '/');
+    var absolute = normalized.charAt(0) === '/';
+    var segments = normalized.split('/');
+    var kept = [];
+    for (var i = 0; i < segments.length; i++) {
+      var segment = segments[i];
+      if (segment === '' || segment === '.') continue;
+      if (segment === '..') return null;
+      kept.push(segment);
+    }
+    var base = absolute || pathJumpRoot === '/' ? '' : pathJumpRoot;
+    if (!kept.length) return base || '/';
+    return base + '/' + kept.join('/');
+  }
+  pathJumpInput.addEventListener('input', function() { setPathJumpError(''); });
+  pathJumpForm.addEventListener('submit', function(e) {
+    e.preventDefault();
+    var value = pathJumpInput.value.trim();
+    if (!value) {
+      setPathJumpError('');
+      return;
+    }
+    if (value.indexOf('\u0000') !== -1) {
+      setPathJumpError('Invalid path');
+      return;
+    }
+    var target = resolveJumpTarget(value);
+    if (target === null) {
+      setPathJumpError("'..' is not allowed");
+      return;
+    }
+    fetch('/resolve?path=' + encodeURIComponent(target)).then(function(resp) {
+      if (resp.status === 404) {
+        setPathJumpError('Folder not found');
+        return;
+      }
+      if (resp.status === 403) {
+        setPathJumpError('Path is outside the served root');
+        return;
+      }
+      if (!resp.ok) {
+        setPathJumpError('Not a folder or invalid path');
+        return;
+      }
+      return resp.json().then(function(resolved) {
+        var current = new URLSearchParams(window.location.search);
+        var dest = new URLSearchParams();
+        dest.set('path', resolved.path);
+        if (current.get('sort')) {
+          dest.set('sort', current.get('sort'));
+          dest.set('order', current.get('order') || 'asc');
+        }
+        if (current.get('hidden') === '1') dest.set('hidden', '1');
+        window.location.href = '/?' + dest.toString();
+      });
+    }).catch(function() {
+      setPathJumpError('Could not reach the server');
+    });
+  });
 
   var directoryTable = document.getElementById('directory-list');
   var columnWidthStorageKey = 'open-server-directory-column-widths:v1';

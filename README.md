@@ -130,6 +130,14 @@ files, save a file from the clipboard, import a file from a URL, copy full
 paths, and download original files. Existing destination files are not replaced
 without an explicit overwrite choice.
 
+The **Jump to** box below the header line goes straight to a folder inside the
+served root. A relative path is resolved against the root; an absolute path is
+accepted when it stays inside it, including symlink-equivalent spellings such
+as the physical location of a symlinked root (or a symlink alias of a physical
+one), which are mapped back onto the configured root so the displayed root
+path never changes. Only existing folders are accepted, problems are reported
+inline, and the current sort order and hidden-file state carry over.
+
 Directory listings can be filtered in the browser with a regular expression
 matched against each entry's basename. Matching is case-sensitive by default;
 enable **Ignore case** when needed. While a filter is applied, an **Active**
@@ -138,8 +146,9 @@ obvious. The current valid filter is remembered separately for each folder for
 the life of the browser tab. Use the **?** button beside the filter for syntax
 notes and examples.
 
-The compact **Actions** group has fixed copy-path and file-download subcolumns,
-so each action stays vertically aligned even when another action is unavailable.
+The compact **Actions** group has fixed open-in-new-tab, copy-path, and
+file-download subcolumns, so each action stays vertically aligned even when
+another action is unavailable.
 The table uses only the width its columns need instead of stretching across a
 full-screen window. Permanently visible separators after **Name**, **Last
 modified**, and **Size** show that those columns are adjustable. Drag a separator

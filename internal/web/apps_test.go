@@ -101,8 +101,10 @@ func TestGroupedApplicationActions(t *testing.T) {
 		`<th scope="col" class="app-subheading">Stop</th>`,
 		`aria-label="Start JupyterLab"`, `aria-label="Start TensorBoard"`,
 		`class="app-stop icon-button"`, `data-state="stopped"`,
+		`class="open-entry icon-button"`, `target="_blank" rel="noopener"`,
+		`aria-label="Open current directory in a new tab"`, `aria-label="Open work in a new tab"`,
 		`class="download-file icon-button"`, `class="open-live icon-button"`,
-		`class="column-file-action"`, `colspan="2" rowspan="2">Actions</th>`,
+		`class="column-file-action"`, `colspan="3" rowspan="2">Actions</th>`,
 		`aria-label="Copy path" title="Copy path"`,
 		`.app-group-heading { border-bottom: 0; }`,
 		`.app-subheading { padding-right: 0.4em; padding-left: 0.4em; font-size: 0.78em;`,
@@ -124,7 +126,7 @@ func TestGroupedApplicationActions(t *testing.T) {
 			t.Errorf("listing is missing %q", want)
 		}
 	}
-	for _, unwanted := range []string{">Path</th>", `colspan="3">Actions</th>`, ">Apps</th>", ">Download</th>", ">Launch</button>", ">JupyterLab</button>", ">TensorBoard</button>", "JupyterLab</th>", "TensorBoard</th>", ">Preview</button>", ">Preview</th>", ">Table</button>", ">Figure</button>", "M6 2h8l4 4v16H6z", "M8 5v14l11-7z", `<rect x="6" y="6" width="12" height="12" rx="1"></rect>`, `class="file-actions"`, `class="file-action-subheading"`, `aria-label="Download file"`} {
+	for _, unwanted := range []string{">Path</th>", `colspan="4">Actions</th>`, ">Apps</th>", ">Download</th>", ">Launch</button>", ">JupyterLab</button>", ">TensorBoard</button>", "JupyterLab</th>", "TensorBoard</th>", ">Preview</button>", ">Preview</th>", ">Table</button>", ">Figure</button>", "M6 2h8l4 4v16H6z", "M8 5v14l11-7z", `<rect x="6" y="6" width="12" height="12" rx="1"></rect>`, `class="file-actions"`, `class="file-action-subheading"`, `aria-label="Download file"`} {
 		if strings.Contains(body, unwanted) {
 			t.Errorf("listing contains visible legacy label %q", unwanted)
 		}
@@ -132,8 +134,8 @@ func TestGroupedApplicationActions(t *testing.T) {
 	if !strings.Contains(body, `>.</a>`) {
 		t.Fatal("listing is missing the current-directory row")
 	}
-	if got := strings.Count(body, `<col class="column-file-action">`); got != 2 {
-		t.Fatalf("file action subcolumn count = %d, want 2", got)
+	if got := strings.Count(body, `<col class="column-file-action">`); got != 3 {
+		t.Fatalf("file action subcolumn count = %d, want 3", got)
 	}
 	if got := strings.Count(body, `<th scope="col" class="app-subheading">Start</th>`); got != 2 {
 		t.Fatalf("application Start subheading count = %d, want 2", got)
@@ -141,14 +143,31 @@ func TestGroupedApplicationActions(t *testing.T) {
 	if got := strings.Count(body, `<th scope="col" class="app-subheading">Stop</th>`); got != 2 {
 		t.Fatalf("application Stop subheading count = %d, want 2", got)
 	}
-	if got := strings.Count(body, `<td class="file-action-column">`); got != 6 {
-		t.Fatalf("file action cell count = %d, want 6 (two fixed cells for each of three rows)", got)
+	if got := strings.Count(body, `<td class="file-action-column">`); got != 9 {
+		t.Fatalf("file action cell count = %d, want 9 (three fixed cells for each of three rows)", got)
+	}
+	if got := strings.Count(body, `class="open-entry icon-button"`); got != 3 {
+		t.Fatalf("open-in-new-tab control count = %d, want 3", got)
 	}
 	if got := strings.Count(body, `class="copy-path icon-button"`); got != 3 {
 		t.Fatalf("copy-path control count = %d, want 3", got)
 	}
 	if got := strings.Count(body, `class="download-file icon-button"`); got != 1 {
 		t.Fatalf("download control count = %d, want 1", got)
+	}
+	reportOpen := strings.Index(body, `aria-label="Open report.pdf in a new tab"`)
+	if reportOpen == -1 {
+		t.Fatal("report row is missing its open-in-new-tab action")
+	}
+	reportRowEnd := strings.Index(body[reportOpen:], `</tr>`)
+	if reportRowEnd == -1 {
+		t.Fatal("report row has no closing tag")
+	}
+	reportActions := body[reportOpen : reportOpen+reportRowEnd]
+	reportCopy := strings.Index(reportActions, `class="copy-path icon-button"`)
+	reportDownload := strings.Index(reportActions, `class="download-file icon-button"`)
+	if reportCopy == -1 || reportDownload == -1 || reportCopy >= reportDownload {
+		t.Fatalf("report actions are not ordered open, copy, download: copy=%d download=%d", reportCopy, reportDownload)
 	}
 	if got := strings.Count(body, `class="app-start icon-button" aria-label="Start JupyterLab"`); got != 2 {
 		t.Fatalf("current and child Jupyter start count = %d, want 2", got)
@@ -173,6 +192,12 @@ func TestGroupedApplicationActions(t *testing.T) {
 	childBody := childListing.Body.String()
 	if !strings.Contains(childBody, `>.</a>`) {
 		t.Fatal("child listing is missing the current-directory row")
+	}
+	if got := strings.Count(childBody, `class="open-entry icon-button"`); got != 3 {
+		t.Fatalf("parent, current, and child-entry open-in-new-tab count = %d, want 3", got)
+	}
+	if !strings.Contains(childBody, `aria-label="Open parent directory in a new tab"`) {
+		t.Fatal("child listing is missing the parent-directory open-in-new-tab action")
 	}
 	if got := strings.Count(childBody, `class="app-start icon-button" aria-label="Start JupyterLab"`); got != 2 {
 		t.Fatalf("current and parent Jupyter start count = %d, want 2", got)
