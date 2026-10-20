@@ -209,8 +209,16 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 						t.Errorf("listing does not contain %q", want)
 					}
 				}
-				if !strings.Contains(body, `var uploadURL = "/upload?path=`) || !strings.Contains(body, `var importURL = "/import?path=`) {
-					t.Fatal("rendered transfer endpoints are not root-relative JavaScript strings")
+				header := startTagByID(t, body, "directory-header")
+				for attribute, route := range map[string]string{"data-upload-url": "/upload", "data-import-url": "/import", "data-mkdir-url": "/mkdir"} {
+					match := regexp.MustCompile(attribute + `="([^"]+)"`).FindStringSubmatch(header)
+					if len(match) != 2 {
+						t.Fatalf("missing transfer endpoint %s", attribute)
+					}
+					endpoint, err := url.Parse(html.UnescapeString(match[1]))
+					if err != nil || endpoint.Scheme != "" || endpoint.Host != "" || endpoint.Path != route || endpoint.Query().Get("path") != fixture.root {
+						t.Fatalf("transfer endpoint %s is not root-relative within the selected folder: %q", attribute, match[1])
+					}
 				}
 				if strings.Contains(body, `>..</a>`) || !strings.Contains(body, "Name ^") {
 					t.Fatal("root listing exposes parent navigation or is missing the active sort marker")
@@ -279,7 +287,7 @@ func TestHTTPBehaviorAgainstLocalAndSFTP(t *testing.T) {
 				if parentIndex == -1 || currentIndex == -1 || parentIndex >= currentIndex {
 					t.Fatal("parent directory must appear above the current directory")
 				}
-				rootLink := regexp.MustCompile(`<a href="([^"]+)" title="Session root">\.</a>`).FindStringSubmatch(insideResponse.Body.String())
+				rootLink := regexp.MustCompile(`<a href="([^"]+)" data-directory-link title="Session root">\.</a>`).FindStringSubmatch(insideResponse.Body.String())
 				if len(rootLink) != 2 {
 					t.Fatal("nested listing is missing the confined-root breadcrumb link")
 				}
@@ -791,8 +799,8 @@ func TestDirectoryPathJumpWorkflow(t *testing.T) {
 
 	submitIndex := strings.Index(directoryTemplate, `pathJumpForm.addEventListener('submit'`)
 	traversalIndex := strings.Index(directoryTemplate, `setPathJumpError("'..' is not allowed");`)
-	resolveIndex := strings.Index(directoryTemplate, `fetch('/resolve?path=' + encodeURIComponent(target))`)
-	navigateIndex := strings.Index(directoryTemplate, `window.location.href = '/?' + dest.toString();`)
+	resolveIndex := strings.Index(directoryTemplate, `fetch('/resolve?path=' + encodeURIComponent(target), {signal: jumpRequest.signal})`)
+	navigateIndex := strings.Index(directoryTemplate, `navigateDirectory('/?' + dest.toString());`)
 	if submitIndex == -1 || traversalIndex == -1 || resolveIndex == -1 || navigateIndex == -1 ||
 		!(submitIndex < traversalIndex && traversalIndex < resolveIndex && resolveIndex < navigateIndex) {
 		t.Fatal("path jump must reject traversal, resolve the destination, then navigate with the resolved path")

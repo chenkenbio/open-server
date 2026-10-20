@@ -111,7 +111,8 @@ SSH/SFTP sessions reconnect automatically after an unexpected drop, using
 bounded retries with backoff. The local URL and port stay the same, so open
 browser tabs do not need to be reloaded: file operations return a temporary
 503 while the SSH connection is down, and normal browsing resumes once it
-reconnects. Use `-no-reconnect` to disable this and end the session
+reconnects. Each successful reconnection prints the session's local URL again
+in the terminal. Use `-no-reconnect` to disable reconnection and end the session
 immediately on a drop instead.
 
 Remote TensorBoard and JupyterLab processes are not stopped when the SSH
@@ -129,6 +130,16 @@ can be shown when needed. `open-server` can create directories, upload multiple
 files, save a file from the clipboard, import a file from a URL, copy full
 paths, and download original files. Existing destination files are not replaced
 without an explicit overwrite choice.
+
+Folder links, sorting, and hidden-file toggles update the listing in place.
+**Refresh** reads the current folder again while keeping its filter, sort order,
+column widths, and scroll position. Back and Forward restore recent listings
+immediately and show **Refreshing** while fetching current contents. Listings
+are cached only in the tab's memory, for up to 60 seconds, ten views, or 8 MiB.
+
+Temporary remote disconnections keep the browser visible and retry directory
+reads automatically. Uploads and URL imports continue in their original folder
+if you navigate elsewhere; failed writes are never automatically repeated.
 
 The **Jump to** box below the header line goes straight to a folder inside the
 served root. A relative path is resolved against the root; an absolute path is
@@ -370,7 +381,15 @@ of the local or SSH account remain the final boundary.
 go test ./...
 go test -race ./...
 go vet ./...
+node --test internal/web/assets/browser-v1.test.cjs
+OPEN_SERVER_BROWSER_TESTS=1 go test ./internal/web -run '^TestBrowserNavigation$' -v
 ```
+
+The optional browser checks require Node.js 22 or newer and an installed Chrome.
+Set `CHROME_BIN` when Chrome is not at its usual macOS location or available as
+`google-chrome` on Linux. They use temporary files and a separate browser profile.
+On macOS, use `TMPDIR=/tmp` for Go tests if long temporary paths exceed the
+Unix-socket length limit.
 
 ## License
 

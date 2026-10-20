@@ -13,10 +13,10 @@ const (
 	appAssetRoutePrefix  = "/assets/apps/"
 	// Rename both live-vN assets whenever either file changes; these URLs are
 	// cached as immutable.
-	liveControllerURL    = liveAssetRoutePrefix + "live-v2.mjs"
-	liveStylesURL        = liveAssetRoutePrefix + "live-v2.css"
-	pdfJSVersion         = "5.7.284"
-	pdfJSRoutePrefix     = liveAssetRoutePrefix + "pdfjs-" + pdfJSVersion + "/"
+	liveControllerURL = liveAssetRoutePrefix + "live-v2.mjs"
+	liveStylesURL     = liveAssetRoutePrefix + "live-v2.css"
+	pdfJSVersion      = "5.7.284"
+	pdfJSRoutePrefix  = liveAssetRoutePrefix + "pdfjs-" + pdfJSVersion + "/"
 )
 
 // liveAssets contains the application-owned live viewer and its pinned PDF.js
@@ -29,6 +29,20 @@ var liveAssets embed.FS
 //
 //go:embed assets/apps
 var appAssets embed.FS
+
+//go:embed assets/browser-v1.js
+var browserAssets embed.FS
+
+func (a *App) serveBrowserAsset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, http.MethodGet, http.MethodHead)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	http.ServeFileFS(w, r, browserAssets, "assets/browser-v1.js")
+}
 
 // serveAppAsset serves one allowlisted launcher icon.
 func (a *App) serveAppAsset(w http.ResponseWriter, r *http.Request) {

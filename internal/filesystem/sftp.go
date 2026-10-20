@@ -28,26 +28,68 @@ func (s SFTP) Lstat(ctx context.Context, name string) (fs.FileInfo, error) {
 }
 
 func (s SFTP) ReadDir(ctx context.Context, name string) ([]Entry, error) {
-	infos, err := awaitSFTP(ctx, func() ([]fs.FileInfo, error) { return s.Client.ReadDir(name) })
+	// ReadDirContext stops requesting batches when a browser moves elsewhere.
+	// Retain the wrapper because closing the directory handle is not cancelable.
+	infos, err := awaitSFTP(ctx, func() ([]fs.FileInfo, error) { return s.Client.ReadDirContext(ctx, name) })
 	if err != nil {
 		return nil, err
 	}
-	entries := make([]Entry, 0, len(infos))
-	for _, listedInfo := range infos {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	return s.directoryEntries(ctx, name, infos)
+}
+
+const sftpDirectoryWorkers = 8
+
+func (s SFTP) directoryEntries(ctx context.Context, name string, infos []fs.FileInfo) ([]Entry, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	entries := make([]Entry, len(infos))
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	var firstErr error
+	var failOnce sync.Once
+	for range min(sftpDirectoryWorkers, len(infos)) {
+		workers.Go(func() {
+			for index := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				info := infos[index]
+				fullName := path.Join(name, info.Name())
+				// READDIR already supplies lstat-style attributes. Some servers
+				// omit the file type; only those entries need another round trip.
+				attributes, ok := info.Sys().(*sftp.FileStat)
+				if !ok || attributes.Mode&0o170000 == 0 {
+					var err error
+					info, err = s.Lstat(ctx, fullName)
+					if err != nil {
+						failOnce.Do(func() { firstErr = err; cancel() })
+						return
+					}
+				}
+				entry := Entry{Name: infos[index].Name(), LinkInfo: info, Info: info}
+				if info.Mode()&fs.ModeSymlink != 0 {
+					entry.LinkTarget, _ = s.Readlink(ctx, fullName)
+					entry.Info, _ = s.Stat(ctx, fullName)
+				}
+				entries[index] = entry
+			}
+		})
+	}
+schedule:
+	for index := range infos {
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			break schedule
 		}
-		fullName := path.Join(name, listedInfo.Name())
-		linkInfo, err := s.Lstat(ctx, fullName)
-		if err != nil {
-			return nil, err
-		}
-		entry := Entry{Name: listedInfo.Name(), LinkInfo: linkInfo, Info: linkInfo}
-		if linkInfo.Mode()&fs.ModeSymlink != 0 {
-			entry.LinkTarget, _ = s.Readlink(ctx, fullName)
-			entry.Info, _ = s.Stat(ctx, fullName)
-		}
-		entries = append(entries, entry)
+	}
+	close(jobs)
+	workers.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return entries, nil
 }

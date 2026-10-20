@@ -669,8 +669,8 @@ func TestHelpIsRecognized(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	if version != "0.2.4" {
-		t.Fatalf("version = %q, want 0.2.4", version)
+	if version != "0.2.5" {
+		t.Fatalf("version = %q, want 0.2.5", version)
 	}
 	for _, argument := range []string{"-version", "-v"} {
 		var output bytes.Buffer
@@ -844,6 +844,18 @@ func TestRunReconnectsAfterUnexpectedSSHExit(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "Connection lost [test-host:.].") {
 		t.Fatalf("output missing reconnect notice: %q", output.String())
+	}
+	urls := regexp.MustCompile(`(?m)^Open this local URL \[test-host:\.\]: (http://127\.0\.0\.1:\d+/)$`).FindAllStringSubmatch(output.String(), -1)
+	if len(urls) < 2 {
+		t.Fatalf("output must print the local URL at startup and after reconnection: %q", output.String())
+	}
+	for _, match := range urls[1:] {
+		if match[1] != urls[0][1] {
+			t.Fatalf("reconnect URL = %q, want original URL %q", match[1], urls[0][1])
+		}
+	}
+	if !strings.Contains(output.String(), "Reconnected [test-host:.].\nOpen this local URL [test-host:.]: "+urls[0][1]+"\n") {
+		t.Fatalf("successful reconnect must be followed by its session URL: %q", output.String())
 	}
 }
 

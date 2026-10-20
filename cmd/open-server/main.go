@@ -30,7 +30,7 @@ import (
 	appweb "open-server/internal/web"
 )
 
-const version = "0.2.4"
+const version = "0.2.5"
 
 const automaticPortStart = 60000
 
@@ -434,6 +434,7 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 
 	done := make(chan error, 1)
 	running := &runningSession{label: resolved.label, done: done, cancel: cancel}
+	localURL := serveStartURL(app.URL(), initialPath)
 	go func() {
 		var result error
 		currentDone := remoteDone
@@ -469,7 +470,7 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 					app.SetBackend(filesystem.SFTP{Client: reconnected.session.Client})
 					currentDone = reconnected.session.Done()
 					currentClose = reconnected.session.Close
-					fmt.Fprintf(output, "Reconnected [%s].\n", resolved.label)
+					fmt.Fprintf(output, "Reconnected [%s].\nOpen this local URL [%s]: %s\n", resolved.label, resolved.label, localURL)
 					reattachLaunchers(ctx, tensorBoardLauncher, jupyterLauncher)
 					continue
 				case reconnectUserClose:
@@ -501,7 +502,7 @@ func startSession(parent context.Context, requestUserClose func(string, time.Tim
 		done <- result
 	}()
 
-	return running, serveStartURL(app.URL(), initialPath), nil
+	return running, localURL, nil
 }
 
 // defaultPageTitle returns a compact browser-tab title for a session target.

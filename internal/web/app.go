@@ -260,6 +260,10 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.serveAppAsset(w, r)
 		return
 	}
+	if route == "/assets/browser-v1.js" {
+		a.serveBrowserAsset(w, r)
+		return
+	}
 	if strings.HasPrefix(route, liveAssetRoutePrefix) {
 		a.serveLiveAsset(w, r)
 		return
@@ -274,7 +278,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch route {
-	case "", "/":
+	case "", "/", "/browse":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w, http.MethodGet, http.MethodHead)
 			return
@@ -455,7 +459,7 @@ func (a *App) securityHeaders(w http.ResponseWriter, allowSameOriginFrame bool) 
 		frameOptions = "SAMEORIGIN"
 	}
 	w.Header().Set("Cache-Control", "private, no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors "+frameAncestors)
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; frame-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors "+frameAncestors)
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", frameOptions)
@@ -516,6 +520,7 @@ type directoryView struct {
 	PlainHTTPWarning   bool
 	RootPath           string
 	CurrentPath        string
+	LoadError          string
 	UploadURL          string
 	ImportURL          string
 	MkdirURL           string
@@ -593,10 +598,14 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	backend := a.currentBackend()
 	info, err := backend.Stat(r.Context(), current)
 	if err != nil {
-		a.pathError(w, err)
+		a.browseError(w, r, current, err)
 		return
 	}
 	if !info.IsDir() {
+		if r.URL.Path == "/browse" {
+			http.Error(w, "path is no longer a directory", http.StatusConflict)
+			return
+		}
 		if previewURL := a.renderedPreviewURL(current); previewURL != "" {
 			http.Redirect(w, r, previewURL, http.StatusTemporaryRedirect)
 			return
@@ -606,9 +615,15 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := backend.ReadDir(r.Context(), current)
 	if err != nil {
-		a.pathError(w, err)
+		a.browseError(w, r, current, err)
 		return
 	}
+	a.renderDirectory(w, r, a.makeDirectoryView(r, current, entries))
+}
+
+// makeDirectoryView is shared by full pages, navigation fragments, and the
+// reconnect shell. It does not perform filesystem reads.
+func (a *App) makeDirectoryView(r *http.Request, current string, entries []filesystem.Entry) directoryView {
 	showHidden := r.URL.Query().Get("hidden") == "1"
 	if !showHidden {
 		visible := entries[:0]
@@ -731,10 +746,29 @@ func (a *App) browse(w http.ResponseWriter, r *http.Request) {
 			LinkTarget:    entry.LinkTarget,
 		})
 	}
+	return view
+}
+
+func (a *App) renderDirectory(w http.ResponseWriter, r *http.Request, view directoryView) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := a.template.Execute(w, view); err != nil {
+	if r.URL.Path == "/browse" {
+		_ = a.template.ExecuteTemplate(w, "directory-fragment", view)
 		return
 	}
+	_ = a.template.Execute(w, view)
+}
+
+func (a *App) browseError(w http.ResponseWriter, r *http.Request, current string, err error) {
+	if r.URL.Path == "/browse" || !errors.Is(err, filesystem.ErrDisconnected) {
+		a.pathError(w, err)
+		return
+	}
+	view := a.makeDirectoryView(r, current, nil)
+	view.LoadError = publicError(err)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Retry-After", "5")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	a.renderDirectory(w, r, view)
 }
 
 func (a *App) requestPath(r *http.Request) (string, error) {

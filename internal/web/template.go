@@ -68,6 +68,8 @@ button, input, select, textarea { font-size: inherit; }
 .path-jump button { padding: 0.2em 0.65em; border: 1px solid #ccc; border-radius: 4px; background: #f7f7f7; color: #333; cursor: pointer; }
 .path-jump button:hover { border-color: #aaa; background: #ececec; }
 #path-jump-error { min-height: 1.2em; color: #a33; font-size: 0.82em; }
+#navigation-feedback { min-height: 1.5em; margin: -0.25em 0 0.35em; font-size: 0.85em; color: #555; }
+#navigation-feedback[data-kind="error"] { color: #a33; }
 .table-scroll { width: 100%; max-width: 100%; overflow-x: auto; }
 table {
   --column-name-width: 28em;
@@ -153,7 +155,7 @@ a.icon-button { display: inline-block; }
 <body>
 <span id="copy-status" class="visually-hidden" role="status" aria-live="polite"></span>
 {{if .PlainHTTPWarning}}<div role="alert" style="margin: 0 0 0.8em 0; padding: 0.7em; border: 1px solid #a66; background: #fff3cd; color: #4d3800; font-family: sans-serif;"><strong>Security warning:</strong> This server uses token-protected plain HTTP. The token controls access, but traffic is not encrypted. Use only on a trusted network.</div>{{end}}
-<div class="page-header">
+{{block "directory-header" .}}<div class="page-header" id="directory-header" data-directory="{{.CurrentPath}}" data-url="{{.CurrentURL}}" data-upload-url="{{.UploadURL}}" data-import-url="{{.ImportURL}}" data-mkdir-url="{{.MkdirURL}}" data-load-error="{{.LoadError}}">
 <div class="header-path">
 <span class="site-name">open-server</span>
 <span class="header-separator">›</span>
@@ -161,7 +163,7 @@ a.icon-button { display: inline-block; }
 <span class="header-separator">›</span>
 <span class="root-path">{{.RootPath}}</span>
 <span class="header-separator">›</span>
-<span class="breadcrumb">{{with index .Breadcrumbs 0}}<a href="{{.URL}}" title="Session root">.</a>{{end}}{{range $i, $crumb := .Breadcrumbs}}{{if $i}} / <a href="{{$crumb.URL}}">{{$crumb.Name}}</a>{{end}}{{end}}</span>
+<span class="breadcrumb">{{with index .Breadcrumbs 0}}<a href="{{.URL}}" data-directory-link title="Session root">.</a>{{end}}{{range $i, $crumb := .Breadcrumbs}}{{if $i}} / <a href="{{$crumb.URL}}" data-directory-link>{{$crumb.Name}}</a>{{end}}{{end}}</span>
 </div>
 <form id="path-jump" class="path-jump" data-root="{{.RootPath}}">
 <label for="path-jump-input">Jump to</label>
@@ -171,11 +173,13 @@ a.icon-button { display: inline-block; }
 </form>
 <div class="header-actions">
 <button id="btn-create-folder" type="button">+ New folder</button>
+<button id="btn-refresh" type="button" title="Read this folder again">Refresh</button>
 <button id="btn-toggle-hidden" type="button" data-href="{{.HiddenToggleURL}}">{{.HiddenToggleLabel}}</button>
 <button type="button" class="copy-path" data-path="{{.CurrentPath}}">&#x2398; Copy path</button>
 {{if .Closeable}}<form action="/close" method="post" onsubmit="return window.confirm('Close open-server and all sessions?');"><input type="hidden" name="csrf" value="{{.CSRFToken}}"><button id="btn-close-server" type="submit">Close open-server</button></form>{{end}}
 </div>
-</div>
+</div>{{end}}
+<div id="navigation-feedback"><span id="navigation-status" role="status" aria-live="polite"></span> <button id="navigation-retry" type="button" hidden>Retry</button></div>
 <div id="drop-zone">
 <form id="upload-form" action="{{.UploadURL}}" method="POST" enctype="multipart/form-data" style="margin: 0;">
 <input id="file-input" type="file" name="file" multiple>
@@ -193,7 +197,7 @@ a.icon-button { display: inline-block; }
 </div>
 <span id="upload-status" role="status" aria-live="polite"></span>
 </div>
-<form id="regex-filter-controls" class="regex-filter-controls" data-directory="{{.CurrentPath}}" data-entry-count="{{len .Entries}}">
+{{block "directory-filter" .}}<form id="regex-filter-controls" class="regex-filter-controls" data-directory="{{.CurrentPath}}" data-entry-count="{{len .Entries}}">
 <label for="regex-filter-input">Regex filter</label>
 <span id="regex-filter-badge" aria-hidden="true">Active</span>
 <button id="regex-filter-help-toggle" type="button" aria-label="Show regex syntax help" aria-controls="regex-filter-help" aria-expanded="false" title="Regex syntax help">?</button>
@@ -215,7 +219,7 @@ a.icon-button { display: inline-block; }
 </ul>
 <p>Use <code>^</code> and <code>$</code> for the start and end, parentheses for groups, <code>|</code> for alternation, square brackets for character classes, and <code>\.</code> for a literal dot. “Ignore case” adds case-insensitive matching. The <code>.</code> and <code>..</code> navigation rows are never filtered.</p>
 </div>
-</form>
+</form>{{end}}
 <div id="conflict-modal" role="dialog" aria-modal="true" aria-labelledby="conflict-message" style="display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.25); z-index: 1000; font-family: sans-serif;">
 <div style="background: #fff; color: #000; border: 1px solid #777; border-radius: 6px; max-width: 28em; margin: 15vh auto 0 auto; padding: 1em;">
 <p id="conflict-message" style="margin: 0 0 0.8em 0;"></p>
@@ -257,7 +261,7 @@ a.icon-button { display: inline-block; }
 </form>
 </div>{{end}}
 <div id="app-action-status" role="status" aria-live="polite"></div>
-<div class="table-scroll" tabindex="0" aria-label="Directory listing">
+{{block "directory-content" .}}<div id="directory-content" class="table-scroll" tabindex="0" aria-label="Directory listing">
 <table id="directory-list" class="{{if .JupyterEnabled}}has-jupyter {{end}}{{if .TensorBoardEnabled}}has-tensorboard {{end}}{{if .LaTeXEnabled}}has-latex{{end}}">
 <colgroup>
 <col class="column-name" data-column="name">
@@ -270,9 +274,9 @@ a.icon-button { display: inline-block; }
 {{if .LaTeXEnabled}}<colgroup><col class="column-latex-action"><col class="column-latex-action"><col class="column-latex-action"></colgroup>{{end}}
 <thead>
 {{$view := .}}<tr>
-<th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.NameSortURL}}">Name{{.NameSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Name column" tabindex="0" data-resize-column="name"></span></th>
-<th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.ModifiedSortURL}}">Last modified{{.ModifiedSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Last modified column" tabindex="0" data-resize-column="modified"></span></th>
-<th scope="col" align="right"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.SizeSortURL}}">Size{{.SizeSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Size column" tabindex="0" data-resize-column="size"></span></th>
+<th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.NameSortURL}}" data-directory-link data-preserve-position>Name{{.NameSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Name column" tabindex="0" data-resize-column="name"></span></th>
+<th scope="col" align="left"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.ModifiedSortURL}}" data-directory-link data-preserve-position>Last modified{{.ModifiedSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Last modified column" tabindex="0" data-resize-column="modified"></span></th>
+<th scope="col" align="right"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}><a href="{{.SizeSortURL}}" data-directory-link data-preserve-position>Size{{.SizeSortMarker}}</a><span class="column-resizer" role="separator" aria-orientation="vertical" aria-label="Resize Size column" tabindex="0" data-resize-column="size"></span></th>
 <th scope="colgroup" align="left" colspan="3"{{if or .JupyterEnabled .TensorBoardEnabled}} rowspan="2"{{end}}>Actions</th>
 {{if .JupyterEnabled}}<th scope="colgroup" align="center" colspan="2" class="app-group-heading" aria-label="JupyterLab" title="JupyterLab"><img src="/assets/apps/jupyter.svg" alt=""></th>{{end}}
 {{if .TensorBoardEnabled}}<th scope="colgroup" align="center" colspan="2" class="app-group-heading" aria-label="TensorBoard" title="TensorBoard"><img src="/assets/apps/tensorboard.png" alt=""></th>{{end}}
@@ -284,15 +288,16 @@ a.icon-button { display: inline-block; }
 </tr>{{end}}
 </thead>
 <tbody>
-{{if .HasParent}}<tr><td><div class="name-cell-content" title=".."><a href="{{.ParentURL}}">..</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><a class="open-entry icon-button" href="{{.ParentURL}}" target="_blank" rel="noopener" aria-label="Open parent directory in a new tab" title="Open parent directory in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.ParentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .ParentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .ParentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>{{end}}
-<tr><td><div class="name-cell-content" title="."><a href="{{.CurrentURL}}">.</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><a class="open-entry icon-button" href="{{.CurrentURL}}" target="_blank" rel="noopener" aria-label="Open current directory in a new tab" title="Open current directory in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.CurrentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .CurrentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .CurrentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>
+{{if .HasParent}}<tr><td><div class="name-cell-content" title=".."><a href="{{.ParentURL}}" data-directory-link>..</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><a class="open-entry icon-button" href="{{.ParentURL}}" target="_blank" rel="noopener" aria-label="Open parent directory in a new tab" title="Open parent directory in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.ParentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .ParentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .ParentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>{{end}}
+<tr><td><div class="name-cell-content" title="."><a href="{{.CurrentURL}}" data-directory-link>.</a></div></td><td>&nbsp;</td><td align="right"> - </td><td class="file-action-column"><a class="open-entry icon-button" href="{{.CurrentURL}}" target="_blank" rel="noopener" aria-label="Open current directory in a new tab" title="Open current directory in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.CurrentPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">&nbsp;</td>{{if .JupyterEnabled}}{{template "app-controls" .CurrentJupyter}}{{end}}{{if .TensorBoardEnabled}}{{template "app-controls" .CurrentTensorBoard}}{{end}}{{if .LaTeXEnabled}}<td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td><td class="action-column">&nbsp;</td>{{end}}</tr>
 </tbody>
 {{if .Entries}}<tbody id="directory-entries">
-{{range .Entries}}<tr><td><div class="name-cell-content" title="{{.Name}}{{if .IsDir}}/{{end}}{{if .IsLink}} → {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}"><a href="{{.URL}}">{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</div></td><td><div class="modified-cell-content" title="{{time .ModTime}}">{{time .ModTime}}</div></td><td align="right"><div class="size-cell-content" title="{{if .IsDir}}-{{else}}{{size .Size}}{{end}}">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</div></td><td class="file-action-column"><a class="open-entry icon-button" href="{{.URL}}" target="_blank" rel="noopener" aria-label="Open {{.Name}} in a new tab" title="Open {{.Name}} in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}">{{template "download-icon"}}</button>{{else}}&nbsp;{{end}}</td>{{if $view.JupyterEnabled}}{{template "app-controls" .Jupyter}}{{end}}{{if $view.TensorBoardEnabled}}{{template "app-controls" .TensorBoard}}{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet-full="{{.TableSnippet.Full}}" data-snippet-short="{{.TableSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet-full="{{.FigureSnippet.Full}}" data-snippet-short="{{.FigureSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
+{{range .Entries}}<tr><td><div class="name-cell-content" title="{{.Name}}{{if .IsDir}}/{{end}}{{if .IsLink}} → {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}"><a href="{{.URL}}"{{if .IsDir}} data-directory-link{{end}}>{{.Name}}{{if .IsDir}}/{{end}}</a>{{if .IsLink}}&nbsp;→ {{.LinkTarget}}{{if .Broken}} (broken){{end}}{{end}}</div></td><td><div class="modified-cell-content" title="{{time .ModTime}}">{{time .ModTime}}</div></td><td align="right"><div class="size-cell-content" title="{{if .IsDir}}-{{else}}{{size .Size}}{{end}}">{{if .IsDir}} - {{else}}{{size .Size}}{{end}}</div></td><td class="file-action-column"><a class="open-entry icon-button" href="{{.URL}}" target="_blank" rel="noopener" aria-label="Open {{.Name}} in a new tab" title="Open {{.Name}} in a new tab">{{template "open-new-tab-icon"}}</a></td><td class="file-action-column"><button type="button" class="copy-path icon-button" data-path="{{.FullPath}}" aria-label="Copy path" title="Copy path">{{template "copy-path-icon"}}</button></td><td class="file-action-column">{{if not .IsDir}}<button type="button" class="download-file icon-button" data-href="{{.Download}}" aria-label="Download {{.Name}}" title="Download {{.Name}}">{{template "download-icon"}}</button>{{else}}&nbsp;{{end}}</td>{{if $view.JupyterEnabled}}{{template "app-controls" .Jupyter}}{{end}}{{if $view.TensorBoardEnabled}}{{template "app-controls" .TensorBoard}}{{end}}{{if $view.LaTeXEnabled}}<td class="action-column">{{if .LiveURL}}<button type="button" class="open-live icon-button" aria-label="Open live PDF preview in a new tab" title="Open live PDF preview in a new tab" data-href="{{.LiveURL}}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3C1.5 2.72421 1.72421 2.5 2 2.5H14C14.2758 2.5 14.5 2.72421 14.5 3V11C14.5 11.2758 14.2758 11.5 14 11.5H2C1.72421 11.5 1.5 11.2758 1.5 11V3ZM2 1C0.895786 1 0 1.89579 0 3V11C0 12.1042 0.895786 13 2 13H2.64979L1.35052 15.2499L2.64949 16L4.38194 13H11.6391L13.3715 16L14.6705 15.2499L13.3712 13H14C15.1042 13 16 12.1042 16 11V3C16 1.89579 15.1042 1 14 1H2ZM5.79501 4.64401V9.35601C5.79501 9.85001 6.32901 10.159 6.75701 9.91401L10.88 7.55801C11.312 7.31201 11.312 6.68901 10.88 6.44201L6.75701 4.08601C6.32801 3.84101 5.79501 4.15001 5.79501 4.64401Z" fill="currentColor"></path></svg></button>{{end}}</td><td class="action-column">{{if .TableSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX table snippet" title="Copy LaTeX table snippet" data-snippet-full="{{.TableSnippet.Full}}" data-snippet-short="{{.TableSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><path d="M3 9h18M3 14h18M9 4v16M15 4v16"></path></svg></button>{{end}}</td><td class="action-column">{{if .FigureSnippet.Full}}<button type="button" class="copy-snippet icon-button" aria-label="Copy LaTeX figure snippet" title="Copy LaTeX figure snippet" data-snippet-full="{{.FigureSnippet.Full}}" data-snippet-short="{{.FigureSnippet.Short}}"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"></rect><circle cx="8" cy="9" r="1.5"></circle><path d="m5 17 4-4 3 3 2-2 5 3"></path></svg></button>{{end}}</td>{{end}}</tr>
 {{end}}
-</tbody>{{else}}<tbody id="directory-empty"><tr><td colspan="{{.ColumnCount}}">This directory is empty.</td></tr></tbody>{{end}}
+</tbody>{{else}}<tbody id="directory-empty"><tr><td colspan="{{.ColumnCount}}">{{if .LoadError}}Waiting for the remote connection…{{else}}This directory is empty.{{end}}</td></tr></tbody>{{end}}
 </table>
-</div>
+</div>{{end}}
+<script src="/assets/browser-v1.js"></script>
 <script>
 (function() {
   var dz = document.getElementById('drop-zone');
@@ -300,380 +305,426 @@ a.icon-button { display: inline-block; }
   var copyStatus = document.getElementById('copy-status');
   var appActionStatus = document.getElementById('app-action-status');
   var csrfToken = {{.CSRFToken}};
-  var uploadURL = {{.UploadURL}};
-  var importURL = {{.ImportURL}};
-  var mkdirURL = {{.MkdirURL}};
   var conflictModal = document.getElementById('conflict-modal');
   var conflictMessage = document.getElementById('conflict-message');
   var conflictApplyAll = document.getElementById('conflict-apply-all');
   var conflictSkip = document.getElementById('conflict-skip');
   var conflictOverwrite = document.getElementById('conflict-overwrite');
 
-  var filterControls = document.getElementById('regex-filter-controls');
-  var filterInput = document.getElementById('regex-filter-input');
-  var filterIgnoreCase = document.getElementById('regex-ignore-case');
-  var filterClear = document.getElementById('regex-filter-clear');
-  var filterError = document.getElementById('regex-filter-error');
-  var filterStatus = document.getElementById('regex-filter-status');
-  var filterHelpToggle = document.getElementById('regex-filter-help-toggle');
-  var filterHelp = document.getElementById('regex-filter-help');
-  var filterHelpClose = document.getElementById('regex-filter-help-close');
-  var filterTotal = parseInt(filterControls.getAttribute('data-entry-count'), 10) || 0;
-  var filterStorageKey = 'open-server-regex-filter:' + filterControls.getAttribute('data-directory');
-  var filterEntries = null;
+  var navigation = null;
+  var navigationVersion = 0;
+  var jumpRequest = null;
+  function abortJump() {
+    navigationVersion++;
+    if (jumpRequest) jumpRequest.abort();
+    jumpRequest = null;
+  }
+  function navigateDirectory(url, options) {
+    if (navigation) return navigation.navigate(url, options);
+    window.location.href = url;
+  }
+  function directoryChanged(endpoint) {
+    if (navigation) navigation.changed(endpoint);
+    else window.location.reload();
+  }
+  function captureDestination() {
+    var header = document.getElementById('directory-header');
+    return {path: header.dataset.directory, uploadURL: header.dataset.uploadUrl,
+      importURL: header.dataset.importUrl, mkdirURL: header.dataset.mkdirUrl};
+  }
 
-  function getFilterEntries() {
-    if (filterEntries !== null) return filterEntries;
-    filterEntries = [];
-    var body = document.getElementById('directory-entries');
-    var rows = body ? body.rows : [];
-    for (var index = 0; index < rows.length; index++) {
-      var link = rows[index].cells[0] && rows[index].cells[0].querySelector('a');
-      var name = link ? link.textContent : '';
-      if (name.slice(-1) === '/') name = name.slice(0, -1);
-      filterEntries.push({row: rows[index], name: name});
+  function mountDirectory() {
+    var viewAbort = new AbortController();
+    var header = document.getElementById('directory-header');
+    var directoryURL = header.dataset.url;
+    var filterControls = document.getElementById('regex-filter-controls');
+    var filterInput = document.getElementById('regex-filter-input');
+    var filterIgnoreCase = document.getElementById('regex-ignore-case');
+    var filterClear = document.getElementById('regex-filter-clear');
+    var filterError = document.getElementById('regex-filter-error');
+    var filterStatus = document.getElementById('regex-filter-status');
+    var filterHelpToggle = document.getElementById('regex-filter-help-toggle');
+    var filterHelp = document.getElementById('regex-filter-help');
+    var filterHelpClose = document.getElementById('regex-filter-help-close');
+    var filterTotal = parseInt(filterControls.getAttribute('data-entry-count'), 10) || 0;
+    var filterStorageKey = 'open-server-regex-filter:' + filterControls.getAttribute('data-directory');
+    var filterEntries = null;
+
+    function getFilterEntries() {
+      if (filterEntries !== null) return filterEntries;
+      filterEntries = [];
+      var body = document.getElementById('directory-entries');
+      var rows = body ? body.rows : [];
+      for (var index = 0; index < rows.length; index++) {
+        var link = rows[index].cells[0] && rows[index].cells[0].querySelector('a');
+        var name = link ? link.textContent : '';
+        if (name.slice(-1) === '/') name = name.slice(0, -1);
+        filterEntries.push({row: rows[index], name: name});
+      }
+      return filterEntries;
     }
-    return filterEntries;
-  }
-  function setFilterError(message) {
-    filterError.textContent = message;
-    filterInput.setAttribute('aria-invalid', message ? 'true' : 'false');
-  }
-  function setFilterActive(active) {
-    if (active) filterControls.classList.add('filter-active');
-    else filterControls.classList.remove('filter-active');
-  }
-  function saveFilter(pattern, ignoreCase) {
-    try {
-      window.sessionStorage.setItem(filterStorageKey, JSON.stringify({pattern: pattern, ignoreCase: ignoreCase}));
-    } catch (e) {}
-  }
-  function removeSavedFilter() {
-    try { window.sessionStorage.removeItem(filterStorageKey); } catch (e) {}
-  }
-  function showAllFilterEntries() {
-    if (filterEntries !== null) {
-      filterEntries.forEach(function(entry) {
-        if (entry.row.hidden) entry.row.hidden = false;
+    function setFilterError(message) {
+      filterError.textContent = message;
+      filterInput.setAttribute('aria-invalid', message ? 'true' : 'false');
+    }
+    function setFilterActive(active) {
+      if (active) filterControls.classList.add('filter-active');
+      else filterControls.classList.remove('filter-active');
+    }
+    function saveFilter(pattern, ignoreCase) {
+      try {
+        window.sessionStorage.setItem(filterStorageKey, JSON.stringify({pattern: pattern, ignoreCase: ignoreCase}));
+      } catch (e) {}
+    }
+    function removeSavedFilter() {
+      try { window.sessionStorage.removeItem(filterStorageKey); } catch (e) {}
+    }
+    function showAllFilterEntries() {
+      if (filterEntries !== null) {
+        filterEntries.forEach(function(entry) {
+          if (entry.row.hidden) entry.row.hidden = false;
+        });
+      }
+      filterStatus.textContent = filterTotal + ' of ' + filterTotal + ' entries';
+      setFilterActive(false);
+    }
+    function clearRegexFilter() {
+      filterInput.value = '';
+      filterIgnoreCase.checked = false;
+      setFilterError('');
+      showAllFilterEntries();
+      removeSavedFilter();
+    }
+    function applyRegexFilter(pattern, ignoreCase, persist) {
+      if (!pattern) {
+        clearRegexFilter();
+        return true;
+      }
+      var expression;
+      try {
+        expression = new RegExp(pattern, ignoreCase ? 'i' : '');
+      } catch (e) {
+        setFilterError(e.message || 'Invalid regular expression');
+        return false;
+      }
+      var matched = 0;
+      getFilterEntries().forEach(function(entry) {
+        var matches = expression.test(entry.name);
+        if (entry.row.hidden === matches) entry.row.hidden = !matches;
+        if (matches) matched++;
       });
-    }
-    filterStatus.textContent = filterTotal + ' of ' + filterTotal + ' entries';
-    setFilterActive(false);
-  }
-  function clearRegexFilter() {
-    filterInput.value = '';
-    filterIgnoreCase.checked = false;
-    setFilterError('');
-    showAllFilterEntries();
-    removeSavedFilter();
-  }
-  function applyRegexFilter(pattern, ignoreCase, persist) {
-    if (!pattern) {
-      clearRegexFilter();
+      setFilterError('');
+      filterStatus.textContent = matched + ' of ' + filterTotal + ' entries';
+      setFilterActive(true);
+      if (persist) saveFilter(pattern, ignoreCase);
       return true;
     }
-    var expression;
-    try {
-      expression = new RegExp(pattern, ignoreCase ? 'i' : '');
-    } catch (e) {
-      setFilterError(e.message || 'Invalid regular expression');
-      return false;
-    }
-    var matched = 0;
-    getFilterEntries().forEach(function(entry) {
-      var matches = expression.test(entry.name);
-      if (entry.row.hidden === matches) entry.row.hidden = !matches;
-      if (matches) matched++;
-    });
-    setFilterError('');
-    filterStatus.textContent = matched + ' of ' + filterTotal + ' entries';
-    setFilterActive(true);
-    if (persist) saveFilter(pattern, ignoreCase);
-    return true;
-  }
-  filterControls.addEventListener('submit', function(e) {
-    e.preventDefault();
-    applyRegexFilter(filterInput.value, filterIgnoreCase.checked, true);
-  });
-  filterClear.addEventListener('click', clearRegexFilter);
-
-  function openRegexHelp() {
-    filterHelp.hidden = false;
-    filterHelpToggle.setAttribute('aria-expanded', 'true');
-    filterHelpClose.focus();
-  }
-  function closeRegexHelp(restoreFocus) {
-    var helpHadFocus = filterHelp.contains(document.activeElement);
-    filterHelp.hidden = true;
-    filterHelpToggle.setAttribute('aria-expanded', 'false');
-    if (restoreFocus || helpHadFocus) filterHelpToggle.focus();
-  }
-  filterHelpToggle.addEventListener('click', function() {
-    if (filterHelp.hidden) {
-      openRegexHelp();
-    } else {
-      closeRegexHelp(true);
-    }
-  });
-  filterHelpClose.addEventListener('click', function() { closeRegexHelp(true); });
-  document.addEventListener('click', function(e) {
-    if (!filterHelp.hidden && e.target !== filterHelpToggle && !filterHelp.contains(e.target)) {
-      closeRegexHelp(false);
-    }
-  });
-  document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape' && !filterHelp.hidden) {
+    filterControls.addEventListener('submit', function(e) {
       e.preventDefault();
-      closeRegexHelp(true);
-    }
-  });
+      applyRegexFilter(filterInput.value, filterIgnoreCase.checked, true);
+    });
+    filterClear.addEventListener('click', clearRegexFilter);
 
-  try {
-    var savedFilterJSON = window.sessionStorage.getItem(filterStorageKey);
-    if (savedFilterJSON) {
-      var savedFilter = JSON.parse(savedFilterJSON);
-      if (typeof savedFilter.pattern === 'string' && typeof savedFilter.ignoreCase === 'boolean') {
-        filterInput.value = savedFilter.pattern;
-        filterIgnoreCase.checked = savedFilter.ignoreCase;
-        if (!applyRegexFilter(savedFilter.pattern, savedFilter.ignoreCase, false)) removeSavedFilter();
+    function openRegexHelp() {
+      filterHelp.hidden = false;
+      filterHelpToggle.setAttribute('aria-expanded', 'true');
+      filterHelpClose.focus();
+    }
+    function closeRegexHelp(restoreFocus) {
+      var helpHadFocus = filterHelp.contains(document.activeElement);
+      filterHelp.hidden = true;
+      filterHelpToggle.setAttribute('aria-expanded', 'false');
+      if (restoreFocus || helpHadFocus) filterHelpToggle.focus();
+    }
+    filterHelpToggle.addEventListener('click', function() {
+      if (filterHelp.hidden) {
+        openRegexHelp();
       } else {
-        removeSavedFilter();
+        closeRegexHelp(true);
       }
-    }
-  } catch (e) {
-    removeSavedFilter();
-  }
+    }, {signal: viewAbort.signal});
+    filterHelpClose.addEventListener('click', function() { closeRegexHelp(true); });
+    document.addEventListener('click', function(e) {
+      if (!filterHelp.hidden && e.target !== filterHelpToggle && !filterHelp.contains(e.target)) {
+        closeRegexHelp(false);
+      }
+    }, {signal: viewAbort.signal});
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && !filterHelp.hidden) {
+        e.preventDefault();
+        closeRegexHelp(true);
+      }
+    }, {signal: viewAbort.signal});
 
-  var pathJumpForm = document.getElementById('path-jump');
-  var pathJumpInput = document.getElementById('path-jump-input');
-  var pathJumpError = document.getElementById('path-jump-error');
-  var pathJumpRoot = (pathJumpForm.getAttribute('data-root') || '/').replace(/\/+$/, '') || '/';
-
-  function setPathJumpError(message) {
-    pathJumpError.textContent = message;
-    pathJumpInput.setAttribute('aria-invalid', message ? 'true' : 'false');
-  }
-  function resolveJumpTarget(input) {
-    var normalized = input.replace(/\\/g, '/');
-    var absolute = normalized.charAt(0) === '/';
-    var segments = normalized.split('/');
-    var kept = [];
-    for (var i = 0; i < segments.length; i++) {
-      var segment = segments[i];
-      if (segment === '' || segment === '.') continue;
-      if (segment === '..') return null;
-      kept.push(segment);
-    }
-    var base = absolute || pathJumpRoot === '/' ? '' : pathJumpRoot;
-    if (!kept.length) return base || '/';
-    return base + '/' + kept.join('/');
-  }
-  pathJumpInput.addEventListener('input', function() { setPathJumpError(''); });
-  pathJumpForm.addEventListener('submit', function(e) {
-    e.preventDefault();
-    var value = pathJumpInput.value.trim();
-    if (!value) {
-      setPathJumpError('');
-      return;
-    }
-    if (value.indexOf('\u0000') !== -1) {
-      setPathJumpError('Invalid path');
-      return;
-    }
-    var target = resolveJumpTarget(value);
-    if (target === null) {
-      setPathJumpError("'..' is not allowed");
-      return;
-    }
-    fetch('/resolve?path=' + encodeURIComponent(target)).then(function(resp) {
-      if (resp.status === 404) {
-        setPathJumpError('Folder not found');
-        return;
-      }
-      if (resp.status === 403) {
-        setPathJumpError('Path is outside the served root');
-        return;
-      }
-      if (!resp.ok) {
-        setPathJumpError('Not a folder or invalid path');
-        return;
-      }
-      return resp.json().then(function(resolved) {
-        var current = new URLSearchParams(window.location.search);
-        var dest = new URLSearchParams();
-        dest.set('path', resolved.path);
-        if (current.get('sort')) {
-          dest.set('sort', current.get('sort'));
-          dest.set('order', current.get('order') || 'asc');
-        }
-        if (current.get('hidden') === '1') dest.set('hidden', '1');
-        window.location.href = '/?' + dest.toString();
-      });
-    }).catch(function() {
-      setPathJumpError('Could not reach the server');
-    });
-  });
-
-  var directoryTable = document.getElementById('directory-list');
-  var columnWidthStorageKey = 'open-server-directory-column-widths:v1';
-  var columnWidthDefaults = {name: 28, modified: 12.5, size: 6.5};
-  var columnWidthLimits = {
-    name: {min: 8, max: 60},
-    modified: {min: 8, max: 30},
-    size: {min: 4.5, max: 20}
-  };
-  var tableFontSize = parseFloat(window.getComputedStyle(directoryTable).fontSize) || 14;
-  var savedColumnWidths = {};
-  try {
-    var savedColumnWidthsJSON = window.localStorage.getItem(columnWidthStorageKey);
-    if (savedColumnWidthsJSON) savedColumnWidths = JSON.parse(savedColumnWidthsJSON) || {};
-  } catch (e) {
-    savedColumnWidths = {};
-  }
-  function columnElement(name) {
-    return directoryTable.querySelector('col[data-column="' + name + '"]');
-  }
-  function defaultColumnWidth(name) {
-    return columnWidthDefaults[name] * tableFontSize;
-  }
-  function clampColumnWidth(name, width) {
-    var limits = columnWidthLimits[name];
-    return Math.max(limits.min * tableFontSize, Math.min(limits.max * tableFontSize, width));
-  }
-  function updateResizeHandle(name, width) {
-    var handle = directoryTable.querySelector('[data-resize-column="' + name + '"]');
-    if (!handle) return;
-    handle.setAttribute('aria-valuemin', Math.round(columnWidthLimits[name].min * tableFontSize));
-    handle.setAttribute('aria-valuemax', Math.round(columnWidthLimits[name].max * tableFontSize));
-    handle.setAttribute('aria-valuenow', Math.round(width));
-    handle.setAttribute('aria-valuetext', Math.round(width) + ' pixels');
-  }
-  function setColumnWidth(name, width, persist) {
-    var column = columnElement(name);
-    if (!column) return;
-    width = clampColumnWidth(name, width);
-    directoryTable.style.setProperty('--column-' + name + '-width', width + 'px');
-    updateResizeHandle(name, width);
-    if (persist) {
-      savedColumnWidths[name] = Math.round(width);
-      try { window.localStorage.setItem(columnWidthStorageKey, JSON.stringify(savedColumnWidths)); } catch (e) {}
-    }
-  }
-  Object.keys(columnWidthDefaults).forEach(function(name) {
-    var savedWidth = Number(savedColumnWidths[name]);
-    setColumnWidth(name, Number.isFinite(savedWidth) && savedWidth > 0 ? savedWidth : defaultColumnWidth(name), false);
-  });
-  Array.prototype.forEach.call(document.querySelectorAll('.column-resizer'), function(handle) {
-    var name = handle.getAttribute('data-resize-column');
-    handle.addEventListener('pointerdown', function(e) {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      var startX = e.clientX;
-      var startWidth = columnElement(name).getBoundingClientRect().width;
-      handle.classList.add('resizing');
-      handle.setPointerCapture(e.pointerId);
-      function move(event) {
-        setColumnWidth(name, startWidth + event.clientX - startX, false);
-      }
-      function finish(event) {
-        setColumnWidth(name, columnElement(name).getBoundingClientRect().width, true);
-        handle.classList.remove('resizing');
-        handle.removeEventListener('pointermove', move);
-        handle.removeEventListener('pointerup', finish);
-        handle.removeEventListener('pointercancel', finish);
-        if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
-      }
-      handle.addEventListener('pointermove', move);
-      handle.addEventListener('pointerup', finish);
-      handle.addEventListener('pointercancel', finish);
-    });
-    handle.addEventListener('keydown', function(e) {
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'Home') return;
-      e.preventDefault();
-      var width = columnElement(name).getBoundingClientRect().width;
-      if (e.key === 'Home') width = defaultColumnWidth(name);
-      else width += (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 24 : 8);
-      setColumnWidth(name, width, true);
-    });
-    handle.addEventListener('dblclick', function(e) {
-      e.preventDefault();
-      e.stopPropagation();
-      delete savedColumnWidths[name];
-      setColumnWidth(name, defaultColumnWidth(name), false);
-      try { window.localStorage.setItem(columnWidthStorageKey, JSON.stringify(savedColumnWidths)); } catch (error) {}
-    });
-  });
-
-  function fallbackCopy(text) {
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    var ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
-  }
-  function showCopyResult(button, succeeded) {
-    clearTimeout(button.copyResultTimer);
-    button.classList.remove('copy-success', 'copy-failure');
-    button.classList.add('copy-result', succeeded ? 'copy-success' : 'copy-failure');
-    copyStatus.textContent = succeeded ? 'Copied to clipboard.' : 'Copy failed.';
-    button.copyResultTimer = setTimeout(function() {
-      button.classList.remove('copy-result', 'copy-success', 'copy-failure');
-    }, 100);
-  }
-  function copyText(button, attribute) {
-    var text = button.getAttribute(attribute);
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(function() {
-        showCopyResult(button, true);
-      }).catch(function() {
-        showCopyResult(button, fallbackCopy(text));
-      });
-      return;
-    }
-    showCopyResult(button, fallbackCopy(text));
-  }
-  Array.prototype.forEach.call(document.querySelectorAll('.copy-path'), function(button) {
-    button.addEventListener('click', function() { copyText(button, 'data-path'); });
-  });
-  var latexFullEnvironment = document.getElementById('latex-full-environment');
-  if (latexFullEnvironment) {
     try {
-      var savedLaTeXMode = window.localStorage.getItem('open-server-latex-snippet-mode');
-      if (savedLaTeXMode === 'short') latexFullEnvironment.checked = false;
-      if (savedLaTeXMode === 'full') latexFullEnvironment.checked = true;
-    } catch (e) {}
-    latexFullEnvironment.addEventListener('change', function() {
+      var savedFilterJSON = window.sessionStorage.getItem(filterStorageKey);
+      if (savedFilterJSON) {
+        var savedFilter = JSON.parse(savedFilterJSON);
+        if (typeof savedFilter.pattern === 'string' && typeof savedFilter.ignoreCase === 'boolean') {
+          filterInput.value = savedFilter.pattern;
+          filterIgnoreCase.checked = savedFilter.ignoreCase;
+          if (!applyRegexFilter(savedFilter.pattern, savedFilter.ignoreCase, false)) removeSavedFilter();
+        } else {
+          removeSavedFilter();
+        }
+      }
+    } catch (e) {
+      removeSavedFilter();
+    }
+
+    var pathJumpForm = document.getElementById('path-jump');
+    var pathJumpInput = document.getElementById('path-jump-input');
+    var pathJumpError = document.getElementById('path-jump-error');
+    var pathJumpRoot = (pathJumpForm.getAttribute('data-root') || '/').replace(/\/+$/, '') || '/';
+
+    function setPathJumpError(message) {
+      pathJumpError.textContent = message;
+      pathJumpInput.setAttribute('aria-invalid', message ? 'true' : 'false');
+    }
+    function resolveJumpTarget(input) {
+      var normalized = input.replace(/\\/g, '/');
+      var absolute = normalized.charAt(0) === '/';
+      var segments = normalized.split('/');
+      var kept = [];
+      for (var i = 0; i < segments.length; i++) {
+        var segment = segments[i];
+        if (segment === '' || segment === '.') continue;
+        if (segment === '..') return null;
+        kept.push(segment);
+      }
+      var base = absolute || pathJumpRoot === '/' ? '' : pathJumpRoot;
+      if (!kept.length) return base || '/';
+      return base + '/' + kept.join('/');
+    }
+    pathJumpInput.addEventListener('input', function() { setPathJumpError(''); });
+    pathJumpForm.addEventListener('submit', function(e) {
+      e.preventDefault();
+      var value = pathJumpInput.value.trim();
+      if (!value) {
+        setPathJumpError('');
+        return;
+      }
+      if (value.indexOf('\u0000') !== -1) {
+        setPathJumpError('Invalid path');
+        return;
+      }
+      var target = resolveJumpTarget(value);
+      if (target === null) {
+        setPathJumpError("'..' is not allowed");
+        return;
+      }
+      abortJump();
+      var jumpVersion = navigationVersion;
+      jumpRequest = new AbortController();
+      fetch('/resolve?path=' + encodeURIComponent(target), {signal: jumpRequest.signal}).then(function(resp) {
+        if (jumpVersion !== navigationVersion) return;
+        if (resp.status === 404) {
+          setPathJumpError('Folder not found');
+          return;
+        }
+        if (resp.status === 403) {
+          setPathJumpError('Path is outside the served root');
+          return;
+        }
+        if (!resp.ok) {
+          setPathJumpError('Not a folder or invalid path');
+          return;
+        }
+        return resp.json().then(function(resolved) {
+          if (jumpVersion !== navigationVersion) return;
+          var current = new URL(directoryURL, window.location.href).searchParams;
+          var dest = new URLSearchParams();
+          dest.set('path', resolved.path);
+          if (current.get('sort')) {
+            dest.set('sort', current.get('sort'));
+            dest.set('order', current.get('order') || 'asc');
+          }
+          if (current.get('hidden') === '1') dest.set('hidden', '1');
+          navigateDirectory('/?' + dest.toString());
+        });
+      }).catch(function(error) {
+        if (jumpVersion !== navigationVersion || error.name === 'AbortError') return;
+        setPathJumpError('Could not reach the server');
+      });
+    });
+
+    var directoryTable = document.getElementById('directory-list');
+    var columnWidthStorageKey = 'open-server-directory-column-widths:v1';
+    var columnWidthDefaults = {name: 28, modified: 12.5, size: 6.5};
+    var columnWidthLimits = {
+      name: {min: 8, max: 60},
+      modified: {min: 8, max: 30},
+      size: {min: 4.5, max: 20}
+    };
+    var tableFontSize = parseFloat(window.getComputedStyle(directoryTable).fontSize) || 14;
+    var savedColumnWidths = {};
+    try {
+      var savedColumnWidthsJSON = window.localStorage.getItem(columnWidthStorageKey);
+      if (savedColumnWidthsJSON) savedColumnWidths = JSON.parse(savedColumnWidthsJSON) || {};
+    } catch (e) {
+      savedColumnWidths = {};
+    }
+    function columnElement(name) {
+      return directoryTable.querySelector('col[data-column="' + name + '"]');
+    }
+    function defaultColumnWidth(name) {
+      return columnWidthDefaults[name] * tableFontSize;
+    }
+    function clampColumnWidth(name, width) {
+      var limits = columnWidthLimits[name];
+      return Math.max(limits.min * tableFontSize, Math.min(limits.max * tableFontSize, width));
+    }
+    function updateResizeHandle(name, width) {
+      var handle = directoryTable.querySelector('[data-resize-column="' + name + '"]');
+      if (!handle) return;
+      handle.setAttribute('aria-valuemin', Math.round(columnWidthLimits[name].min * tableFontSize));
+      handle.setAttribute('aria-valuemax', Math.round(columnWidthLimits[name].max * tableFontSize));
+      handle.setAttribute('aria-valuenow', Math.round(width));
+      handle.setAttribute('aria-valuetext', Math.round(width) + ' pixels');
+    }
+    function setColumnWidth(name, width, persist) {
+      var column = columnElement(name);
+      if (!column) return;
+      width = clampColumnWidth(name, width);
+      directoryTable.style.setProperty('--column-' + name + '-width', width + 'px');
+      updateResizeHandle(name, width);
+      if (persist) {
+        savedColumnWidths[name] = Math.round(width);
+        try { window.localStorage.setItem(columnWidthStorageKey, JSON.stringify(savedColumnWidths)); } catch (e) {}
+      }
+    }
+    Object.keys(columnWidthDefaults).forEach(function(name) {
+      var savedWidth = Number(savedColumnWidths[name]);
+      setColumnWidth(name, Number.isFinite(savedWidth) && savedWidth > 0 ? savedWidth : defaultColumnWidth(name), false);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.column-resizer'), function(handle) {
+      var name = handle.getAttribute('data-resize-column');
+      handle.addEventListener('pointerdown', function(e) {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        var startX = e.clientX;
+        var startWidth = columnElement(name).getBoundingClientRect().width;
+        handle.classList.add('resizing');
+        handle.setPointerCapture(e.pointerId);
+        function move(event) {
+          setColumnWidth(name, startWidth + event.clientX - startX, false);
+        }
+        function finish(event) {
+          setColumnWidth(name, columnElement(name).getBoundingClientRect().width, true);
+          handle.classList.remove('resizing');
+          handle.removeEventListener('pointermove', move);
+          handle.removeEventListener('pointerup', finish);
+          handle.removeEventListener('pointercancel', finish);
+          if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+        }
+        handle.addEventListener('pointermove', move);
+        handle.addEventListener('pointerup', finish);
+        handle.addEventListener('pointercancel', finish);
+      });
+      handle.addEventListener('keydown', function(e) {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'Home') return;
+        e.preventDefault();
+        var width = columnElement(name).getBoundingClientRect().width;
+        if (e.key === 'Home') width = defaultColumnWidth(name);
+        else width += (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 24 : 8);
+        setColumnWidth(name, width, true);
+      });
+      handle.addEventListener('dblclick', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        delete savedColumnWidths[name];
+        setColumnWidth(name, defaultColumnWidth(name), false);
+        try { window.localStorage.setItem(columnWidthStorageKey, JSON.stringify(savedColumnWidths)); } catch (error) {}
+      });
+    });
+
+    function fallbackCopy(text) {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      var ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    }
+    function showCopyResult(button, succeeded) {
+      clearTimeout(button.copyResultTimer);
+      button.classList.remove('copy-success', 'copy-failure');
+      button.classList.add('copy-result', succeeded ? 'copy-success' : 'copy-failure');
+      copyStatus.textContent = succeeded ? 'Copied to clipboard.' : 'Copy failed.';
+      button.copyResultTimer = setTimeout(function() {
+        button.classList.remove('copy-result', 'copy-success', 'copy-failure');
+      }, 100);
+    }
+    function copyText(button, attribute) {
+      var text = button.getAttribute(attribute);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function() {
+          showCopyResult(button, true);
+        }).catch(function() {
+          showCopyResult(button, fallbackCopy(text));
+        });
+        return;
+      }
+      showCopyResult(button, fallbackCopy(text));
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('.copy-path'), function(button) {
+      button.addEventListener('click', function() { copyText(button, 'data-path'); });
+    });
+    var latexFullEnvironment = document.getElementById('latex-full-environment');
+    if (latexFullEnvironment) {
       try {
-        window.localStorage.setItem('open-server-latex-snippet-mode', latexFullEnvironment.checked ? 'full' : 'short');
+        var savedLaTeXMode = window.localStorage.getItem('open-server-latex-snippet-mode');
+        if (savedLaTeXMode === 'short') latexFullEnvironment.checked = false;
+        if (savedLaTeXMode === 'full') latexFullEnvironment.checked = true;
       } catch (e) {}
+      latexFullEnvironment.addEventListener('change', function() {
+        try {
+          window.localStorage.setItem('open-server-latex-snippet-mode', latexFullEnvironment.checked ? 'full' : 'short');
+        } catch (e) {}
+      });
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('.copy-snippet'), function(button) {
+      button.addEventListener('click', function() {
+        copyText(button, latexFullEnvironment && !latexFullEnvironment.checked ? 'data-snippet-short' : 'data-snippet-full');
+      });
     });
+    Array.prototype.forEach.call(document.querySelectorAll('.download-file'), function(button) {
+      button.addEventListener('click', function() {
+        window.location.href = button.getAttribute('data-href');
+      });
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.open-live'), function(button) {
+      button.addEventListener('click', function() {
+        window.open(button.getAttribute('data-href'), '_blank', 'noopener');
+      });
+    });
+    bindAppControls();
+    bindFolderButton();
+    document.getElementById('btn-refresh').addEventListener('click', function() {
+      navigateDirectory(directoryURL, {force: true, preserve: true});
+    });
+    document.getElementById('btn-toggle-hidden').addEventListener('click', function() {
+      navigateDirectory(this.getAttribute('data-href'), {preserve: true});
+    });
+    return function() { viewAbort.abort(); abortJump(); };
   }
-  Array.prototype.forEach.call(document.querySelectorAll('.copy-snippet'), function(button) {
-    button.addEventListener('click', function() {
-      copyText(button, latexFullEnvironment && !latexFullEnvironment.checked ? 'data-snippet-short' : 'data-snippet-full');
-    });
-  });
-  Array.prototype.forEach.call(document.querySelectorAll('.download-file'), function(button) {
-    button.addEventListener('click', function() {
-      window.location.href = button.getAttribute('data-href');
-    });
-  });
-  Array.prototype.forEach.call(document.querySelectorAll('.open-live'), function(button) {
-    button.addEventListener('click', function() {
-      window.open(button.getAttribute('data-href'), '_blank', 'noopener');
-    });
-  });
+
   function setAppElementVisible(element, visible) {
     if (element) element.hidden = !visible;
   }
   function updateAppControl(control, appStatus) {
     if (!control || !appStatus) return;
+    if (!control.isConnected) {
+      Array.prototype.forEach.call(document.querySelectorAll('[data-app-control]'), function(current) {
+        if (current.getAttribute('data-endpoint') === control.getAttribute('data-endpoint')) updateAppControl(current, appStatus);
+      });
+      return;
+    }
     var state = appStatus.state || 'stopped';
     var available = !!appStatus.available;
     control.setAttribute('data-state', state);
@@ -742,6 +793,7 @@ a.icon-button { display: inline-block; }
       body: body
     }).then(actionResponse).then(function(appStatus) {
       updateAppControl(control, appStatus);
+      directoryChanged(control.getAttribute('data-endpoint'));
       setAppActionStatus(label + ' is running.');
       if (opened && appStatus.open_url) {
         opened.location.replace(appStatus.open_url);
@@ -773,6 +825,7 @@ a.icon-button { display: inline-block; }
       credentials: 'same-origin'
     }).then(actionResponse).then(function(appStatus) {
       updateAppControl(control, appStatus);
+      directoryChanged(control.getAttribute('data-endpoint'));
       setAppActionStatus(label + ' stopped.');
     }).catch(function(error) {
       refreshAppControl(control).catch(function() {});
@@ -818,22 +871,24 @@ a.icon-button { display: inline-block; }
       closeJupyterModal();
     }
   });{{end}}
-  Array.prototype.forEach.call(document.querySelectorAll('[data-app-control] .app-start'), function(button) {
-    button.addEventListener('click', function() {
-      var control = button.closest('[data-app-control]');
-      if (control.getAttribute('data-app') === 'jupyter' && openJupyterModal) {
-        openJupyterModal(control);
-      } else {
-        startApplication(control, null);
-      }
+  function bindAppControls() {
+    Array.prototype.forEach.call(document.querySelectorAll('[data-app-control] .app-start'), function(button) {
+      button.addEventListener('click', function() {
+        var control = button.closest('[data-app-control]');
+        if (control.getAttribute('data-app') === 'jupyter' && openJupyterModal) {
+          openJupyterModal(control);
+        } else {
+          startApplication(control, null);
+        }
+      });
     });
-  });
-  Array.prototype.forEach.call(document.querySelectorAll('.app-stop'), function(button) {
-    button.addEventListener('click', function() {
-      var control = button.parentElement.previousElementSibling;
-      if (control) stopApplication(control);
+    Array.prototype.forEach.call(document.querySelectorAll('.app-stop'), function(button) {
+      button.addEventListener('click', function() {
+        var control = button.parentElement.previousElementSibling;
+        if (control) stopApplication(control);
+      });
     });
-  });
+  }
   function refreshActiveApplications() {
     if (document.hidden) return;
     Array.prototype.forEach.call(document.querySelectorAll('[data-app-control]'), function(control) {
@@ -847,10 +902,8 @@ a.icon-button { display: inline-block; }
   document.addEventListener('visibilitychange', function() {
     if (!document.hidden) refreshActiveApplications();
   });
-  document.getElementById('btn-toggle-hidden').addEventListener('click', function() {
-    window.location.href = this.getAttribute('data-href');
-  });
 
+  var folderDestination = null;
   var folderModal = document.getElementById('folder-modal');
   var folderName = document.getElementById('folder-name');
   var folderCreate = document.getElementById('folder-create');
@@ -863,14 +916,15 @@ a.icon-button { display: inline-block; }
     var name = folderName.value.trim();
     if (!name) return;
     var xhr = new XMLHttpRequest();
-    xhr.open('POST', mkdirURL, true);
+    var destination = folderDestination || captureDestination();
+    xhr.open('POST', destination.mkdirURL, true);
     xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
     status.textContent = 'Creating folder ' + name + '...';
     xhr.addEventListener('load', function() {
       if (xhr.status >= 200 && xhr.status < 300) {
         closeFolderModal();
-        status.textContent = 'Folder created. Reloading...';
-        setTimeout(function() { window.location.reload(); }, 250);
+        status.textContent = 'Folder created in ' + destination.path + '.';
+        directoryChanged(destination.mkdirURL);
       } else {
         status.textContent = 'Create folder failed: ' + errorMessage(xhr, 'request failed');
       }
@@ -880,15 +934,19 @@ a.icon-button { display: inline-block; }
     });
     xhr.send('name=' + encodeURIComponent(name));
   }
-  document.getElementById('btn-create-folder').addEventListener('click', function() {
-    folderName.value = '';
-    folderModal.style.display = 'block';
-    folderName.focus();
-    folderName.onkeydown = function(e) {
-      if (e.key === 'Enter') { e.preventDefault(); createFolder(); }
-      if (e.key === 'Escape') closeFolderModal();
-    };
-  });
+  function bindFolderButton() {
+    document.getElementById('btn-create-folder').addEventListener('click', function() {
+      folderDestination = captureDestination();
+      document.getElementById('folder-prompt').textContent = 'Create a folder in ' + folderDestination.path + ':';
+      folderName.value = '';
+      folderModal.style.display = 'block';
+      folderName.focus();
+      folderName.onkeydown = function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); createFolder(); }
+        if (e.key === 'Escape') closeFolderModal();
+      };
+    });
+  }
   folderCreate.addEventListener('click', createFolder);
   folderCancel.addEventListener('click', closeFolderModal);
 
@@ -932,17 +990,19 @@ a.icon-button { display: inline-block; }
     conflictSkip.onclick = function() { finish('skip'); };
     conflictOverwrite.onclick = function() { finish('overwrite'); };
   }
-  function uploadFiles(files) {
+  function uploadFiles(files, destination) {
+    destination = destination || captureDestination();
+    files = Array.prototype.slice.call(files);
     var i = 0;
     var skipped = 0;
     var savedConflictAction = '';
     function finishBatch() {
       if (skipped > 0) {
-        status.textContent = 'Uploads complete. Skipped ' + skipped + ' file(s). Reloading...';
+        status.textContent = 'Uploads complete. Skipped ' + skipped + ' file(s). Saved in ' + destination.path + '.';
       } else {
-        status.textContent = 'All uploads complete. Reloading...';
+        status.textContent = 'All uploads complete in ' + destination.path + '.';
       }
-      setTimeout(function() { window.location.reload(); }, 400);
+      directoryChanged(destination.uploadURL);
     }
     function resolveConflict(fileName, callback) {
       if (savedConflictAction) {
@@ -963,11 +1023,11 @@ a.icon-button { display: inline-block; }
       var form = new FormData();
       form.append('file', file, file.name);
       var xhr = new XMLHttpRequest();
-      xhr.open('POST', endpointWithOverwrite(uploadURL, overwrite), true);
+      xhr.open('POST', endpointWithOverwrite(destination.uploadURL, overwrite), true);
       xhr.upload.addEventListener('progress', function(e) {
         if (e.lengthComputable) {
           var percent = (e.loaded / e.total) * 100;
-          status.textContent = 'Uploading ' + file.name + ' (' + i + '/' + files.length + '): ' + percent.toFixed(0) + '%';
+          status.textContent = 'Uploading ' + file.name + ' (' + i + '/' + files.length + '): ' + percent.toFixed(0) + '% to ' + destination.path;
         }
       });
       xhr.addEventListener('load', function() {
@@ -984,10 +1044,12 @@ a.icon-button { display: inline-block; }
           });
         } else {
           status.textContent = 'Upload failed: ' + errorMessage(xhr, 'request failed');
+          directoryChanged(destination.uploadURL);
         }
       });
       xhr.addEventListener('error', function() {
         status.textContent = 'Upload failed: network error';
+        directoryChanged(destination.uploadURL);
       });
       xhr.send(form);
     }
@@ -1012,6 +1074,7 @@ a.icon-button { display: inline-block; }
   });
   fileInput.addEventListener('change', function() {
     if (fileInput.files && fileInput.files.length) uploadFiles(fileInput.files);
+    fileInput.value = '';
   });
 
   var pasteModal = document.getElementById('paste-modal');
@@ -1040,7 +1103,8 @@ a.icon-button { display: inline-block; }
     return 'paste-' + date.getFullYear() + pad(date.getMonth() + 1) + pad(date.getDate()) +
       '-' + pad(date.getHours()) + pad(date.getMinutes()) + pad(date.getSeconds()) + extensionFromType(type);
   }
-  function promptPasteName(file) {
+  function promptPasteName(file, destination) {
+    document.getElementById('paste-prompt').textContent = 'Save pasted file in ' + destination.path + ' as:';
     pasteName.value = file.name || defaultPasteName(file.type);
     pasteModal.style.display = 'block';
     pasteName.focus();
@@ -1056,7 +1120,7 @@ a.icon-button { display: inline-block; }
       if (!name) return;
       if (name.indexOf('.') === -1) name += extensionFromType(file.type);
       close();
-      uploadFiles([new File([file], name, {type: file.type, lastModified: file.lastModified})]);
+      uploadFiles([new File([file], name, {type: file.type, lastModified: file.lastModified})], destination);
     };
     pasteCancel.onclick = function() {
       close();
@@ -1073,6 +1137,7 @@ a.icon-button { display: inline-block; }
   var disarmPaste = null;
   var pasteKeyLabel = /Mac|iP(hone|ad|od)/.test(navigator.platform || '') ? 'Cmd+V' : 'Ctrl+V';
   function armPasteCapture() {
+    var destination = captureDestination();
     status.textContent = 'Press ' + pasteKeyLabel + ' to paste a file (Esc or click again to cancel).';
     pasteButton.textContent = 'Waiting for ' + pasteKeyLabel + '… (click to cancel)';
     function cleanup() {
@@ -1100,7 +1165,7 @@ a.icon-button { display: inline-block; }
         return;
       }
       e.preventDefault();
-      promptPasteName(file);
+      promptPasteName(file, destination);
     }
     function onKey(e) {
       if (e.key === 'Escape') {
@@ -1130,24 +1195,25 @@ a.icon-button { display: inline-block; }
     urlRow.style.display = hidden ? '' : 'none';
     if (hidden) urlInput.focus();
   });
-  function fetchFromURL(overwrite) {
-    var source = urlInput.value.trim();
+  function fetchFromURL(overwrite, destination, source) {
+    destination = destination || captureDestination();
+    source = source || urlInput.value.trim();
     if (!source) return;
     var xhr = new XMLHttpRequest();
-    xhr.open('POST', endpointWithOverwrite(importURL, overwrite), true);
+    xhr.open('POST', endpointWithOverwrite(destination.importURL, overwrite), true);
     xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
     status.textContent = 'Fetching URL on this device...';
     xhr.addEventListener('load', function() {
       var body = responseJSON(xhr);
       if (xhr.status >= 200 && xhr.status < 300) {
-        status.textContent = 'Saved ' + (body.path || 'file') + '. Reloading...';
-        setTimeout(function() { window.location.reload(); }, 400);
+        status.textContent = 'Saved ' + (body.path || 'file') + ' in ' + destination.path + '.';
+        directoryChanged(destination.importURL);
       } else if (xhr.status === 409 && !overwrite) {
-        var destination = body.path || source;
-        var name = destination.split('/').pop() || destination;
+        var destinationPath = body.path || source;
+        var name = destinationPath.split('/').pop() || destinationPath;
         showConflictDialog(name, function(action) {
           if (action === 'overwrite') {
-            fetchFromURL(true);
+            fetchFromURL(true, destination, source);
           } else {
             status.textContent = 'Skipped ' + name + '.';
           }
@@ -1158,6 +1224,7 @@ a.icon-button { display: inline-block; }
     });
     xhr.addEventListener('error', function() {
       status.textContent = 'URL fetch failed: network error';
+      directoryChanged(destination.importURL);
     });
     xhr.send('url=' + encodeURIComponent(source));
   }
@@ -1165,7 +1232,11 @@ a.icon-button { display: inline-block; }
   urlInput.addEventListener('keydown', function(e) {
     if (e.key === 'Enter') { e.preventDefault(); fetchFromURL(false); }
   });
+  var disposeDirectory = mountDirectory();
+  if (window.OpenServerBrowser) {
+    navigation = window.OpenServerBrowser.createNavigation({mount: mountDirectory, dispose: disposeDirectory, beforeNavigate: abortJump});
+  }
 })();
 </script>
 </body>
-</html>`
+</html>{{define "directory-fragment"}}{{template "directory-header" .}}{{template "directory-filter" .}}{{template "directory-content" .}}{{end}}`
