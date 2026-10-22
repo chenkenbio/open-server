@@ -1,6 +1,6 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {DirectoryCache, normalizeURL, retryDelay} = require('./browser-v1.js');
+const {DirectoryCache, normalizeURL, retryDelay} = require('./browser-v2.js');
 
 test('directory cache expires without extending freshness on access', () => {
   let now = 0;

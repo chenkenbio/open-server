@@ -89,7 +89,7 @@ func TestBrowserAssetRequiresAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, route := range []string{"/assets/browser-v1.js", "/browse"} {
+	for _, route := range []string{"/assets/browser-v2.js", "/browse"} {
 		response := request(app, http.MethodGet, route, nil)
 		if response.Code != http.StatusForbidden {
 			t.Fatalf("unauthenticated %s = %d", route, response.Code)
@@ -97,7 +97,7 @@ func TestBrowserAssetRequiresAuthentication(t *testing.T) {
 	}
 	app.accessToken = ""
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
-		response := request(app, method, "/assets/browser-v1.js", nil)
+		response := request(app, method, "/assets/browser-v2.js", nil)
 		if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/javascript; charset=utf-8" || !strings.Contains(response.Header().Get("Cache-Control"), "immutable") {
 			t.Fatalf("asset = %d %v", response.Code, response.Header())
 		}

@@ -9,13 +9,15 @@ import assert from 'node:assert/strict';
 const [base, directoryRoot] = process.argv.slice(2);
 const profile = await mkdtemp(join(tmpdir(), 'open-server-chrome-'));
 const chromePath = process.env.CHROME_BIN || (process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 'google-chrome');
-const chrome = spawn(chromePath, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking', '--remote-debugging-port=0', `--user-data-dir=${profile}`, 'about:blank'], {stdio: ['ignore', 'ignore', 'pipe']});
+const chrome = spawn(chromePath, ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--disable-background-networking', '--remote-debugging-port=0', ...(process.env.BROWSER_BFCACHE === '0' ? ['--disable-features=BackForwardCache'] : []), `--user-data-dir=${profile}`, 'about:blank'], {stdio: ['ignore', 'ignore', 'pipe']});
 let socket;
 let sessionId;
 let nextID = 0;
 const commands = new Map();
 const exceptions = [];
+const cacheMisses = [];
 let stderr = '';
+let navigationCallback;
 
 async function control(action, extra = {}) {
   return (await fetch(base + '/__test/control', action ? {method: 'POST', body: JSON.stringify({action, ...extra})} : {})).json();
@@ -47,6 +49,27 @@ async function jump(relative) {
 }
 async function click(selector) { await run(`document.querySelector(${JSON.stringify(selector)}).click();`); }
 async function check(name, fn) { await fn(); process.stdout.write('PASS ' + name + '\n'); }
+async function navigateDocument(action) {
+  let timer;
+  const navigated = new Promise((resolve, reject) => {
+    navigationCallback = resolve;
+    timer = setTimeout(() => reject(new Error('Document navigation timed out')), 10000);
+  });
+  try { await action(); await navigated; }
+  finally { clearTimeout(timer); navigationCallback = null; }
+}
+// Poll from the driver because a full navigation destroys page-side promises.
+async function waitForPage(expression) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    try { if (await evaluate(expression)) return; }
+    catch (error) {
+      if (!/context|navigat/i.test(error.message)) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error('Page wait failed: ' + expression);
+}
 
 try {
   const debuggerURL = await new Promise((resolve, reject) => {
@@ -70,6 +93,8 @@ try {
       else command.resolve(message.result);
     }
     if (message.method === 'Runtime.exceptionThrown') exceptions.push(message.params.exceptionDetails);
+    if (message.method === 'Page.backForwardCacheNotUsed') cacheMisses.push(message.params);
+    if (message.method === 'Page.frameNavigated' && !message.params.frame.parentId && navigationCallback) navigationCallback();
   });
   const target = await send('Target.createTarget', {url: 'about:blank'}, null);
   const attached = await send('Target.attachToTarget', {targetId: target.targetId, flatten: true}, null);
@@ -230,6 +255,45 @@ try {
     await run(`document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));`);
     assert.equal(await evaluate(`document.getElementById('regex-filter-help').hidden`), true);
     assert.equal(await evaluate(`document.activeElement.id`), 'regex-filter-help-toggle');
+  });
+
+  await check('Back from PNG/SVG figures restores position, including changed listings', async () => {
+    await send('Page.addScriptToEvaluateOnNewDocument', {source: `window.addEventListener('pageshow', event => { window.figureReturnPersisted = event.persisted; });`});
+    const directoryURL = base + '/?path=' + encodeURIComponent(directoryRoot) + '&sort=name&order=asc&hidden=1';
+    await send('Page.navigate', {url: directoryURL});
+    await waitForPage(`document.getElementById('directory-entries') && window.OpenServerBrowser && typeof window.figureReturnPersisted === 'boolean'`);
+    assert.equal(await evaluate('scrollY'), 0);
+    await run(`document.getElementById('regex-filter-input').value = '^entry-'; document.getElementById('regex-filter-controls').requestSubmit();`);
+    for (const [index, name] of ['entry-0090.png', 'entry-0190.svg', 'entry-0090.png'].entries()) {
+      const saved = await run(`const link = Array.from(document.querySelectorAll('#directory-entries td:first-child a')).find(link => link.textContent === ${JSON.stringify(name)});
+        link.scrollIntoView({block: 'center'});
+        document.getElementById('directory-content').scrollLeft = 90;
+        window.figureReturnPersisted = null;
+        return {url: location.href, href: link.href, y: scrollY, figureY: link.getBoundingClientRect().top, tableX: document.getElementById('directory-content').scrollLeft,
+          width: document.getElementById('directory-list').style.getPropertyValue('--column-name-width')};`);
+      assert.ok(saved.y > 500, JSON.stringify(saved));
+      assert.ok(saved.tableX > 0, JSON.stringify(saved));
+      await navigateDocument(() => click(`#directory-entries td:first-child a[href=${JSON.stringify(new URL(saved.href).pathname + new URL(saved.href).search)}]`));
+      await waitForPage(`location.href === ${JSON.stringify(saved.href)} && !document.getElementById('directory-header') && document.querySelector('img')?.naturalWidth > 0`);
+      if (index === 2) await control('prepend');
+      const history = await send('Page.getNavigationHistory');
+      await navigateDocument(() => send('Page.navigateToHistoryEntry', {entryId: history.entries[history.currentIndex - 1].id}));
+      await waitForPage(`location.href === ${JSON.stringify(saved.url)} && !!document.getElementById('directory-list') && typeof window.figureReturnPersisted === 'boolean' && !document.getElementById('directory-content').hasAttribute('aria-busy')`);
+      const restored = await run(`return {y: scrollY, tableX: document.getElementById('directory-content').scrollLeft,
+        width: document.getElementById('directory-list').style.getPropertyValue('--column-name-width'),
+        figureY: Array.from(document.querySelectorAll('#directory-entries td:first-child a')).find(link => link.textContent === ${JSON.stringify(name)}).getBoundingClientRect().top,
+        filter: document.getElementById('regex-filter-input').value, persisted: window.figureReturnPersisted};`);
+      assert.ok(Math.abs(restored.figureY - saved.figureY) < 2, JSON.stringify({name, saved, restored}));
+      if (index === 2) assert.ok(restored.y > saved.y, JSON.stringify({saved, restored}));
+      else assert.ok(Math.abs(restored.y - saved.y) < 2, JSON.stringify({name, saved, restored}));
+      assert.equal(restored.tableX, saved.tableX);
+      assert.equal(restored.width, saved.width);
+      assert.equal(restored.filter, '^entry-');
+      // A subsequent no-store refresh can make the page ineligible for caching.
+      if (process.env.BROWSER_BFCACHE === '0' || (index === 0 && process.env.BROWSER_BFCACHE === '1')) {
+        assert.equal(restored.persisted, process.env.BROWSER_BFCACHE === '1', JSON.stringify({restored, cacheMisses}));
+      }
+    }
   });
 
   assert.equal(exceptions.length, 0, JSON.stringify(exceptions));

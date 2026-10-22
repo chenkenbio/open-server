@@ -1,9 +1,12 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +43,18 @@ func TestBrowserNavigation(t *testing.T) {
 	}
 	for i := range 400 {
 		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("entry-%04d.txt", i)), []byte("contents"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var figurePNG bytes.Buffer
+	if err := png.Encode(&figurePNG, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{
+		"entry-0090.png": figurePNG.Bytes(),
+		"entry-0190.svg": []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"><rect width="80" height="80" fill="blue"/></svg>`),
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), data, 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -84,6 +99,10 @@ func TestBrowserNavigation(t *testing.T) {
 					backend.release()
 				case "write":
 					if err := os.WriteFile(filepath.Join(root, "entry-0000-new.txt"), []byte("new"), 0o600); err != nil {
+						t.Error(err)
+					}
+				case "prepend":
+					if err := os.WriteFile(filepath.Join(root, "entry-0000-before.txt"), []byte("new"), 0o600); err != nil {
 						t.Error(err)
 					}
 				}

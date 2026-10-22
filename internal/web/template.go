@@ -297,7 +297,7 @@ a.icon-button { display: inline-block; }
 </tbody>{{else}}<tbody id="directory-empty"><tr><td colspan="{{.ColumnCount}}">{{if .LoadError}}Waiting for the remote connection…{{else}}This directory is empty.{{end}}</td></tr></tbody>{{end}}
 </table>
 </div>{{end}}
-<script src="/assets/browser-v1.js"></script>
+<script src="/assets/browser-v2.js"></script>
 <script>
 (function() {
   var dz = document.getElementById('drop-zone');

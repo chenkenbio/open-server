@@ -260,7 +260,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.serveAppAsset(w, r)
 		return
 	}
-	if route == "/assets/browser-v1.js" {
+	if route == "/assets/browser-v2.js" {
 		a.serveBrowserAsset(w, r)
 		return
 	}

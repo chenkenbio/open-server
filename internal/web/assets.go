@@ -30,7 +30,7 @@ var liveAssets embed.FS
 //go:embed assets/apps
 var appAssets embed.FS
 
-//go:embed assets/browser-v1.js
+//go:embed assets/browser-v2.js
 var browserAssets embed.FS
 
 func (a *App) serveBrowserAsset(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +41,7 @@ func (a *App) serveBrowserAsset(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
-	http.ServeFileFS(w, r, browserAssets, "assets/browser-v1.js")
+	http.ServeFileFS(w, r, browserAssets, "assets/browser-v2.js")
 }
 
 // serveAppAsset serves one allowlisted launcher icon.

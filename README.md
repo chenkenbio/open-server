@@ -136,6 +136,9 @@ Folder links, sorting, and hidden-file toggles update the listing in place.
 column widths, and scroll position. Back and Forward restore recent listings
 immediately and show **Refreshing** while fetching current contents. Listings
 are cached only in the tab's memory, for up to 60 seconds, ten views, or 8 MiB.
+Opening a figure or another file in the same tab and using browser Back restores
+the listing's vertical and horizontal scroll position, including when the browser
+reloads the directory page.
 
 Temporary remote disconnections keep the browser visible and retry directory
 reads automatically. Uploads and URL imports continue in their original folder
@@ -381,13 +384,15 @@ of the local or SSH account remain the final boundary.
 go test ./...
 go test -race ./...
 go vet ./...
-node --test internal/web/assets/browser-v1.test.cjs
+node --test internal/web/assets/browser-v2.test.cjs
 OPEN_SERVER_BROWSER_TESTS=1 go test ./internal/web -run '^TestBrowserNavigation$' -v
 ```
 
 The optional browser checks require Node.js 22 or newer and an installed Chrome.
 Set `CHROME_BIN` when Chrome is not at its usual macOS location or available as
 `google-chrome` on Linux. They use temporary files and a separate browser profile.
+Set `BROWSER_BFCACHE=0` to force directory reloads after viewing figures, or
+`BROWSER_BFCACHE=1` to require a cached first return.
 On macOS, use `TMPDIR=/tmp` for Go tests if long temporary paths exceed the
 Unix-socket length limit.
 

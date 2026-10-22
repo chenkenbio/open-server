@@ -84,6 +84,8 @@
     let scrollFrame;
     let disposed = false;
     const listeners = new AbortController();
+    const initialPosition = historyPosition(win.history.state);
+    let restoringInitialPosition = !!initialPosition && !header().dataset.loadError && doc.readyState !== 'complete';
 
     function announce(message, error = false) {
       status.textContent = message;
@@ -130,10 +132,14 @@
         if (saved.selection && focused.setSelectionRange) focused.setSelectionRange(...saved.selection);
       }
     }
+    function historyPosition(state) {
+      const saved = state && state.openServer;
+      return saved && saved.url === normalize(win.location.href).href ? saved.position : undefined;
+    }
     function remember() {
       // During an uncached history load the URL already describes the target,
       // while the old view stays visible. Never attach its scroll to that URL.
-      if (normalize(win.location.href).href !== currentURL.href) return;
+      if (doc.hidden || restoringInitialPosition || header().dataset.loadError || normalize(win.location.href).href !== currentURL.href) return;
       win.history.replaceState({...win.history.state, openServer: {url: currentURL.href, position: position()}}, '', currentURL.href);
     }
     function parse(html) {
@@ -261,32 +267,58 @@
       }
     }
     doc.addEventListener('click', event => {
-      const link = event.target.closest && event.target.closest('a[data-directory-link]');
+      const link = event.target.closest && event.target.closest('a');
       if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || link.target || link.hasAttribute('download')) return;
+      if (!link.hasAttribute('data-directory-link')) {
+        // Save before leaving for a file. Updating history during pagehide can
+        // evict the page from the browser's Back/Forward cache.
+        remember();
+        return;
+      }
       event.preventDefault();
       navigate(link.href, {preserve: link.hasAttribute('data-preserve-position')});
     }, {signal: listeners.signal});
     retry.addEventListener('click', () => { if (pending) load(pending); }, {signal: listeners.signal});
     win.addEventListener('popstate', event => {
-      navigate(win.location.href, {history: true, position: event.state && event.state.openServer && event.state.openServer.position});
+      navigate(win.location.href, {history: true, position: historyPosition(event.state)});
     }, {signal: listeners.signal});
     win.addEventListener('scroll', () => {
       if (!scrollFrame) scrollFrame = win.requestAnimationFrame(() => { scrollFrame = null; remember(); });
-    }, {passive: true, signal: listeners.signal});
+    }, {capture: true, passive: true, signal: listeners.signal});
     doc.addEventListener('visibilitychange', () => {
+      if (doc.hidden && scrollFrame) {
+        win.cancelAnimationFrame(scrollFrame);
+        scrollFrame = null;
+      }
       if (pending && pending.retrying) scheduleRetry(pending);
     }, {signal: listeners.signal});
-    win.addEventListener('pagehide', remember, {signal: listeners.signal});
     win.addEventListener('pageshow', event => {
-      if (event.persisted) navigate(win.location.href, {history: true, force: true, preserve: true});
+      if (event.persisted) {
+        const saved = historyPosition(win.history.state);
+        const preserve = !header().dataset.loadError && currentURL.href === normalize(win.location.href).href;
+        if (preserve) restore(saved);
+        navigate(win.location.href, {history: true, force: true, preserve, position: saved});
+      } else if (restoringInitialPosition) {
+        restoringInitialPosition = false;
+        restore(initialPosition);
+        remember();
+      }
     }, {signal: listeners.signal});
     const previousScrollRestoration = win.history.scrollRestoration;
     win.history.scrollRestoration = 'manual';
-    if (!header().dataset.loadError) cache.set(currentURL.href, snapshot());
-    remember();
+    // Full document returns (for example, Back from a figure) retain this
+    // history entry even when the browser cannot retain the directory page.
+    // Wait for pageshow so layout and the browser's initial scroll are settled,
+    // then restore before saving any position.
     if (header().dataset.loadError) {
       announce(header().dataset.loadError, true);
-      navigate(currentURL, {force: true, preserve: true});
+      navigate(currentURL, {force: true, history: true, position: initialPosition});
+    } else {
+      cache.set(currentURL.href, snapshot());
+      if (!restoringInitialPosition) {
+        restore(initialPosition);
+        remember();
+      }
     }
     return {
       navigate, changed,
